@@ -438,4 +438,78 @@ mod in_process_tests {
         // Engine + bridge thread harus sudah berakhir setelah join.
         assert!(client.engine_finished());
     }
+
+    /// Transport test yang panic pada pembacaan request pertama — simulasi
+    /// bug engine. `write_event` tetap mengalirkan event (mirip
+    /// `MemoryTransport`) agar `Ready` benar-benar terkirim sebelum panic.
+    /// FIX(brief): brief asli memakai unit struct yang membuang `Ready`,
+    /// bertentangan dengan kontrak "Ready lalu Error" di komentarnya,
+    /// sehingga assertion event pertama selalu gagal.
+    struct PanickyTransport {
+        event_tx: std_mpsc::Sender<ProtocolEvent>,
+    }
+
+    impl core_agentic::runtime::transport::Transport for PanickyTransport {
+        fn read_request(&self) -> std::io::Result<Option<ProtocolRequest>> {
+            panic!("boom: injected engine bug");
+        }
+        fn write_event(&self, event: &ProtocolEvent) -> std::io::Result<()> {
+            self.event_tx.send(event.clone()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "event receiver closed")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_panic_becomes_error_event() {
+        let (request_tx, request_rx) = std_mpsc::channel::<ProtocolRequest>();
+        let (event_tx, event_rx) = std_mpsc::channel::<ProtocolEvent>();
+        let (tokio_tx, mut events) = tokio_mpsc::unbounded_channel::<ProtocolEvent>();
+
+        std::thread::Builder::new()
+            .name("agentic-runtime-bridge".to_string())
+            .spawn(move || {
+                while let Ok(event) = event_rx.recv() {
+                    if tokio_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("bridge thread");
+
+        // FIX(brief): pakai `event_tx` dari factory agar `Ready` sampai ke
+        // bridge/channel; brief asli mengabaikannya sehingga `Ready` hilang.
+        let _engine = spawn_engine_thread(
+            |_request_rx, event_tx| RuntimeEngine::new(PanickyTransport { event_tx }),
+            request_rx,
+            event_tx.clone(),
+            event_tx,
+        );
+
+        // Event pertama: Ready (terkirim sebelum panic).
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .expect("no event after panic window")
+            .expect("event channel closed before terminal event");
+        assert!(
+            matches!(first.event, core_agentic::Event::Ready { .. }),
+            "expected Ready first, got {first:?}"
+        );
+
+        // Event kedua: Error hasil catch_unwind (bukan crash test process).
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+            .await
+            .expect("no terminal event after panic")
+            .expect("event channel closed before terminal event");
+        match second.event {
+            core_agentic::Event::Error { message } => {
+                assert!(
+                    message.contains("panicked"),
+                    "expected panic message, got: {message}"
+                );
+            }
+            other => panic!("expected Error event after panic, got {other:?}"),
+        }
+        drop(request_tx);
+    }
 }
