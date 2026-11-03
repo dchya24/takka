@@ -89,11 +89,13 @@ mentah streaming) / `Event::ToolOutput` diperkaya (`duration_ms`, `success`,
   oleh `tool_result_max_chars`; delta hanya observability.
 
 Spec: `docs/superpowers/specs/2026-08-06-interactive-live-progress-and-steering-design.md` (Fase 1).
-Next: **Fase 2 — steering + REPL non-blokir** (spec yang sama).
+Next: **Fase 2b — steer/follow-up queue** sudah landed (engine + CLI); sisa **Fase UX — REPL non-blokir (input saat run)** (spec yang sama).
 
 ## Open work
 
-**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) sudah landed; **Fase 2b: steer/follow-up queue** (terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) adalah item protocol berikutnya.
+**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed — berikutnya **Fase 3: daemon long-lived**.
+
+**Fase UX (open):** input-during-run di REPL inline (non-blokir) belum diimplementasikan — steer/follow-up tersedia di engine/CLI, tapi REPL masih idle-only untuk `/queue`.
 
 Sized by effort. Each item has its own home in
 [`../tasks/tasks-core-agentic.md`](../tasks/tasks-core-agentic.md) or

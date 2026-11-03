@@ -100,12 +100,12 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 | Handshake | `initialize` → `initialized`, capabilities negotiation | `Ready` → `Init` → `InitOk` (+ capabilities) | ✅ setara |
 | Versioning protokol | versi + gating capability per-method | `PROTOCOL_VERSION = 1` + capabilities + opt-out | ✅ setara |
 | Korelasi request↔event | `sub_id` + event id per turn | `request_id` di envelope | ✅ setara |
-| Antrian saat streaming | `thread/queue/add` (steer/follow-up) | — | 🔜 backlogged (lihat COMPARISON_PI_VS_AGENTIC.md) |
+| Antrian saat streaming | `thread/queue/add` (steer/follow-up) | `Request::Steer` antrian engine + follow-up client-side | ✅ ala pi (split shell/core) |
 | Daemon long-lived | `LocalDaemon` (Unix socket) | — | 🔜 fase lanjut |
 | Kontrol subprocess terisolasi | `exec-server` + pty + sandbox | `run_command` di core | 🔜 beda scope |
 | SDK bahasa lain | TS SDK resmi | — | 🔜 terbuka otomatis begitu protokol stabil |
 
-**Ringkasan gap:** yang memisahkan kita dari pola codex bukan fondasi — fondasinya (protokol versioned, handshake, engine generik atas `Transport`) sudah ada. Gap Fase 1 — **abstraction koneksi di sisi CLI** (`AgentConnection { InProcess, Spawned }`) dan **pemakaian `MemoryTransport`** lewat `InProcessClient` sebagai mode embedded default — **sudah tertutup di branch ini**. Jarak yang tersisa ke pola codex adalah **Fase 2b** (antrian steer/follow-up saat streaming), **daemon long-lived** (Fase 3), dan **SDK bahasa lain** (Fase 4).
+**Ringkasan gap:** yang memisahkan kita dari pola codex bukan fondasi — fondasinya (protokol versioned, handshake, engine generik atas `Transport`) sudah ada. Gap Fase 1 — **abstraction koneksi di sisi CLI** (`AgentConnection { InProcess, Spawned }`) dan **pemakaian `MemoryTransport`** lewat `InProcessClient` sebagai mode embedded default — **sudah tertutup di branch ini**. Jarak yang tersisa ke pola codex adalah **daemon long-lived** (Fase 3) dan **SDK bahasa lain** (Fase 4).
 
 ---
 
@@ -132,12 +132,26 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 4. Panic isolation: tangkap panic di thread engine → terjemahkan jadi event `Error` → TUI tawarkan respawn (UX sama seperti "runtime died" sekarang).
 5. **Test matrix**: skenario identik dijalankan terhadap `StdioTransport` dan `MemoryTransport` (regresi serialisasi hanya muncul di jalur spawn).
 
-### Fase 2 — Protocol hardening gaya codex ✅ (landed 2026-11, kecuali antrian steer → Fase 2b)
+### Fase 2 — Protocol hardening gaya codex ✅ (landed 2026-11)
 
 1. ✅ Tambah `capabilities` ke `Init` (mis. `experimental_api: bool`) + gating per-request di `RuntimeEngine`; error semantik `"not initialized"` / `"already initialized"`.
 2. ✅ Notification opt-out list (hemat bandwidth delta untuk frontend yang tak butuh) — allowlist `NotificationKind` via `ConnectionCapabilities.optOutNotify`.
 3. ✅ Pisahkan tipe "internal" (UI↔core, boleh berubah bebas) dari "external" (wire, harus versioned ketat) — di codex ini dua ruang tipe di `codex-protocol`. Di kita: kelompokkan eksplisit di `protocol.rs`, atau ekstrak crate `agentic-protocol` saat frontend non-Rust nyata dibutuhkan.
-4. ⏳ Belum — antrian pesan saat streaming (steer/follow-up); pindah ke **Fase 2b** (sudah dianalisis di `COMPARISON_PI_VS_AGENTIC.md`).
+4. ✅ Antrian pesan saat streaming (steer/follow-up) — landed sebagai **Fase 2b** (lihat sub-catatan di bawah).
+
+#### Fase 2b — Antrian steer/follow-up ✅ (landed 2026-11)
+
+Split ala pi: **steer di engine, follow-up di client**. `Request::Steer { content }`
+menaruh teks user di antrian FIFO engine; di batas iterasi (tool boundary) berikutnya
+teks disuntik sebagai user message nyata dan diumumkan `Steered` (ack `SteerQueued`).
+Antrian aman terhadap gate: steer yang masuk saat gate pending tidak mengganggu alur
+gate dan dikonsumsi di batas berikutnya setelah gate selesai — input user tidak hilang.
+Gating ketat: `Steer` sebelum `Init` → `not initialized`, tanpa run aktif →
+`no active run`.
+
+CLI: flag global `--queue-mode interrupt|follow-up` + slash `/queue`. `interrupt`
+mengirim steer live ke engine; `follow-up` (default) mengantri teks client-side dan
+memicu run berikutnya sendiri setelah `Done`. Additive — `PROTOCOL_VERSION` tetap 1.
 
 ### Fase 3 — Daemon mode (ala `LocalDaemon` opencode/codex)
 

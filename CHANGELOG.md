@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eksperimental), dan notification opt-out (`ConnectionCapabilities.
   optOutNotify`, allowlist: thinking/assistant_delta/warning/todo_changed).
   Semua additive; `PROTOCOL_VERSION` tetap 1.
+- Runtime: **steer & queue** (Fase 2b) — the agent can now be steered
+  mid-run: `Request::Steer { content }` queues user text engine-side;
+  at the next tool boundary it is injected as a real user message and
+  announced with `Steered` (ack via `SteerQueued`). Errors: `not
+  initialized` / `no active run`. Pending gates never lose user input.
+  CLI adds `--queue-mode interrupt|follow-up` and the `/queue` slash
+  command: `interrupt` sends live steers, `follow-up` (default) queues
+  text client-side and issues the next run itself. Additive; protocol
+  version stays 1.
 
 ### Changed
 - Tests: the two CLI e2e smoke tests now spawn the real `agentic-runtime`
