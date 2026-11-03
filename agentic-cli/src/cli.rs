@@ -54,6 +54,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_log_file: bool,
 
+    /// Runtime connection mode
+    ///
+    /// - embedded: run the agent engine in-process (default; no separate
+    ///   agentic-runtime binary needed)
+    /// - spawn:    spawn the agentic-runtime daemon subprocess (JSONL over
+    ///   stdio; honors AGENTIC_RUNTIME_BIN)
+    #[arg(long, global = true, value_name = "MODE", default_value = "embedded")]
+    pub runtime: RuntimeModeArg,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -72,6 +81,25 @@ impl From<PermissionModeArg> for core_agentic::PermissionMode {
             PermissionModeArg::Default => core_agentic::PermissionMode::Default,
             PermissionModeArg::Plan => core_agentic::PermissionMode::Plan,
             PermissionModeArg::Yolo => core_agentic::PermissionMode::Yolo,
+        }
+    }
+}
+
+/// Which runtime connection mode to use
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum RuntimeModeArg {
+    /// Run the agent engine in-process (default; single binary)
+    #[default]
+    Embedded,
+    /// Spawn the agentic-runtime daemon subprocess
+    Spawn,
+}
+
+impl From<RuntimeModeArg> for crate::client::RuntimeMode {
+    fn from(arg: RuntimeModeArg) -> Self {
+        match arg {
+            RuntimeModeArg::Embedded => crate::client::RuntimeMode::Embedded,
+            RuntimeModeArg::Spawn => crate::client::RuntimeMode::Spawn,
         }
     }
 }

@@ -462,8 +462,9 @@ pub struct Commands {
     config: Config,
     // orchestrator removed (P1-1 DoD: no Orchestrator::new in CLI —
     // all agent runs go through the agentic-runtime daemon).
-    runtime_client: Option<crate::client::RuntimeClient>,
+    connection: Option<crate::client::AgentConnection>,
     runtime_config_path: Option<String>,
+    runtime_mode: crate::client::RuntimeMode,
     color_enabled: bool,
     debug_enabled: bool,
     permission_mode: core_agentic::PermissionMode,
@@ -500,8 +501,9 @@ impl Commands {
         Self {
             config,
 
-            runtime_client: None,
+            connection: None,
             runtime_config_path: None,
+            runtime_mode: crate::client::RuntimeMode::Embedded,
             color_enabled: true,
             debug_enabled: false,
             permission_mode: core_agentic::PermissionMode::Default,
@@ -519,8 +521,13 @@ impl Commands {
         self
     }
 
-    async fn ensure_runtime(&mut self) -> Result<()> {
-        if self.runtime_client.is_some() {
+    pub fn with_runtime_mode(mut self, mode: crate::client::RuntimeMode) -> Self {
+        self.runtime_mode = mode;
+        self
+    }
+
+    async fn ensure_connection(&mut self) -> Result<()> {
+        if self.connection.is_some() {
             return Ok(());
         }
         let overrides = core_agentic::runtime::protocol::InitOverrides {
@@ -529,7 +536,9 @@ impl Commands {
             model: self.config.active_model().map(|model| model.model.clone()),
             system_prompt: self.config.system_prompt.clone(),
         };
-        self.runtime_client = Some(crate::client::RuntimeClient::spawn(overrides).await?);
+        self.connection = Some(
+            crate::client::AgentConnection::connect(self.runtime_mode, overrides).await?,
+        );
         Ok(())
     }
 
@@ -831,8 +840,8 @@ impl Commands {
     ///
     /// No-op when the orchestrator hasn't been initialized yet.
     pub async fn restart_session(&mut self) -> Result<()> {
-        self.ensure_runtime().await?;
-        let runtime = self.runtime_client.as_mut().unwrap();
+        self.ensure_connection().await?;
+        let runtime = self.connection.as_mut().unwrap();
         let event = runtime
             .send_and_wait(core_agentic::runtime::protocol::Request::ResetSession)
             .await?;
@@ -844,11 +853,11 @@ impl Commands {
     }
 
     pub async fn list_tools(&mut self) {
-        if let Err(e) = self.ensure_runtime().await {
+        if let Err(e) = self.ensure_connection().await {
             inline::print_line(&components::error_badge(&e.to_string()));
             return;
         }
-        let runtime = self.runtime_client.as_mut().unwrap();
+        let runtime = self.connection.as_mut().unwrap();
         let reply = match runtime
             .send_and_wait(core_agentic::runtime::protocol::Request::ListTools)
             .await
@@ -913,7 +922,7 @@ impl Commands {
 
         // Reset orchestrator so it reinitializes with new model
 
-        self.runtime_client = None;
+        self.connection = None;
 
         Ok((active_provider, active_model))
     }
@@ -1213,12 +1222,12 @@ impl Commands {
             inline::print_blank();
             return;
         }
-        if let Err(error) = self.ensure_runtime().await {
+        if let Err(error) = self.ensure_connection().await {
             inline::print_line(&components::error_badge(&error.to_string()));
             return;
         }
         let response = self
-            .runtime_client
+            .connection
             .as_mut()
             .unwrap()
             .send_and_wait(core_agentic::runtime::protocol::Request::SearchMemory {
@@ -1299,11 +1308,11 @@ impl Commands {
         ));
         inline::print_blank();
 
-        if let Err(e) = self.ensure_runtime().await {
+        if let Err(e) = self.ensure_connection().await {
             inline::print_line(&components::error_badge(&e.to_string()));
             return Ok(());
         }
-        let runtime = self.runtime_client.as_mut().unwrap();
+        let runtime = self.connection.as_mut().unwrap();
 
         // Full planner lifecycle on the daemon: LLM plan creation, the
         // approval gate (blocking dialoguer prompt is safe here — the
@@ -1506,7 +1515,7 @@ impl Commands {
             }
         }
 
-        self.ensure_runtime().await?;
+        self.ensure_connection().await?;
 
         // Runtime events are forwarded to the existing single-writer renderer.
         let show_tool_calls = self.config.output.show_tool_calls;
@@ -1692,7 +1701,7 @@ impl Commands {
             .expect("failed to spawn renderer thread");
 
         let runtime = self
-            .runtime_client
+            .connection
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Runtime not initialized"))?;
         let result = runtime
@@ -1804,9 +1813,9 @@ impl Commands {
         E: Fn(core_agentic::Event) + Send + Sync + 'static,
     {
         let expanded = crate::file_ref::expand_with_attachments(task);
-        self.ensure_runtime().await?;
+        self.ensure_connection().await?;
         let runtime = self
-            .runtime_client
+            .connection
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Runtime not initialized"))?;
 
@@ -2081,10 +2090,10 @@ Instructions the agent follows when this skill is loaded.
     ///
     /// Returns the skill body content on success.
     pub async fn load_and_activate_skill(&mut self, name: &str) -> Result<String, String> {
-        if let Err(e) = self.ensure_runtime().await {
+        if let Err(e) = self.ensure_connection().await {
             return Err(e.to_string());
         }
-        let runtime = self.runtime_client.as_mut().unwrap();
+        let runtime = self.connection.as_mut().unwrap();
         let reply = runtime
             .send_and_wait(core_agentic::runtime::protocol::Request::SkillActivate {
                 name: name.to_string(),
@@ -3295,6 +3304,7 @@ mod search_snippet_tests {
 #[cfg(test)]
 mod e2e_tests {
     use super::*;
+    use crate::client::RuntimeMode;
     use std::sync::{Arc, Mutex};
 
     /// Write a minimal config file pinning the spawned `agentic-runtime`
@@ -3336,19 +3346,21 @@ mod e2e_tests {
         path
     }
 
-    /// `run_with_callbacks` must stream the daemon's session lifecycle
-    /// events through to the caller's callback. The real `agentic-runtime`
-    /// subprocess is spawned and driven over the wire protocol; the pinned
-    /// unreachable provider makes the session fail deterministically.
+    /// `run_with_callbacks` must stream the session lifecycle
+    /// events through to the caller's callback, in BOTH connection modes.
+    /// The embedded engine runs as a thread inside this process; the
+    /// spawned mode launches the real `agentic-runtime` subprocess over
+    /// the wire protocol. The pinned unreachable provider makes the
+    /// session fail deterministically in both cases.
     ///
     /// Tool-call / model-response semantics are covered by
     /// `core-agentic/tests/runtime_engine.rs` (in-process engine tests).
-    #[tokio::test]
-    async fn smoke_run_with_callbacks_streams_daemon_lifecycle_events() {
+    async fn smoke_lifecycle(mode: RuntimeMode) {
         let fixture = hermetic_runtime_config();
 
         let mut commands = Commands::new(Config::fallback())
             .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(mode)
             .with_permission_mode(core_agentic::PermissionMode::Yolo);
 
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -3383,6 +3395,16 @@ mod e2e_tests {
         );
     }
 
+    #[tokio::test]
+    async fn smoke_lifecycle_embedded() {
+        smoke_lifecycle(RuntimeMode::Embedded).await;
+    }
+
+    #[tokio::test]
+    async fn smoke_lifecycle_spawned() {
+        smoke_lifecycle(RuntimeMode::Spawn).await;
+    }
+
     /// Regression test for the frozen-"Thinking…" deadlock: `Commands::run`
     /// (the inline renderer-thread path) used to leave `chunk_tx` alive in
     /// its own stack frame while blocking on `renderer.join()`. The renderer
@@ -3390,16 +3412,16 @@ mod e2e_tests {
     /// *every* `Sender` is dropped — so it never exited and the spinner
     /// stayed on screen forever.
     ///
-    /// Driven through the real daemon with an unreachable provider so the
-    /// renderer must still join cleanly on the session-failure path.
+    /// Driven through both connection modes with an unreachable provider so
+    /// the renderer must still join cleanly on the session-failure path.
     /// Multi-thread runtime + timeout: without the fix this test fails with
     /// a timeout instead of hanging the whole test binary.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn smoke_run_through_daemon_does_not_deadlock() {
+    async fn smoke_no_deadlock(mode: RuntimeMode) {
         let fixture = hermetic_runtime_config();
 
         let mut commands = Commands::new(Config::fallback())
             .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(mode)
             .with_permission_mode(core_agentic::PermissionMode::Yolo);
 
         let result = tokio::time::timeout(
@@ -3413,6 +3435,16 @@ mod e2e_tests {
         // `run` renders session failures as an error badge and returns Ok —
         // the regression here is returning at all, not the outcome.
         assert!(result.is_ok(), "run should complete: {:?}", result.err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_no_deadlock_embedded() {
+        smoke_no_deadlock(RuntimeMode::Embedded).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_no_deadlock_spawned() {
+        smoke_no_deadlock(RuntimeMode::Spawn).await;
     }
 }
 

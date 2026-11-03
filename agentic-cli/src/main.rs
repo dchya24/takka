@@ -254,7 +254,8 @@ async fn main() -> Result<()> {
         .with_runtime_config_path(cli.config.clone())
         .with_color(color_enabled)
         .with_debug(cli.debug)
-        .with_permission_mode(cli.mode.into());
+        .with_permission_mode(cli.mode.into())
+        .with_runtime_mode(cli.runtime.into());
 
     // ── Command dispatch ───────────────────────────────────
     match &cli.command {

@@ -336,6 +336,87 @@ impl ConnectionIo for InProcessClient {
     }
 }
 
+/// Which connection mode the CLI uses to reach the agent engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuntimeMode {
+    /// Engine runs as a thread inside this process (default; no runtime
+    /// binary needed).
+    #[default]
+    Embedded,
+    /// Spawn the `agentic-runtime` daemon subprocess (JSONL over stdio).
+    Spawn,
+}
+
+/// One connection abstraction over both transports (codex's
+/// `AppServerClient { Embedded, Remote }` pattern): embedded and spawned
+/// are not two products — they are two transports behind one client.
+pub enum AgentConnection {
+    Spawned(RuntimeClient),
+    InProcess(InProcessClient),
+}
+
+impl AgentConnection {
+    pub async fn connect(mode: RuntimeMode, overrides: InitOverrides) -> Result<Self> {
+        match mode {
+            RuntimeMode::Embedded => {
+                Ok(Self::InProcess(InProcessClient::start(overrides).await?))
+            }
+            RuntimeMode::Spawn => Ok(Self::Spawned(RuntimeClient::spawn(overrides).await?)),
+        }
+    }
+
+    pub async fn send(&mut self, request: Request) -> Result<String> {
+        match self {
+            Self::Spawned(client) => client.send(request).await,
+            Self::InProcess(client) => client.send(request).await,
+        }
+    }
+
+    pub async fn next_event(&mut self) -> Result<ProtocolEvent> {
+        match self {
+            Self::Spawned(client) => client.next_event().await,
+            Self::InProcess(client) => client.next_event().await,
+        }
+    }
+
+    pub async fn send_and_wait(&mut self, request: Request) -> Result<ProtocolEvent> {
+        send_and_wait_io(self, request).await
+    }
+
+    pub async fn run<C, E, R>(
+        &mut self,
+        task: String,
+        attachments: Vec<core_agentic::Attachment>,
+        on_chunk: C,
+        on_event: E,
+        responder: R,
+    ) -> Result<String>
+    where
+        C: FnMut(&str),
+        E: FnMut(core_agentic::Event),
+        R: FnMut(&ProtocolEvent) -> Option<Request>,
+    {
+        run_turn(self, task, attachments, on_chunk, on_event, responder).await
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Spawned(client) => client.shutdown().await,
+            Self::InProcess(client) => client.shutdown().await,
+        }
+    }
+}
+
+impl ConnectionIo for AgentConnection {
+    fn raw_send(&mut self, request: Request) -> impl Future<Output = Result<String>> + Send {
+        self.send(request)
+    }
+
+    fn raw_next_event(&mut self) -> impl Future<Output = Result<ProtocolEvent>> + Send {
+        self.next_event()
+    }
+}
+
 pub fn runtime_binary() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("AGENTIC_RUNTIME_BIN") {
         return Ok(PathBuf::from(path));
@@ -424,6 +505,32 @@ mod in_process_tests {
         .expect("ListTools failed");
         assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
         client.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn agent_connection_connects_in_both_modes() {
+        // Embedded (default): tanpa binary agentic-runtime sama sekali.
+        let mut embedded = AgentConnection::connect(
+            RuntimeMode::Embedded,
+            hermetic_overrides(),
+        )
+        .await
+        .expect("embedded connect");
+        let event = embedded.send_and_wait(Request::ListTools).await.expect("list tools");
+        assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
+        embedded.shutdown().await.expect("embedded shutdown");
+
+        // Spawn: jalur lama lewat binary daemon (runtime_binary() menemukan
+        // target/debug/agentic-runtime hasil cargo test workspace).
+        let mut spawned = AgentConnection::connect(
+            RuntimeMode::Spawn,
+            hermetic_overrides(),
+        )
+        .await
+        .expect("spawned connect");
+        let event = spawned.send_and_wait(Request::ListTools).await.expect("list tools");
+        assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
+        spawned.shutdown().await.expect("spawned shutdown");
     }
 
     #[tokio::test]
