@@ -75,6 +75,11 @@ pub enum Request {
         #[serde(default)]
         attachments: Vec<Attachment>,
     },
+    /// Steer the currently-running agent: content masuk sebagai user
+    /// message di iteration boundary berikutnya (reply: `SteerQueued`).
+    Steer {
+        content: String,
+    },
     Cancel,
     ResetSession,
     SearchMemory {

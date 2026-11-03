@@ -190,6 +190,84 @@ impl LLMProvider for CapturingScriptedProvider {
     }
 }
 
+/// Streaming counterpart of [`CapturingScriptedProvider`]: scripts
+/// `ChatResponse`s for `chat_stream()` calls (same single-chunk encoding
+/// as [`StreamingScriptedProvider`]) AND records every incoming
+/// `ChatRequest`. Used by the runtime steering tests to assert what the
+/// engine's run actually sent to the provider on each turn.
+pub struct CapturingStreamingScriptedProvider {
+    responses: Mutex<Vec<ChatResponse>>,
+    /// One entry per `chat_stream()` call, in call order.
+    pub requests: Mutex<Vec<ChatRequest>>,
+}
+
+impl CapturingStreamingScriptedProvider {
+    pub fn new(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl LLMProvider for CapturingStreamingScriptedProvider {
+    fn provider_type(&self) -> &str {
+        "capturing-stream"
+    }
+    fn provider_id(&self) -> &str {
+        "capturing-stream"
+    }
+    fn chat(&self, _req: ChatRequest) -> ProviderResult<ChatResponse> {
+        Err(ProviderError::new(
+            "streaming only — use chat_stream for CapturingStreamingScriptedProvider",
+        ))
+    }
+    fn chat_stream(&self, req: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
+        self.requests.lock().unwrap().push(req);
+        let mut q = self.responses.lock().unwrap();
+        if q.is_empty() {
+            return Err(ProviderError::new(
+                "CapturingStreamingScriptedProvider: no scripted response left",
+            ));
+        }
+        let resp = q.remove(0);
+
+        // Single chunk carrying either text delta or full tool calls
+        // (same encoding as StreamingScriptedProvider).
+        let mut chunks = Vec::new();
+        if resp.message.tool_calls.is_empty() {
+            chunks.push(Ok(ChatChunk {
+                id: resp.id.clone(),
+                delta: resp.message.content.clone().unwrap_or_default(),
+                finish_reason: resp.finish_reason.clone(),
+                tool_calls: vec![],
+                usage: resp.usage.clone(),
+            }));
+        } else {
+            let tool_calls: Vec<ToolCallDelta> = resp
+                .message
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCallDelta {
+                    index: 0,
+                    id: Some(tc.id.clone()),
+                    function_name: Some(tc.function.name.clone()),
+                    function_arguments: Some(tc.function.arguments.clone()),
+                })
+                .collect();
+            chunks.push(Ok(ChatChunk {
+                id: resp.id.clone(),
+                delta: resp.message.content.clone().unwrap_or_default(),
+                finish_reason: resp.finish_reason.clone(),
+                tool_calls,
+                usage: resp.usage.clone(),
+            }));
+        }
+
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
 /// Provider that streams scripted `ChatResponse`s in order, one per
 /// `chat_stream()` call. Text content is streamed as a single delta;
 /// tool calls are delivered as one chunk carrying the full arguments.

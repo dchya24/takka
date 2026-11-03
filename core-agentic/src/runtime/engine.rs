@@ -85,6 +85,11 @@ pub struct RuntimeEngine<T: Transport> {
     /// Discovered skill index — populated by [`Self::initialize`], used
     /// by `Request::SkillActivate` (resolve + inject).
     skill_index: Option<Arc<std::sync::RwLock<crate::SkillIndex>>>,
+    /// Steer queue (Fase 2b): `Request::Steer` pushes here while a run
+    /// is active; the orchestrator's steering source drains the whole
+    /// FIFO at each iteration boundary. One shared `Arc` connects the
+    /// engine arm to the orchestrator hook, wherever it was built.
+    steer_queue: Arc<Mutex<std::collections::VecDeque<String>>>,
     running: Arc<AtomicBool>,
     current_request_id: Arc<Mutex<Option<String>>>,
     pending_question: Arc<Mutex<Option<mpsc::Sender<Vec<QuestionAnswer>>>>>,
@@ -106,6 +111,7 @@ impl<T: Transport> RuntimeEngine<T> {
             initialized: false,
             capabilities: ConnectionCapabilities::default(),
             skill_index: None,
+            steer_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             running: Arc::new(AtomicBool::new(false)),
             current_request_id: Arc::new(Mutex::new(None)),
             pending_question: Arc::new(Mutex::new(None)),
@@ -116,7 +122,9 @@ impl<T: Transport> RuntimeEngine<T> {
 
     pub fn with_session(transport: T, provider: Arc<dyn LLMProvider>, tools: ToolRegistry) -> Self {
         let mut engine = Self::new(transport);
-        engine.orchestrator = Some(Arc::new(Orchestrator::new(provider, tools)));
+        let mut orchestrator = Orchestrator::new(provider, tools);
+        engine.install_steering_source(&mut orchestrator);
+        engine.orchestrator = Some(Arc::new(orchestrator));
         engine.initialized = true;
         engine
     }
@@ -167,6 +175,7 @@ impl<T: Transport> RuntimeEngine<T> {
             );
             receiver.recv().unwrap_or(false)
         });
+        engine.install_steering_source(&mut orchestrator);
         engine.orchestrator = Some(Arc::new(orchestrator));
         engine.initialized = true;
         engine
@@ -250,6 +259,26 @@ impl<T: Transport> RuntimeEngine<T> {
                 Request::Cancel => {
                     if let Some(orchestrator) = self.orchestrator.as_ref() {
                         orchestrator.cancel_handle().store(true, Ordering::SeqCst);
+                    }
+                }
+                Request::Steer { content } => {
+                    if !self.initialized {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                    } else if !self.running.load(Ordering::SeqCst) {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "no active run".to_string(),
+                            },
+                        );
+                    } else {
+                        self.steer_queue.lock().unwrap().push_back(content.clone());
+                        self.emit(Some(request.id), Event::SteerQueued { content });
                     }
                 }
                 Request::ResetSession => {
@@ -456,8 +485,20 @@ impl<T: Transport> RuntimeEngine<T> {
             orchestrator.set_max_iterations(max_iterations);
         }
         self.install_confirmation_handler(&mut orchestrator);
+        self.install_steering_source(&mut orchestrator);
         self.orchestrator = Some(Arc::new(orchestrator));
         Ok(())
+    }
+
+    /// Bind the engine's steer queue to an orchestrator (Fase 2b): the
+    /// steering source drains the whole FIFO at every iteration boundary
+    /// (Fase 2b orchestrator poll). One shared `Arc` queue is used
+    /// across the engine field and this closure.
+    fn install_steering_source(&self, orchestrator: &mut Orchestrator) {
+        let queue = self.steer_queue.clone();
+        orchestrator.set_steering_source(Box::new(move || {
+            queue.lock().unwrap().drain(..).collect()
+        }));
     }
 
     fn runtime_tool_deps(&self) -> ToolDeps {

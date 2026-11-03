@@ -6,7 +6,9 @@ use core_agentic::providers::{
     ProviderResult, StreamResult,
 };
 use core_agentic::runtime::engine::RuntimeEngine;
-use core_agentic::runtime::protocol::{ConnectionCapabilities, ProtocolRequest, Request};
+use core_agentic::runtime::protocol::{
+    ConnectionCapabilities, ProtocolEvent, ProtocolRequest, Request,
+};
 use core_agentic::runtime::transport::MemoryTransport;
 use core_agentic::{QuestionAnswer, ToolRegistry};
 
@@ -692,4 +694,398 @@ fn golden_event_stream_text_only_run() {
     // SessionStarted must come first; Done must come last
     assert_eq!(relevant.first(), Some(&"session_started"));
     assert_eq!(relevant.last(), Some(&"done"));
+}
+
+// ── Steering (Fase 2b, Task 2): Request::Steer + engine queue ───────
+
+/// Hard-deadline event read: test tidak pernah menggantung — setiap
+/// baca dibatasi waktu, deadline lewat = panic dengan konteks.
+fn recv_until(
+    event_rx: &std::sync::mpsc::Receiver<ProtocolEvent>,
+    deadline: std::time::Instant,
+) -> ProtocolEvent {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    event_rx
+        .recv_timeout(remaining)
+        .expect("event stream must produce events before the deadline")
+}
+
+const STEER_TEXT: &str = "use the lake theme instead";
+
+/// Steer saat run aktif: SteerQueued reply segera (di-tag dengan request
+/// id steer), Steered di-emit dengan request id RUN (bukan id steer),
+/// dan konteks provider berikutnya memuat steer sebagai user message.
+#[test]
+fn steer_during_run_injects_at_next_boundary() {
+    let provider = std::sync::Arc::new(support::CapturingStreamingScriptedProvider::new(vec![
+        // Turn 1: tool call — tool-nya sleep, jadi steer masih sempat
+        // tiba sebelum boundary berikutnya.
+        support::tool_call_response("t1", "grep", &serde_json::json!({"pattern": "x"})),
+        // Turn 2: final.
+        support::text_response("done"),
+    ]));
+    let registry = ToolRegistry::new();
+    registry.register(Box::new(support::SlowReadTool::new(
+        "grep",
+        std::time::Duration::from_millis(300),
+    )));
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        provider.clone(),
+        registry,
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "run-1",
+            Request::Run {
+                task: "find x".into(),
+                attachments: vec![],
+            },
+        ))
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    // Tunggu sampai run terbukti in-flight: ToolStarted terlihat.
+    loop {
+        let event = recv_until(&event_rx, deadline);
+        match event.event {
+            Event::ToolStarted { .. } => break,
+            Event::Done { .. } | Event::Error { .. } => {
+                panic!("run ended before the steer window opened: {:?}", event.event)
+            }
+            _ => {}
+        }
+    }
+
+    // Steer tiba saat run aktif (tool masih dieksekusi).
+    request_tx
+        .send(ProtocolRequest::new(
+            "steer-1",
+            Request::Steer {
+                content: STEER_TEXT.into(),
+            },
+        ))
+        .unwrap();
+
+    let mut steer_queued_ids = Vec::new();
+    let mut steered = Vec::new();
+    loop {
+        let event = recv_until(&event_rx, deadline);
+        match &event.event {
+            Event::SteerQueued { content } => {
+                assert_eq!(content, STEER_TEXT);
+                steer_queued_ids
+                    .push(event.request_id.clone().expect("SteerQueued must be tagged"));
+            }
+            Event::Steered { content } => steered.push((
+                event.request_id.clone().expect("Steered must be tagged"),
+                content.clone(),
+            )),
+            Event::Done { .. } => break,
+            Event::Error { message } => panic!("run error: {message}"),
+            _ => {}
+        }
+    }
+    request_tx
+        .send(ProtocolRequest::new("shutdown", Request::Shutdown))
+        .unwrap();
+    worker.join().unwrap();
+
+    // 1. SteerQueued di-tag dengan request id steer.
+    assert_eq!(
+        steer_queued_ids,
+        vec!["steer-1".to_string()],
+        "SteerQueued must carry the steer request id"
+    );
+    // 2. Steered di-tag dengan run id, BUKAN id steer.
+    assert_eq!(steered.len(), 1, "exactly one Steered expected: {steered:?}");
+    assert_eq!(
+        steered[0].0, "run-1",
+        "Steered must carry the RUN request id, not the steer id"
+    );
+    assert_eq!(steered[0].1, STEER_TEXT);
+
+    // 3. Konteks model: steer tidak ada di turn 1, ada sebagai user
+    //    message di turn 2 (injected at the boundary, not at run start).
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "two provider calls expected");
+    assert!(
+        !requests[0]
+            .messages
+            .iter()
+            .any(|m| m.content.contains(STEER_TEXT)),
+        "steer must NOT be in the turn-1 request: {:?}",
+        requests[0].messages
+    );
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains(STEER_TEXT)),
+        "steer must reach turn 2 as a user message: {:?}",
+        requests[1].messages
+    );
+}
+
+/// Fresh engine (belum init): Steer ditolak strict.
+#[test]
+fn steer_before_init_is_rejected() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::new(MemoryTransport::new(request_rx, event_tx));
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "steer-1",
+            Request::Steer {
+                content: "early".into(),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.event, Event::Error { message } if message == "not initialized")),
+        "expected 'not initialized' error: {events:?}"
+    );
+}
+
+/// Engine initialized tapi tidak ada run aktif: Steer ditolak strict.
+#[test]
+fn steer_when_no_run_active_is_rejected() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "steer-1",
+            Request::Steer {
+                content: "idle".into(),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.event, Event::Error { message } if message == "no active run")),
+        "expected 'no active run' error: {events:?}"
+    );
+}
+
+/// Tiga steer di-queue saat satu run aktif → dikonsumsi FIFO berurutan
+/// a, b, c di boundary yang sama; tiap ack di-tag dengan id-nya.
+#[test]
+fn steers_consume_fifo_order() {
+    let provider = std::sync::Arc::new(support::CapturingStreamingScriptedProvider::new(vec![
+        support::tool_call_response("t1", "grep", &serde_json::json!({"pattern": "x"})),
+        support::text_response("done"),
+    ]));
+    let registry = ToolRegistry::new();
+    registry.register(Box::new(support::SlowReadTool::new(
+        "grep",
+        std::time::Duration::from_millis(300),
+    )));
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        provider,
+        registry,
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "run-1",
+            Request::Run {
+                task: "find x".into(),
+                attachments: vec![],
+            },
+        ))
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let event = recv_until(&event_rx, deadline);
+        match event.event {
+            Event::ToolStarted { .. } => break,
+            Event::Done { .. } | Event::Error { .. } => {
+                panic!("run ended before the steer window opened: {:?}", event.event)
+            }
+            _ => {}
+        }
+    }
+
+    for content in ["a", "b", "c"] {
+        request_tx
+            .send(ProtocolRequest::new(
+                format!("steer-{content}"),
+                Request::Steer {
+                    content: content.into(),
+                },
+            ))
+            .unwrap();
+    }
+
+    let mut queued = Vec::new();
+    let mut steered_contents = Vec::new();
+    loop {
+        let event = recv_until(&event_rx, deadline);
+        match &event.event {
+            Event::SteerQueued { content } => {
+                queued.push((event.request_id.clone().unwrap(), content.clone()));
+            }
+            Event::Steered { content } => steered_contents.push(content.clone()),
+            Event::Done { .. } => break,
+            Event::Error { message } => panic!("run error: {message}"),
+            _ => {}
+        }
+    }
+    request_tx
+        .send(ProtocolRequest::new("shutdown", Request::Shutdown))
+        .unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(
+        queued,
+        vec![
+            ("steer-a".to_string(), "a".to_string()),
+            ("steer-b".to_string(), "b".to_string()),
+            ("steer-c".to_string(), "c".to_string()),
+        ],
+        "setiap steer di-ack dengan request id-nya"
+    );
+    assert_eq!(
+        steered_contents,
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        "drain at the boundary must be FIFO"
+    );
+}
+
+/// Gate-safety: steer saat confirmation gate pending TETAP di-queue
+/// (run masih aktif meski diblokir menunggu approval), lalu dikonsumsi
+/// di boundary setelah gate disetujui — steer tidak mengganggu gate.
+#[test]
+fn steer_during_pending_confirmation_gate_is_queued_and_consumed_after_gate() {
+    let provider = std::sync::Arc::new(support::CapturingStreamingScriptedProvider::new(vec![
+        // Turn 1: run_command → butuh approval di Default mode.
+        support::tool_call_response(
+            "c1",
+            "run_command",
+            &serde_json::json!({"command": "curl --version"}),
+        ),
+        // Turn 2: final.
+        support::text_response("executed"),
+    ]));
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_provider(
+        MemoryTransport::new(request_rx, event_tx),
+        provider.clone(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "run-g",
+            Request::Run {
+                task: "execute".into(),
+                attachments: vec![],
+            },
+        ))
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Tunggu gate terbuka — run thread memblokir menunggu approval.
+    loop {
+        let event = recv_until(&event_rx, deadline);
+        match event.event {
+            Event::ConfirmationRequest { .. } => break,
+            Event::Done { .. } | Event::Error { .. } => panic!(
+                "run ended before the confirmation gate opened: {:?}",
+                event.event
+            ),
+            _ => {}
+        }
+    }
+
+    // Steer saat gate pending: run aktif → harus di-queue, bukan error.
+    request_tx
+        .send(ProtocolRequest::new(
+            "steer-g",
+            Request::Steer {
+                content: "steer at the gate".into(),
+            },
+        ))
+        .unwrap();
+    // Lalu jawab gate (disposisi FIFO: Steer diproses lebih dulu).
+    request_tx
+        .send(ProtocolRequest::new(
+            "approve-g",
+            Request::ConfirmResponse {
+                request_id: Some("run-g".into()),
+                approved: true,
+            },
+        ))
+        .unwrap();
+
+    let mut saw_queued = false;
+    let mut steered = Vec::new();
+    loop {
+        let event = recv_until(&event_rx, deadline);
+        match &event.event {
+            Event::SteerQueued { content } => {
+                assert_eq!(content, "steer at the gate");
+                assert_eq!(event.request_id.as_deref(), Some("steer-g"));
+                saw_queued = true;
+            }
+            Event::Steered { content } => steered.push((
+                event.request_id.clone().expect("Steered must be tagged"),
+                content.clone(),
+            )),
+            Event::Done { .. } => break,
+            Event::Error { message } => panic!("run error: {message}"),
+            _ => {}
+        }
+    }
+    request_tx
+        .send(ProtocolRequest::new("shutdown", Request::Shutdown))
+        .unwrap();
+    worker.join().unwrap();
+
+    assert!(saw_queued, "steer during a pending gate must be queued");
+    assert_eq!(
+        steered,
+        vec![("run-g".to_string(), "steer at the gate".to_string())],
+        "steer consumed after the gate, tagged with the run id"
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert!(
+        requests[1]
+            .messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("steer at the gate")),
+        "steer must reach the model after the gate: {:?}",
+        requests[1].messages
+    );
 }
