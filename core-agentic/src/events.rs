@@ -225,6 +225,19 @@ pub enum Event {
     #[serde(rename = "session_failed")]
     #[serde(rename_all = "camelCase")]
     SessionFailed { message: String },
+
+    // ------------------------------------------------------------------
+    // Steering (Fase 2b). User-initiated mid-run guidance.
+    // ------------------------------------------------------------------
+    /// Emitted by the engine when `Request::Steer` is accepted (immediate
+    /// ack; the queued text is consumed later at an iteration boundary).
+    #[serde(rename = "steer_queued")]
+    SteerQueued { content: String },
+
+    /// Emitted by the orchestrator when a queued steer is consumed at an
+    /// iteration boundary and added to memory as a user message.
+    #[serde(rename = "steered")]
+    Steered { content: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +301,8 @@ pub enum EventType {
     SessionCompleted,
     StateChanged,
     SessionFailed,
+    SteerQueued,
+    Steered,
 }
 
 impl Event {
@@ -329,6 +344,8 @@ impl Event {
             Event::SessionCompleted { .. } => EventType::SessionCompleted,
             Event::StateChanged { .. } => EventType::StateChanged,
             Event::SessionFailed { .. } => EventType::SessionFailed,
+            Event::SteerQueued { .. } => EventType::SteerQueued,
+            Event::Steered { .. } => EventType::Steered,
         }
     }
 }
@@ -491,5 +508,29 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["model"], "claude-3");
         assert_eq!(json["messageCount"], 7);
+    }
+
+    #[test]
+    fn steer_events_serialize_with_wire_tags() {
+        // Fase 2b: engine ack (steer_queued) and orchestrator boundary
+        // consumption (steered) must round-trip with stable wire tags so
+        // non-Rust frontends can consume the stream.
+        let queued = Event::SteerQueued {
+            content: "focus on tests".into(),
+        };
+        let json = serde_json::to_value(&queued).unwrap();
+        assert_eq!(json["type"], "steer_queued");
+        assert_eq!(json["content"], "focus on tests");
+        let parsed: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.event_type(), EventType::SteerQueued);
+
+        let steered = Event::Steered {
+            content: "focus on tests".into(),
+        };
+        let json = serde_json::to_value(&steered).unwrap();
+        assert_eq!(json["type"], "steered");
+        assert_eq!(json["content"], "focus on tests");
+        let parsed: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.event_type(), EventType::Steered);
     }
 }

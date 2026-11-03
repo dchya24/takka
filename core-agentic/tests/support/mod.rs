@@ -147,6 +147,49 @@ impl LLMProvider for RecordingProvider {
     }
 }
 
+/// Provider that returns scripted `ChatResponse`s in order, one per
+/// `chat()` call, AND captures every incoming `ChatRequest`. Used by the
+/// steering tests to assert what context the orchestrator actually sent
+/// to the provider on each turn.
+pub struct CapturingScriptedProvider {
+    responses: Mutex<Vec<ChatResponse>>,
+    /// One entry per `chat()` call, in call order.
+    pub requests: Mutex<Vec<ChatRequest>>,
+}
+
+impl CapturingScriptedProvider {
+    pub fn new(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl LLMProvider for CapturingScriptedProvider {
+    fn provider_type(&self) -> &str {
+        "capturing"
+    }
+    fn provider_id(&self) -> &str {
+        "capturing"
+    }
+    fn chat(&self, req: ChatRequest) -> ProviderResult<ChatResponse> {
+        self.requests.lock().unwrap().push(req);
+        let mut q = self.responses.lock().unwrap();
+        if q.is_empty() {
+            return Err(ProviderError::new(
+                "CapturingScriptedProvider: no scripted response left",
+            ));
+        }
+        Ok(q.remove(0))
+    }
+    fn chat_stream(&self, _req: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
+        Err(ProviderError::new(
+            "streaming not supported in CapturingScriptedProvider",
+        ))
+    }
+}
+
 /// Provider that streams scripted `ChatResponse`s in order, one per
 /// `chat_stream()` call. Text content is streamed as a single delta;
 /// tool calls are delivered as one chunk carrying the full arguments.

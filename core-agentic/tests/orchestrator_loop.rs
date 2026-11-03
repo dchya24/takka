@@ -199,6 +199,97 @@ fn finalization_turn_advertises_zero_tools() {
     );
 }
 
+/// Steering hook (Fase 2b): messages queued in the steering source are
+/// injected as user messages at the next iteration boundary and
+/// announced via `Event::Steered`.
+#[test]
+fn steering_source_messages_injected_at_iteration_boundary() {
+    // Turn 1 returns a tool call (run not finished → a second boundary
+    // exists); turn 2 returns the final answer. After the tool executes
+    // (turn 1 done), the orchestrator polls `steering_source()` BEFORE
+    // the turn-2 LLM call — that's where the steer lands.
+    let steering = Arc::new(Mutex::new(vec!["use the lake theme instead".to_string()]));
+    let steering_source = {
+        let steering = steering.clone();
+        move || steering.lock().unwrap().drain(..).collect::<Vec<_>>()
+    };
+
+    let provider = Arc::new(support::CapturingScriptedProvider::new(vec![
+        support::tool_call_response("t1", "grep", &serde_json::json!({"pattern": "x"})),
+        support::text_response("done"),
+    ]));
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+    let orch = {
+        let mut orch = Orchestrator::new(provider.clone(), tools);
+        orch.set_permission_mode(PermissionMode::Yolo);
+        orch.set_steering_source(Box::new(steering_source));
+        orch
+    };
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    let answer = orch.run("pick a theme").expect("run should succeed");
+    assert_eq!(answer, "done");
+
+    // `Steered` emitted with the right content.
+    assert!(
+        events.lock().unwrap().iter().any(
+            |e| matches!(e, Event::Steered { content } if content == "use the lake theme instead")
+        ),
+        "expected a Steered event, got {:?}",
+        events.lock().unwrap()
+    );
+
+    // The turn-2 request context carries the steer as a user message
+    // (it reaches the model before the final answer — not lost).
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expected two provider calls");
+    let second = &requests[1];
+    assert!(
+        second
+            .messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.contains("use the lake theme instead")),
+        "steer text must reach turn 2 as a user message, got {:?}",
+        second.messages
+    );
+}
+
+/// Without a steering source the run is unchanged: no `Steered` events.
+#[test]
+fn run_without_steering_source_has_no_steered_events() {
+    let provider: Arc<dyn LLMProvider> =
+        Arc::new(ScriptedProvider::new(vec![support::text_response("plain answer")]));
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    let answer = orch.run("hello").expect("run should succeed");
+    assert_eq!(answer, "plain answer");
+
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::Steered { .. })),
+        "no Steered events expected without a steering source, got {:?}",
+        events.lock().unwrap()
+    );
+}
+
 /// Loop detection: same tool called consecutively must trigger early abort.
 #[test]
 fn loop_detection_aborts_on_repeated_tool() {

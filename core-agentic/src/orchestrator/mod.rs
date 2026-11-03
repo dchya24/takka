@@ -244,6 +244,11 @@ pub struct Orchestrator {
     /// Optional model name used for summarization calls. Defaults to the
     /// orchestrator's main `model` when unset.
     summarizer_model: Option<String>,
+    /// Optional steering source (Fase 2b). Polled once per agent-loop
+    /// iteration boundary; every returned message is added to memory as
+    /// a user message and announced via `Event::Steered`. `None` (the
+    /// default) means no poll — the loop behaves exactly as before.
+    steering_source: Option<Box<dyn Fn() -> Vec<String> + Send + Sync>>,
 }
 
 impl Orchestrator {
@@ -270,6 +275,7 @@ impl Orchestrator {
             session_id: Mutex::new(None),
             auto_compact_with_llm: false,
             summarizer_model: None,
+            steering_source: None,
         }
     }
 
@@ -455,6 +461,16 @@ impl Orchestrator {
     /// model. Setting a cheaper/faster model here is recommended.
     pub fn set_summarizer_model(&mut self, model: impl Into<String>) {
         self.summarizer_model = Some(model.into());
+    }
+
+    /// Set the steering source (Fase 2b): polled once per agent-loop
+    /// iteration boundary (after the pause/cancel guards, before the
+    /// next provider call). The source returns the whole ready queue
+    /// (FIFO) and the orchestrator drains it in one shot — it never
+    /// re-queues or retains leftovers. Each drained text is added to
+    /// memory as a `user` message and announced via `Event::Steered`.
+    pub fn set_steering_source(&mut self, source: Box<dyn Fn() -> Vec<String> + Send + Sync>) {
+        self.steering_source = Some(source);
     }
 
     /// Reset the cancel flag (e.g. between REPL inputs).

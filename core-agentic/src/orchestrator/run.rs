@@ -126,6 +126,10 @@ impl Orchestrator {
                 return Err(AgenticError::Cancelled);
             }
 
+            // Fase 2b: steering poll — drained once per boundary, before
+            // the next provider call.
+            self.drain_steering();
+
             self.maybe_autocompact();
 
             let mut messages = self.build_messages();
@@ -367,6 +371,10 @@ impl Orchestrator {
                 return Err(AgenticError::Cancelled);
             }
 
+            // Fase 2b: steering poll — drained once per boundary, before
+            // the next provider call.
+            self.drain_steering();
+
             self.maybe_autocompact();
 
             let mut messages = self.build_messages();
@@ -532,6 +540,28 @@ impl Orchestrator {
     /// Internal helper: returns true when cancel was requested.
     pub(super) fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Steering poll (Fase 2b): called once per iteration boundary —
+    /// after the pause/cancel guards, before `maybe_autocompact` and the
+    /// next provider call. The source is drained exactly once (it
+    /// returns the whole ready queue, FIFO); each message is added to
+    /// memory as a user message and announced via `Event::Steered`.
+    fn drain_steering(&self) {
+        if let Some(source) = &self.steering_source {
+            for message in source() {
+                tracing::debug!(
+                    len = message.len(),
+                    "steering message injected at iteration boundary"
+                );
+                self.memory
+                    .lock()
+                    .unwrap()
+                    .add_message(crate::memory::Message::user(message.clone()));
+                self.events
+                    .emit(crate::events::Event::Steered { content: message });
+            }
+        }
     }
 
     /// Pre-flight check: every attachment must be supported by the
