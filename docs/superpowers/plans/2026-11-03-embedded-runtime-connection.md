@@ -928,5 +928,5 @@ git commit -m "docs: embedded runtime mode notes + mark codex-benchmark Fase 1 l
 ## Self-Review (dijalankan penulis plan — sudah dilakukan)
 
 1. **Spec coverage**: handshake bersama + InProcessClient + panic isolation + shutdown (Task 1–2); AgentConnection + flag + wiring + test matrix e2e (Task 3); docs + gate (Task 4). Success criteria spec: "tanpa binary agentic-runtime" tercakup oleh test `agent_connection_connects_in_both_modes` (embedded connect tanpa spawn) + smoke embedded; "spawn 100% perilaku lama" tercakup wrapper spawned. ✓
-2. **Placeholder scan**: tidak ada TBD/TODO; semua step berisi kode konkret atau command exact. Catatan penyesuaian struktur `PanickyTransport` di Task 2 Step 1b adalah instruksi eksplisit, bukan placeholder. ✓
+2. **Placeholder scan**: tidak ada TBD/TODO; semua step berisi kode konkret atau command exact. Transport panik di Task 2 ditulis dalam satu versi final.
 3. **Type consistency**: `ConnectionIo::raw_send/raw_next_event` konsisten di semua impl (RuntimeClient, InProcessClient, AgentConnection); `send_and_wait_io`/`run_turn` dipakai nama sama di Task 1 & 3; `RuntimeMode::{Embedded, Spawn}` konsisten dengan `RuntimeModeArg`. ✓
