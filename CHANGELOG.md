@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and interactive gates; an engine panic in embedded mode surfaces as a
   normal terminal `Error` event (same "runtime died" UX as the spawned
   mode).
+- Runtime: **protocol hardening** (Fase 2a) — `Init` wajib tepat sekali
+  (`not initialized` / `already initialized` errors), capability
+  negotiation (`experimental_api` opt-in, `Request::Plan` kini API
+  eksperimental), dan notification opt-out (`ConnectionCapabilities.
+  optOutNotify`, allowlist: thinking/assistant_delta/warning/todo_changed).
+  Semua additive; `PROTOCOL_VERSION` tetap 1.
 
 ### Changed
 - Tests: the two CLI e2e smoke tests now spawn the real `agentic-runtime`

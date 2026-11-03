@@ -93,6 +93,8 @@ Next: **Fase 2 — steering + REPL non-blokir** (spec yang sama).
 
 ## Open work
 
+**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) sudah landed; **Fase 2b: steer/follow-up queue** (terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) adalah item protocol berikutnya.
+
 Sized by effort. Each item has its own home in
 [`../tasks/tasks-core-agentic.md`](../tasks/tasks-core-agentic.md) or
 [`../tasks/tasks-agentic-cli.md`](../tasks/tasks-agentic-cli.md).

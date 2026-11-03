@@ -97,8 +97,8 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 | Protokol lintas-proses | SQ/EQ + JSON-RPC 2.0, tipe di crate terpisah | `ProtocolRequest`/`ProtocolEvent` JSONL, module `core_agentic::runtime::protocol` | ✅ konsep setara; masih module (ok di monorepo) |
 | Client abstraction | `AppServerClient { InProcess, Remote }` | `AgentConnection { InProcess, Spawned }` | ✅ setara |
 | Transport | stdio / Unix socket / WebSocket / in-memory channel | `StdioTransport` + `MemoryTransport` (kini dipakai CLI lewat `InProcessClient` sebagai mode embedded default) | ⚠️ infra 80% ada |
-| Handshake | `initialize` → `initialized`, capabilities negotiation | `Ready` → `Init` → `InitOk` | ✅ konsep setara, belum ada capabilities |
-| Versioning protokol | versi + gating capability per-method | `PROTOCOL_VERSION = 1` cek tunggal | ⚠️ cukup untuk v1 |
+| Handshake | `initialize` → `initialized`, capabilities negotiation | `Ready` → `Init` → `InitOk` (+ capabilities) | ✅ setara |
+| Versioning protokol | versi + gating capability per-method | `PROTOCOL_VERSION = 1` + capabilities + opt-out | ✅ setara |
 | Korelasi request↔event | `sub_id` + event id per turn | `request_id` di envelope | ✅ setara |
 | Antrian saat streaming | `thread/queue/add` (steer/follow-up) | — | 🔜 backlogged (lihat COMPARISON_PI_VS_AGENTIC.md) |
 | Daemon long-lived | `LocalDaemon` (Unix socket) | — | 🔜 fase lanjut |
@@ -132,12 +132,12 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 4. Panic isolation: tangkap panic di thread engine → terjemahkan jadi event `Error` → TUI tawarkan respawn (UX sama seperti "runtime died" sekarang).
 5. **Test matrix**: skenario identik dijalankan terhadap `StdioTransport` dan `MemoryTransport` (regresi serialisasi hanya muncul di jalur spawn).
 
-### Fase 2 — Protocol hardening gaya codex
+### Fase 2 — Protocol hardening gaya codex ✅ (landed 2026-11, kecuali antrian steer → Fase 2b)
 
-1. Tambah `capabilities` ke `Init` (mis. `experimental_api: bool`) + gating per-request di `RuntimeEngine`; error semantik `"not initialized"`.
-2. Notification opt-out list (hemat bandwidth delta untuk frontend yang tak butuh).
-3. Pisahkan tipe "internal" (UI↔core, boleh berubah bebas) dari "external" (wire, harus versioned ketat) — di codex ini dua ruang tipe di `codex-protocol`. Di kita: kelompokkan eksplisit di `protocol.rs`, atau ekstrak crate `agentic-protocol` saat frontend non-Rust nyata dibutuhkan.
-4. Pertimbangkan antrian pesan saat streaming (steer/follow-up) — sudah dianalisis di `COMPARISON_PI_VS_AGENTIC.md`.
+1. ✅ Tambah `capabilities` ke `Init` (mis. `experimental_api: bool`) + gating per-request di `RuntimeEngine`; error semantik `"not initialized"` / `"already initialized"`.
+2. ✅ Notification opt-out list (hemat bandwidth delta untuk frontend yang tak butuh) — allowlist `NotificationKind` via `ConnectionCapabilities.optOutNotify`.
+3. ✅ Pisahkan tipe "internal" (UI↔core, boleh berubah bebas) dari "external" (wire, harus versioned ketat) — di codex ini dua ruang tipe di `codex-protocol`. Di kita: kelompokkan eksplisit di `protocol.rs`, atau ekstrak crate `agentic-protocol` saat frontend non-Rust nyata dibutuhkan.
+4. ⏳ Belum — antrian pesan saat streaming (steer/follow-up); pindah ke **Fase 2b** (sudah dianalisis di `COMPARISON_PI_VS_AGENTIC.md`).
 
 ### Fase 3 — Daemon mode (ala `LocalDaemon` opencode/codex)
 
