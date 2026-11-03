@@ -29,7 +29,11 @@ pub(crate) async fn perform_handshake(
     if !matches!(ready.event, core_agentic::Event::Ready { .. }) {
         return Err(anyhow!("runtime did not emit ready"));
     }
-    io.raw_send(Request::Init { overrides }).await?;
+    io.raw_send(Request::Init {
+        overrides,
+        capabilities: Default::default(),
+    })
+    .await?;
     let initialized = io.raw_next_event().await?;
     match initialized.event {
         core_agentic::Event::InitOk { .. } => Ok(()),

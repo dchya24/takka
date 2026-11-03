@@ -60,6 +60,7 @@ fn runtime_emits_ready_init_ok_delta_and_done() {
             "init-1",
             Request::Init {
                 overrides: Default::default(),
+                capabilities: Default::default(),
             },
         ))
         .unwrap();
@@ -277,6 +278,7 @@ fn list_tools_replies_with_tool_list() {
             "init-1",
             Request::Init {
                 overrides: Default::default(),
+                capabilities: Default::default(),
             },
         ))
         .unwrap();
@@ -314,6 +316,7 @@ fn skill_activate_without_index_answers_negative() {
             "init-1",
             Request::Init {
                 overrides: Default::default(),
+                capabilities: Default::default(),
             },
         ))
         .unwrap();
@@ -370,6 +373,7 @@ fn plan_request_runs_creation_approval_and_execution() {
             "init-1",
             Request::Init {
                 overrides: Default::default(),
+                capabilities: Default::default(),
             },
         ))
         .unwrap();
@@ -450,6 +454,7 @@ fn golden_event_stream_text_only_run() {
             "init-1",
             Request::Init {
                 overrides: Default::default(),
+                capabilities: Default::default(),
             },
         ))
         .unwrap();

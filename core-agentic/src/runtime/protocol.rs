@@ -1,4 +1,18 @@
 //! Transport-neutral runtime protocol types.
+//!
+//! # Wire contract (versioned, eksternal)
+//!
+//! Tipe di bawah adalah KONTRAK LINTAS-PROSES: `ProtocolRequest`,
+//! `ProtocolEvent`, `Request`, `Event`, `InitOverrides`,
+//! `ConnectionCapabilities`, `NotificationKind`. Perubahan harus additive
+//! (`#[serde(default)]`) di dalam `PROTOCOL_VERSION` yang sama; rename,
+//! penghapusan, atau perubahan semantik = bump versi. Frontend non-Rust
+//! memakai kontrak ini mentah-mentah — jangan menambah field "sementara".
+//!
+//! # Internal
+//!
+//! Detail di luar kontrak wire (mis. helper#[cfg(test)]) tidak boleh
+//! bocor ke tipe di atas.
 
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +67,8 @@ pub enum Request {
     Init {
         #[serde(default)]
         overrides: InitOverrides,
+        #[serde(default)]
+        capabilities: ConnectionCapabilities,
     },
     Run {
         task: String,
@@ -105,6 +121,33 @@ pub struct InitOverrides {
     pub system_prompt: Option<String>,
 }
 
+/// Capabilities yang dideklarasikan frontend saat `Init` — sekali per
+/// koneksi, imutabel setelahnya (init kedua ditolak engine).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionCapabilities {
+    /// Opt-in API eksperimental (saat ini: `Request::Plan`).
+    #[serde(default)]
+    pub experimental_api: bool,
+    /// Notification yang TIDAK dikirim engine ke frontend ini. Salalu
+    /// dalam allowlist `NotificationKind`; nilai lain tidak bisa
+    /// direpresentasikan (embedded) / gagal deserialisasi (spawn).
+    #[serde(default)]
+    pub opt_out_notify: Vec<NotificationKind>,
+}
+
+/// Allowlist tertutup notification yang boleh di-opt-out. Event di luar
+/// varian ini (per-request respons dan interaktif gate) TIDAK PERNAH
+/// difilter — opt-out tidak bisa membunuh alur run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationKind {
+    Thinking,
+    AssistantDelta,
+    Warning,
+    TodoChanged,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeNotice {
@@ -131,5 +174,45 @@ mod tests {
         assert_eq!(value["requestId"], "r2");
         assert_eq!(value["type"], "tool_started");
         assert_eq!(value["toolCallId"], "c1");
+    }
+
+    #[test]
+    fn init_request_without_capabilities_field_defaults() {
+        // Frame gaya lama (mis. protocol-demo.js): tidak membawa capabilities.
+        let frame = r#"{"v":1,"id":"i1","type":"init"}"#;
+        let req: ProtocolRequest = serde_json::from_str(frame).unwrap();
+        match req.request {
+            Request::Init { capabilities, .. } => {
+                assert_eq!(capabilities, ConnectionCapabilities::default());
+                assert!(!capabilities.experimental_api);
+                assert!(capabilities.opt_out_notify.is_empty());
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_request_with_capabilities_deserializes() {
+        let frame = r#"{"v":1,"id":"i2","type":"init","capabilities":{"experimentalApi":true,"optOutNotify":["thinking","todo_changed"]}}"#;
+        let req: ProtocolRequest = serde_json::from_str(frame).unwrap();
+        match req.request {
+            Request::Init { capabilities, .. } => {
+                assert!(capabilities.experimental_api);
+                assert!(capabilities
+                    .opt_out_notify
+                    .contains(&NotificationKind::Thinking));
+                assert!(capabilities
+                    .opt_out_notify
+                    .contains(&NotificationKind::TodoChanged));
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_notification_name_fails_frame_deserialization() {
+        // Allowlist tertutup: nama di luar enum tidak bisa lewat jalur wire.
+        let frame = r#"{"v":1,"id":"i3","type":"init","capabilities":{"experimentalApi":false,"optOutNotify":["done"]}}"#;
+        assert!(serde_json::from_str::<ProtocolRequest>(frame).is_err());
     }
 }

@@ -116,7 +116,7 @@ impl<T: Transport> RuntimeEngine<T> {
             }
 
             match request.request {
-                Request::Init { overrides } => {
+                Request::Init { overrides, .. } => {
                     let result = if self.orchestrator.is_none() {
                         self.initialize(overrides)
                     } else {
