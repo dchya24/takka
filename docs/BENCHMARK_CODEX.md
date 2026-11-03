@@ -96,7 +96,7 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 | Headless runner | `codex-exec` via `InProcessAppServerClient` | embedded (default) + `agentic-runtime` spawn | ✅ dual-mode |
 | Protokol lintas-proses | SQ/EQ + JSON-RPC 2.0, tipe di crate terpisah | `ProtocolRequest`/`ProtocolEvent` JSONL, module `core_agentic::runtime::protocol` | ✅ konsep setara; masih module (ok di monorepo) |
 | Client abstraction | `AppServerClient { InProcess, Remote }` | `AgentConnection { InProcess, Spawned }` | ✅ setara |
-| Transport | stdio / Unix socket / WebSocket / in-memory channel | `StdioTransport` + `MemoryTransport` (sudah ada, **belum dipakai CLI**) | ⚠️ infra 80% ada |
+| Transport | stdio / Unix socket / WebSocket / in-memory channel | `StdioTransport` + `MemoryTransport` (kini dipakai CLI lewat `InProcessClient` sebagai mode embedded default) | ⚠️ infra 80% ada |
 | Handshake | `initialize` → `initialized`, capabilities negotiation | `Ready` → `Init` → `InitOk` | ✅ konsep setara, belum ada capabilities |
 | Versioning protokol | versi + gating capability per-method | `PROTOCOL_VERSION = 1` cek tunggal | ⚠️ cukup untuk v1 |
 | Korelasi request↔event | `sub_id` + event id per turn | `request_id` di envelope | ✅ setara |
@@ -105,7 +105,7 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 | Kontrol subprocess terisolasi | `exec-server` + pty + sandbox | `run_command` di core | 🔜 beda scope |
 | SDK bahasa lain | TS SDK resmi | — | 🔜 terbuka otomatis begitu protokol stabil |
 
-**Ringkasan gap:** yang memisahkan kita dari pola codex bukan fondasi — fondasinya (protokol versioned, handshake, engine generik atas `Transport`) sudah ada. Gap-nya **satu abstraction di sisi CLI** dan **pemakaian `MemoryTransport` yang masih nganggur**.
+**Ringkasan gap:** yang memisahkan kita dari pola codex bukan fondasi — fondasinya (protokol versioned, handshake, engine generik atas `Transport`) sudah ada. Gap Fase 1 — **abstraction koneksi di sisi CLI** (`AgentConnection { InProcess, Spawned }`) dan **pemakaian `MemoryTransport`** lewat `InProcessClient` sebagai mode embedded default — **sudah tertutup di branch ini**. Jarak yang tersisa ke pola codex adalah Fase 2–4: hardening protokol (capabilities, gating), daemon long-lived, lalu SDK bahasa lain.
 
 ---
 
