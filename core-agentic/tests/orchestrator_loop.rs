@@ -200,18 +200,30 @@ fn finalization_turn_advertises_zero_tools() {
 }
 
 /// Steering hook (Fase 2b): messages queued in the steering source are
-/// injected as user messages at the next iteration boundary and
-/// announced via `Event::Steered`.
+/// injected as user messages at the iteration boundary and announced
+/// via `Event::Steered`.
 #[test]
 fn steering_source_messages_injected_at_iteration_boundary() {
-    // Turn 1 returns a tool call (run not finished → a second boundary
-    // exists); turn 2 returns the final answer. After the tool executes
-    // (turn 1 done), the orchestrator polls `steering_source()` BEFORE
-    // the turn-2 LLM call — that's where the steer lands.
-    let steering = Arc::new(Mutex::new(vec!["use the lake theme instead".to_string()]));
-    let steering_source = {
-        let steering = steering.clone();
-        move || steering.lock().unwrap().drain(..).collect::<Vec<_>>()
+    // The orchestrator polls `steering_source()` at EVERY iteration
+    // boundary — including before the turn-1 provider call (poll #1).
+    // This scripted source is counter-based: poll #1 (run start)
+    // returns `[]`, poll #2 (the turn-1 → turn-2 boundary, after turn
+    // 1's tool call executes and before the final-answer request)
+    // returns the steer. Turn 1 returns a tool call so that second
+    // boundary exists. This proves the steer is picked up at a boundary
+    // DURING the run, not merely drained before the loop starts: the
+    // text must be absent from requests[0] and present as a user
+    // message in requests[1].
+    let steer_text = "use the lake theme instead".to_string();
+    let polled = Mutex::new(false);
+    let steering_source = move || {
+        let mut polled = polled.lock().unwrap();
+        if *polled {
+            vec![steer_text.clone()]
+        } else {
+            *polled = true;
+            Vec::new()
+        }
     };
 
     let provider = Arc::new(support::CapturingScriptedProvider::new(vec![
@@ -245,10 +257,22 @@ fn steering_source_messages_injected_at_iteration_boundary() {
         events.lock().unwrap()
     );
 
-    // The turn-2 request context carries the steer as a user message
-    // (it reaches the model before the final answer — not lost).
+    // Poll #1 fired before the turn-1 request while the source was
+    // still empty: the steer text must NOT be in requests[0].
     let requests = provider.requests.lock().unwrap();
     assert_eq!(requests.len(), 2, "expected two provider calls");
+    let first = &requests[0];
+    assert!(
+        !first
+            .messages
+            .iter()
+            .any(|m| m.content.contains("use the lake theme instead")),
+        "steer text must NOT be in the turn-1 request (source was empty at poll #1), got {:?}",
+        first.messages
+    );
+
+    // The turn-2 request context carries the steer as a user message
+    // (it reaches the model before the final answer — not lost).
     let second = &requests[1];
     assert!(
         second
