@@ -536,8 +536,14 @@ impl Commands {
             model: self.config.active_model().map(|model| model.model.clone()),
             system_prompt: self.config.system_prompt.clone(),
         };
-        self.connection =
-            Some(crate::client::AgentConnection::connect(self.runtime_mode, overrides).await?);
+        self.connection = Some(
+            crate::client::AgentConnection::connect(
+                self.runtime_mode,
+                overrides,
+                crate::client::CLI_CAPABILITIES,
+            )
+            .await?,
+        );
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use core_agentic::runtime::engine::RuntimeEngine;
 use core_agentic::runtime::protocol::{
-    InitOverrides, ProtocolEvent, ProtocolRequest, Request, PROTOCOL_VERSION,
+    ConnectionCapabilities, InitOverrides, ProtocolEvent, ProtocolRequest, Request,
+    PROTOCOL_VERSION,
 };
 use core_agentic::runtime::transport::MemoryTransport;
 use std::future::Future;
@@ -19,11 +20,19 @@ pub trait ConnectionIo {
     fn raw_next_event(&mut self) -> impl Future<Output = Result<ProtocolEvent>> + Send;
 }
 
+/// Capabilities yang dikirim CLI saat handshake: CLI memakai `/plan` /
+/// `--plan`, jadi opt-in `experimental_api` itu jujur.
+pub const CLI_CAPABILITIES: ConnectionCapabilities = ConnectionCapabilities {
+    experimental_api: true,
+    opt_out_notify: Vec::new(),
+};
+
 /// Identical handshake for both modes: wait `Ready`, send `Init`, wait
 /// `InitOk` (or an `Error` explaining why initialization failed).
 pub(crate) async fn perform_handshake(
     io: &mut impl ConnectionIo,
     overrides: InitOverrides,
+    caps: ConnectionCapabilities,
 ) -> Result<()> {
     let ready = io.raw_next_event().await?;
     if !matches!(ready.event, core_agentic::Event::Ready { .. }) {
@@ -31,7 +40,7 @@ pub(crate) async fn perform_handshake(
     }
     io.raw_send(Request::Init {
         overrides,
-        capabilities: Default::default(),
+        capabilities: caps,
     })
     .await?;
     let initialized = io.raw_next_event().await?;
@@ -102,12 +111,16 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
-    pub async fn spawn(overrides: InitOverrides) -> Result<Self> {
+    pub async fn spawn(overrides: InitOverrides, caps: ConnectionCapabilities) -> Result<Self> {
         let binary = runtime_binary()?;
-        Self::spawn_binary(&binary, overrides).await
+        Self::spawn_binary(&binary, overrides, caps).await
     }
 
-    pub async fn spawn_binary(binary: &Path, overrides: InitOverrides) -> Result<Self> {
+    pub async fn spawn_binary(
+        binary: &Path,
+        overrides: InitOverrides,
+        caps: ConnectionCapabilities,
+    ) -> Result<Self> {
         let mut child = Command::new(binary)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -123,7 +136,7 @@ impl RuntimeClient {
             lines: BufReader::new(stdout).lines(),
             sequence: 0,
         };
-        perform_handshake(&mut client, overrides).await?;
+        perform_handshake(&mut client, overrides, caps).await?;
         Ok(client)
     }
 
@@ -242,7 +255,7 @@ pub struct InProcessClient {
 }
 
 impl InProcessClient {
-    pub async fn start(overrides: InitOverrides) -> Result<Self> {
+    pub async fn start(overrides: InitOverrides, caps: ConnectionCapabilities) -> Result<Self> {
         let (request_tx, request_rx) = std_mpsc::channel::<ProtocolRequest>();
         let (event_tx, event_rx) = std_mpsc::channel::<ProtocolEvent>();
         let (tokio_tx, events) = tokio_mpsc::unbounded_channel::<ProtocolEvent>();
@@ -278,7 +291,7 @@ impl InProcessClient {
             engine_thread: Some(engine_thread),
             sequence: 0,
         };
-        perform_handshake(&mut client, overrides).await?;
+        perform_handshake(&mut client, overrides, caps).await?;
         Ok(client)
     }
 
@@ -363,11 +376,17 @@ pub enum AgentConnection {
 }
 
 impl AgentConnection {
-    pub async fn connect(mode: RuntimeMode, overrides: InitOverrides) -> Result<Self> {
+    pub async fn connect(
+        mode: RuntimeMode,
+        overrides: InitOverrides,
+        caps: ConnectionCapabilities,
+    ) -> Result<Self> {
         match mode {
-            RuntimeMode::Embedded => Ok(Self::InProcess(InProcessClient::start(overrides).await?)),
+            RuntimeMode::Embedded => Ok(Self::InProcess(
+                InProcessClient::start(overrides, caps).await?,
+            )),
             RuntimeMode::Spawn => Ok(Self::Spawned(Box::new(
-                RuntimeClient::spawn(overrides).await?,
+                RuntimeClient::spawn(overrides, caps).await?,
             ))),
         }
     }
@@ -500,7 +519,7 @@ mod in_process_tests {
 
     #[tokio::test]
     async fn in_process_handshake_and_list_tools_round_trip() {
-        let mut client = InProcessClient::start(hermetic_overrides())
+        let mut client = InProcessClient::start(hermetic_overrides(), CLI_CAPABILITIES)
             .await
             .expect("embedded handshake");
         let event = tokio::time::timeout(
@@ -517,9 +536,13 @@ mod in_process_tests {
     #[tokio::test]
     async fn agent_connection_connects_in_both_modes() {
         // Embedded (default): tanpa binary agentic-runtime sama sekali.
-        let mut embedded = AgentConnection::connect(RuntimeMode::Embedded, hermetic_overrides())
-            .await
-            .expect("embedded connect");
+        let mut embedded = AgentConnection::connect(
+            RuntimeMode::Embedded,
+            hermetic_overrides(),
+            CLI_CAPABILITIES,
+        )
+        .await
+        .expect("embedded connect");
         let event = embedded
             .send_and_wait(Request::ListTools)
             .await
@@ -529,9 +552,10 @@ mod in_process_tests {
 
         // Spawn: jalur lama lewat binary daemon (runtime_binary() menemukan
         // target/debug/agentic-runtime hasil cargo test workspace).
-        let mut spawned = AgentConnection::connect(RuntimeMode::Spawn, hermetic_overrides())
-            .await
-            .expect("spawned connect");
+        let mut spawned =
+            AgentConnection::connect(RuntimeMode::Spawn, hermetic_overrides(), CLI_CAPABILITIES)
+                .await
+                .expect("spawned connect");
         let event = spawned
             .send_and_wait(Request::ListTools)
             .await
@@ -540,9 +564,25 @@ mod in_process_tests {
         spawned.shutdown().await.expect("spawned shutdown");
     }
 
+    /// Kontrak serialization caps CLI: Init frame yang dikirim handshake
+    /// harus membawa `experimentalApi: true` (opt-in eksplisit, bukan
+    /// default engine) — persis seperti yang diperiksa gating Task 2.
+    #[test]
+    fn cli_capabilities_serialize_experimental_opt_in() {
+        let frame = serde_json::to_value(core_agentic::runtime::protocol::ProtocolRequest::new(
+            "i",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: CLI_CAPABILITIES,
+            },
+        ))
+        .unwrap();
+        assert_eq!(frame["capabilities"]["experimentalApi"], true);
+    }
+
     #[tokio::test]
     async fn shutdown_joins_engine_thread() {
-        let mut client = InProcessClient::start(hermetic_overrides())
+        let mut client = InProcessClient::start(hermetic_overrides(), CLI_CAPABILITIES)
             .await
             .expect("embedded handshake");
         tokio::time::timeout(std::time::Duration::from_secs(10), client.shutdown())
