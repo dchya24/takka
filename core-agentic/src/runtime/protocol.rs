@@ -11,7 +11,7 @@
 //!
 //! # Internal
 //!
-//! Detail di luar kontrak wire (mis. helper#[cfg(test)]) tidak boleh
+//! Detail di luar kontrak wire (mis. helper dan modul #[cfg(test)]) tidak boleh
 //! bocor ke tipe di atas.
 
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,7 @@ pub struct ConnectionCapabilities {
     /// Opt-in API eksperimental (saat ini: `Request::Plan`).
     #[serde(default)]
     pub experimental_api: bool,
-    /// Notification yang TIDAK dikirim engine ke frontend ini. Salalu
+    /// Notification yang TIDAK dikirim engine ke frontend ini. Selalu
     /// dalam allowlist `NotificationKind`; nilai lain tidak bisa
     /// direpresentasikan (embedded) / gagal deserialisasi (spawn).
     #[serde(default)]

@@ -6,7 +6,7 @@ use core_agentic::providers::{
     ProviderResult, StreamResult,
 };
 use core_agentic::runtime::engine::RuntimeEngine;
-use core_agentic::runtime::protocol::{ProtocolRequest, Request};
+use core_agentic::runtime::protocol::{ConnectionCapabilities, ProtocolRequest, Request};
 use core_agentic::runtime::transport::MemoryTransport;
 use core_agentic::{QuestionAnswer, ToolRegistry};
 
@@ -43,8 +43,10 @@ impl LLMProvider for TextProvider {
     }
 }
 
+/// Engine `with_session` sudah initialized: tidak ada Init, tidak ada
+/// InitOk — langsung Ready → delta → Done.
 #[test]
-fn runtime_emits_ready_init_ok_delta_and_done() {
+fn runtime_emits_ready_delta_and_done_without_init() {
     let (request_tx, request_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let transport = MemoryTransport::new(request_rx, event_tx);
@@ -55,15 +57,6 @@ fn runtime_emits_ready_init_ok_delta_and_done() {
     );
     let worker = std::thread::spawn(move || engine.run());
 
-    request_tx
-        .send(ProtocolRequest::new(
-            "init-1",
-            Request::Init {
-                overrides: Default::default(),
-                capabilities: Default::default(),
-            },
-        ))
-        .unwrap();
     request_tx
         .send(ProtocolRequest::new(
             "run-1",
@@ -80,9 +73,6 @@ fn runtime_emits_ready_init_ok_delta_and_done() {
     assert!(events
         .iter()
         .any(|event| matches!(event.event, Event::Ready { .. })));
-    assert!(events
-        .iter()
-        .any(|event| matches!(event.event, Event::InitOk { .. })));
     assert!(events.iter().any(
         |event| matches!(&event.event, Event::AssistantDelta { content } if content == "hello")
     ));
@@ -274,15 +264,6 @@ fn list_tools_replies_with_tool_list() {
     let worker = std::thread::spawn(move || engine.run());
 
     request_tx
-        .send(ProtocolRequest::new(
-            "init-1",
-            Request::Init {
-                overrides: Default::default(),
-                capabilities: Default::default(),
-            },
-        ))
-        .unwrap();
-    request_tx
         .send(ProtocolRequest::new("tools-1", Request::ListTools))
         .unwrap();
     drop(request_tx);
@@ -311,15 +292,6 @@ fn skill_activate_without_index_answers_negative() {
     );
     let worker = std::thread::spawn(move || engine.run());
 
-    request_tx
-        .send(ProtocolRequest::new(
-            "init-1",
-            Request::Init {
-                overrides: Default::default(),
-                capabilities: Default::default(),
-            },
-        ))
-        .unwrap();
     request_tx
         .send(ProtocolRequest::new(
             "skill-1",
@@ -365,18 +337,13 @@ fn plan_request_runs_creation_approval_and_execution() {
     let mut engine = RuntimeEngine::with_provider(
         MemoryTransport::new(request_rx, event_tx),
         std::sync::Arc::new(provider),
-    );
+    )
+    .with_capabilities(ConnectionCapabilities {
+        experimental_api: true,
+        opt_out_notify: vec![],
+    });
     let worker = std::thread::spawn(move || engine.run());
 
-    request_tx
-        .send(ProtocolRequest::new(
-            "init-1",
-            Request::Init {
-                overrides: Default::default(),
-                capabilities: Default::default(),
-            },
-        ))
-        .unwrap();
     request_tx
         .send(ProtocolRequest::new(
             "plan-1",
@@ -434,6 +401,228 @@ fn plan_request_runs_creation_approval_and_execution() {
     worker.join().unwrap();
 }
 
+/// Fresh engine (belum init): request resource wajib ditolak.
+#[test]
+fn resource_requests_before_init_are_rejected() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let transport = MemoryTransport::new(request_rx, event_tx);
+    let mut engine = RuntimeEngine::new(transport);
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "run-1",
+            Request::Run {
+                task: "hello".into(),
+                attachments: vec![],
+            },
+        ))
+        .unwrap();
+    request_tx
+        .send(ProtocolRequest::new("tools-1", Request::ListTools))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    let errors: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::Error { message } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors.len(),
+        2,
+        "expected exactly two not-initialized errors: {errors:?}"
+    );
+    assert!(
+        errors.iter().all(|m| *m == "not initialized"),
+        "got: {errors:?}"
+    );
+}
+
+/// Init kedua kali (di sini: setelah constructor with_session yang berarti
+/// sudah initialized) ditolak dengan "already initialized".
+#[test]
+fn second_init_is_rejected() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let transport = MemoryTransport::new(request_rx, event_tx);
+    let mut engine = RuntimeEngine::with_session(
+        transport,
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "init-1",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: Default::default(),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.event, Event::Error { message } if message == "already initialized")
+        ),
+        "expected already-initialized error: {events:?}"
+    );
+}
+
+/// Request::Plan tanpa opt-in experimental ditolak dengan capability error.
+/// (Dengan `with_session` engine sudah initialized, jadi urutan cek:
+/// capability langsung dievaluasi.)
+#[test]
+fn plan_without_experimental_capability_is_rejected() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let transport = MemoryTransport::new(request_rx, event_tx);
+    let mut engine = RuntimeEngine::with_session(
+        transport,
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "plan-1",
+            Request::Plan {
+                goal: "fake goal".into(),
+                require_approval: false,
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.event, Event::Error { message }
+            if message == "capability 'experimental_api' required")),
+        "expected capability error: {events:?}"
+    );
+}
+
+mod sink_tests {
+    use core_agentic::events::Event;
+    use core_agentic::runtime::engine::EventSink;
+    use core_agentic::runtime::protocol::{NotificationKind, ProtocolEvent};
+    use core_agentic::runtime::transport::MemoryTransport;
+
+    fn make_sink() -> (
+        std::sync::mpsc::Receiver<ProtocolEvent>,
+        EventSink<MemoryTransport>,
+    ) {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        drop(request_tx); // tidak ada loop engine di sini
+        let transport = std::sync::Arc::new(MemoryTransport::new(request_rx, event_tx));
+        let sink = EventSink::new(transport, Default::default());
+        (event_rx, sink)
+    }
+
+    #[test]
+    fn sink_filters_opted_out_notifications_only() {
+        let (event_rx, sink) = make_sink();
+        sink.set_opt_outs(&[
+            NotificationKind::Thinking,
+            NotificationKind::AssistantDelta,
+            NotificationKind::Warning,
+            NotificationKind::TodoChanged,
+        ]);
+
+        // Diopt-out: tidak terkirim.
+        sink.send(
+            Some("r".into()),
+            Event::Thinking {
+                content: "t".into(),
+            },
+        );
+        sink.send(
+            Some("r".into()),
+            Event::AssistantDelta {
+                content: "d".into(),
+            },
+        );
+        sink.send(
+            Some("r".into()),
+            Event::Warning {
+                message: "w".into(),
+            },
+        );
+        sink.send(Some("r".into()), Event::TodoChanged { todos: vec![] });
+
+        // Tidak terseleksi: selalu terkirim — respons + gates.
+        sink.send(
+            Some("r".into()),
+            Event::Done {
+                result: "final".into(),
+            },
+        );
+        sink.send(
+            Some("r".into()),
+            Event::Error {
+                message: "boom".into(),
+            },
+        );
+        sink.send(
+            Some("r".into()),
+            Event::ConfirmationRequest {
+                action: "write".into(),
+                description: "d".into(),
+                risk_level: "medium".into(),
+            },
+        );
+        sink.send(
+            Some("r".into()),
+            Event::QuestionRequest { questions: vec![] },
+        );
+        sink.send(
+            None,
+            Event::Ready {
+                protocol: "agentic".into(),
+                version: 1,
+            },
+        );
+
+        let seen: Vec<_> = event_rx.try_iter().collect();
+        assert!(seen.iter().any(|e| matches!(e.event, Event::Done { .. })));
+        assert!(seen.iter().any(|e| matches!(e.event, Event::Error { .. })));
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e.event, Event::ConfirmationRequest { .. })));
+        assert!(seen
+            .iter()
+            .any(|e| matches!(e.event, Event::QuestionRequest { .. })));
+        assert!(seen.iter().any(|e| matches!(e.event, Event::Ready { .. })));
+        assert!(!seen.iter().any(|e| matches!(
+            e.event,
+            Event::Thinking { .. }
+                | Event::AssistantDelta { .. }
+                | Event::Warning { .. }
+                | Event::TodoChanged { .. }
+        )));
+        assert_eq!(
+            seen.len(),
+            5,
+            "exactly the 5 non-opted-out events: {seen:?}"
+        );
+    }
+}
+
 /// Golden event-stream test: verify the daemon produces the expected
 /// event sequence for a simple text-only run (no tools).
 #[test]
@@ -449,15 +638,6 @@ fn golden_event_stream_text_only_run() {
     );
     let worker = std::thread::spawn(move || engine.run());
 
-    request_tx
-        .send(ProtocolRequest::new(
-            "init-1",
-            Request::Init {
-                overrides: Default::default(),
-                capabilities: Default::default(),
-            },
-        ))
-        .unwrap();
     request_tx
         .send(ProtocolRequest::new(
             "run-1",

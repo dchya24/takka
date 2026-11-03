@@ -1,4 +1,7 @@
-use super::protocol::{ProtocolEvent, Request, PROTOCOL_NAME, PROTOCOL_VERSION};
+use super::protocol::{
+    ConnectionCapabilities, NotificationKind, ProtocolEvent, Request, PROTOCOL_NAME,
+    PROTOCOL_VERSION,
+};
 use super::transport::Transport;
 use crate::events::Event;
 use crate::providers::{LLMProvider, OpenAIProvider};
@@ -9,9 +12,76 @@ use crate::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+/// Single choke point for every engine event write: opt-out filtering is
+/// applied here AND only here. The `NotificationKind` allowlist guarantees
+/// interactive gates and per-request responses are never filtered — an
+/// opt-out cannot kill a run in progress. Clones share the same opt-out
+/// set, so filtering is global across the whole engine (handler sites
+/// included).
+pub struct EventSink<T: Transport> {
+    transport: Arc<T>,
+    opt_outs: Arc<Mutex<std::collections::HashSet<NotificationKind>>>,
+}
+
+impl<T: Transport> EventSink<T> {
+    pub fn new(
+        transport: Arc<T>,
+        opt_outs: Arc<Mutex<std::collections::HashSet<NotificationKind>>>,
+    ) -> Self {
+        Self {
+            transport,
+            opt_outs,
+        }
+    }
+
+    /// Replace the opt-out set (connection-level, set at `Init`).
+    pub fn set_opt_outs(&self, kinds: &[NotificationKind]) {
+        *self.opt_outs.lock().unwrap() = kinds.iter().copied().collect();
+    }
+
+    fn suppressed(&self, event: &Event) -> bool {
+        let kind = match event {
+            Event::Thinking { .. } => NotificationKind::Thinking,
+            Event::AssistantDelta { .. } => NotificationKind::AssistantDelta,
+            Event::Warning { .. } => NotificationKind::Warning,
+            Event::TodoChanged { .. } => NotificationKind::TodoChanged,
+            _ => return false,
+        };
+        self.opt_outs.lock().unwrap().contains(&kind)
+    }
+
+    pub fn send(&self, request_id: Option<String>, event: Event) {
+        if self.suppressed(&event) {
+            return;
+        }
+        if let Err(error) = self
+            .transport
+            .write_event(&ProtocolEvent::new(request_id, event))
+        {
+            tracing::warn!(%error, "failed to write runtime event");
+        }
+    }
+}
+
+impl<T: Transport> Clone for EventSink<T> {
+    fn clone(&self) -> Self {
+        Self {
+            transport: self.transport.clone(),
+            opt_outs: self.opt_outs.clone(),
+        }
+    }
+}
+
 pub struct RuntimeEngine<T: Transport> {
     transport: Arc<T>,
+    sink: EventSink<T>,
     orchestrator: Option<Arc<Orchestrator>>,
+    /// Strict initialization gate: only a successful `Request::Init` (or
+    /// an embedded `with_session`/`with_provider` constructor) opens the
+    /// resource requests below.
+    initialized: bool,
+    /// Capabilities declared at `Init` — immutable afterwards.
+    capabilities: ConnectionCapabilities,
     /// Discovered skill index — populated by [`Self::initialize`], used
     /// by `Request::SkillActivate` (resolve + inject).
     skill_index: Option<Arc<std::sync::RwLock<crate::SkillIndex>>>,
@@ -24,9 +94,17 @@ pub struct RuntimeEngine<T: Transport> {
 
 impl<T: Transport> RuntimeEngine<T> {
     pub fn new(transport: T) -> Self {
+        let transport = Arc::new(transport);
+        let sink = EventSink::new(
+            transport.clone(),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
+        );
         Self {
-            transport: Arc::new(transport),
+            transport,
+            sink,
             orchestrator: None,
+            initialized: false,
+            capabilities: ConnectionCapabilities::default(),
             skill_index: None,
             running: Arc::new(AtomicBool::new(false)),
             current_request_id: Arc::new(Mutex::new(None)),
@@ -39,18 +117,29 @@ impl<T: Transport> RuntimeEngine<T> {
     pub fn with_session(transport: T, provider: Arc<dyn LLMProvider>, tools: ToolRegistry) -> Self {
         let mut engine = Self::new(transport);
         engine.orchestrator = Some(Arc::new(Orchestrator::new(provider, tools)));
+        engine.initialized = true;
         engine
+    }
+
+    /// Declare connection capabilities for an embedded session — the
+    /// in-process equivalent of the wire `Init.capabilities`. Must be
+    /// called before `run()`; capabilities stay immutable once the loop
+    /// serves requests (a second init is rejected).
+    pub fn with_capabilities(mut self, capabilities: ConnectionCapabilities) -> Self {
+        self.sink.set_opt_outs(&capabilities.opt_out_notify);
+        self.capabilities = capabilities;
+        self
     }
 
     pub fn with_provider(transport: T, provider: Arc<dyn LLMProvider>) -> Self {
         let mut engine = Self::new(transport);
         let question_handler = RuntimeQuestionHandler {
-            transport: engine.transport.clone(),
+            sink: engine.sink.clone(),
             current_request_id: engine.current_request_id.clone(),
             pending: engine.pending_question.clone(),
         };
         let todo_handler = RuntimeTodoHandler {
-            transport: engine.transport.clone(),
+            sink: engine.sink.clone(),
             current_request_id: engine.current_request_id.clone(),
         };
         let mut deps = ToolDeps::new();
@@ -61,24 +150,25 @@ impl<T: Transport> RuntimeEngine<T> {
             tools.register(tool);
         }
         let mut orchestrator = Orchestrator::new(provider, tools);
-        let transport = engine.transport.clone();
+        let sink = engine.sink.clone();
         let current_request_id = engine.current_request_id.clone();
         let pending_confirmation = engine.pending_confirmation.clone();
         orchestrator.set_confirmation_handler(move |request| {
             let (sender, receiver) = mpsc::channel();
             *pending_confirmation.lock().unwrap() = Some(sender);
             let request_id = current_request_id.lock().unwrap().clone();
-            let _ = transport.write_event(&ProtocolEvent::new(
+            sink.send(
                 request_id,
                 Event::ConfirmationRequest {
                     action: request.action,
                     description: request.description,
                     risk_level: request.risk_level.as_str().to_string(),
                 },
-            ));
+            );
             receiver.recv().unwrap_or(false)
         });
         engine.orchestrator = Some(Arc::new(orchestrator));
+        engine.initialized = true;
         engine
     }
 
@@ -116,29 +206,44 @@ impl<T: Transport> RuntimeEngine<T> {
             }
 
             match request.request {
-                Request::Init { overrides, .. } => {
-                    let result = if self.orchestrator.is_none() {
-                        self.initialize(overrides)
-                    } else {
-                        Ok(())
-                    };
-                    match result {
-                        Ok(()) => self.emit(
+                Request::Init {
+                    overrides,
+                    capabilities,
+                } => {
+                    if self.initialized {
+                        self.emit(
                             Some(request.id),
-                            Event::InitOk {
-                                protocol: PROTOCOL_NAME.to_string(),
-                                version: PROTOCOL_VERSION,
+                            Event::Error {
+                                message: "already initialized".to_string(),
                             },
-                        ),
-                        Err(message) => self.emit(Some(request.id), Event::Error { message }),
+                        );
+                    } else {
+                        match self.initialize(overrides) {
+                            Ok(()) => {
+                                self.capabilities = capabilities.clone();
+                                self.sink.set_opt_outs(&capabilities.opt_out_notify);
+                                self.initialized = true;
+                                self.emit(
+                                    Some(request.id),
+                                    Event::InitOk {
+                                        protocol: PROTOCOL_NAME.to_string(),
+                                        version: PROTOCOL_VERSION,
+                                    },
+                                );
+                            }
+                            Err(message) => self.emit(Some(request.id), Event::Error { message }),
+                        }
                     }
                 }
                 Request::Run { task, attachments } => {
-                    if self.orchestrator.is_none() {
-                        if let Err(message) = self.initialize(Default::default()) {
-                            self.emit(Some(request.id), Event::Error { message });
-                            continue;
-                        }
+                    if !self.initialized {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                        continue;
                     }
                     self.start_run(request.id, task, attachments);
                 }
@@ -157,26 +262,29 @@ impl<T: Transport> RuntimeEngine<T> {
                         self.emit(
                             Some(request.id),
                             Event::Error {
-                                message: "runtime is not initialized".to_string(),
+                                message: "not initialized".to_string(),
                             },
                         );
                     }
                 }
                 Request::SearchMemory { query } => {
-                    let matches = self
-                        .orchestrator
-                        .as_ref()
-                        .map(|orchestrator| {
-                            orchestrator
-                                .search_memory(&query)
-                                .into_iter()
-                                .map(|(role, content)| crate::events::MemorySearchMatch {
-                                    role: role.as_str().to_string(),
-                                    content,
-                                })
-                                .collect()
+                    let Some(orchestrator) = self.orchestrator.as_ref() else {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                        continue;
+                    };
+                    let matches = orchestrator
+                        .search_memory(&query)
+                        .into_iter()
+                        .map(|(role, content)| crate::events::MemorySearchMatch {
+                            role: role.as_str().to_string(),
+                            content,
                         })
-                        .unwrap_or_default();
+                        .collect();
                     self.emit(
                         Some(request.id),
                         Event::MemorySearchResult { query, matches },
@@ -189,27 +297,30 @@ impl<T: Transport> RuntimeEngine<T> {
                         self.emit(
                             Some(request.id),
                             Event::Error {
-                                message: "runtime is not initialized".to_string(),
+                                message: "not initialized".to_string(),
                             },
                         );
                     }
                 }
                 Request::ListTools => {
-                    let tools = self
-                        .orchestrator
-                        .as_ref()
-                        .map(|orchestrator| {
-                            orchestrator
-                                .tool_registry()
-                                .list()
-                                .into_iter()
-                                .map(|schema| crate::events::ToolInfo {
-                                    name: schema.name,
-                                    description: schema.description,
-                                })
-                                .collect()
+                    let Some(orchestrator) = self.orchestrator.as_ref() else {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                        continue;
+                    };
+                    let tools = orchestrator
+                        .tool_registry()
+                        .list()
+                        .into_iter()
+                        .map(|schema| crate::events::ToolInfo {
+                            name: schema.name,
+                            description: schema.description,
                         })
-                        .unwrap_or_default();
+                        .collect();
                     self.emit(Some(request.id), Event::ToolList { tools });
                 }
                 Request::SkillActivate { name } => {
@@ -219,6 +330,24 @@ impl<T: Transport> RuntimeEngine<T> {
                     goal,
                     require_approval,
                 } => {
+                    if !self.initialized {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    if !self.capabilities.experimental_api {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "capability 'experimental_api' required".to_string(),
+                            },
+                        );
+                        continue;
+                    }
                     self.handle_plan(request.id, goal, require_approval);
                 }
                 Request::Shutdown => break,
@@ -334,33 +463,33 @@ impl<T: Transport> RuntimeEngine<T> {
     fn runtime_tool_deps(&self) -> ToolDeps {
         let mut deps = ToolDeps::new();
         deps.question_handler = Some(Arc::new(RuntimeQuestionHandler {
-            transport: self.transport.clone(),
+            sink: self.sink.clone(),
             current_request_id: self.current_request_id.clone(),
             pending: self.pending_question.clone(),
         }));
         deps.todo_handler = Some(Box::new(RuntimeTodoHandler {
-            transport: self.transport.clone(),
+            sink: self.sink.clone(),
             current_request_id: self.current_request_id.clone(),
         }));
         deps
     }
 
     fn install_confirmation_handler(&self, orchestrator: &mut Orchestrator) {
-        let transport = self.transport.clone();
+        let sink = self.sink.clone();
         let current_request_id = self.current_request_id.clone();
         let pending_confirmation = self.pending_confirmation.clone();
         orchestrator.set_confirmation_handler(move |request| {
             let (sender, receiver) = mpsc::channel();
             *pending_confirmation.lock().unwrap() = Some(sender);
             let request_id = current_request_id.lock().unwrap().clone();
-            let _ = transport.write_event(&ProtocolEvent::new(
+            sink.send(
                 request_id,
                 Event::ConfirmationRequest {
                     action: request.action,
                     description: request.description,
                     risk_level: request.risk_level.as_str().to_string(),
                 },
-            ));
+            );
             receiver.recv().unwrap_or(false)
         });
     }
@@ -373,7 +502,7 @@ impl<T: Transport> RuntimeEngine<T> {
             self.emit(
                 Some(request_id),
                 Event::Error {
-                    message: "runtime is not initialized".to_string(),
+                    message: "not initialized".to_string(),
                 },
             );
             return;
@@ -453,7 +582,7 @@ impl<T: Transport> RuntimeEngine<T> {
             self.emit(
                 Some(request_id),
                 Event::Error {
-                    message: "runtime is not initialized".to_string(),
+                    message: "not initialized".to_string(),
                 },
             );
             return;
@@ -461,7 +590,7 @@ impl<T: Transport> RuntimeEngine<T> {
 
         let provider = orchestrator.provider();
         let tools = orchestrator.tool_registry().clone();
-        let transport = self.transport.clone();
+        let sink = self.sink.clone();
         let pending_confirmation = self.pending_confirmation.clone();
         let current_request_id = self.current_request_id.clone();
         let running = self.running.clone();
@@ -470,10 +599,7 @@ impl<T: Transport> RuntimeEngine<T> {
 
         let handle = std::thread::spawn(move || {
             let write = |event: crate::events::Event| {
-                let _ = transport.write_event(&ProtocolEvent::new(
-                    current_request_id.lock().unwrap().clone(),
-                    event,
-                ));
+                sink.send(current_request_id.lock().unwrap().clone(), event);
             };
 
             let planner = crate::PlannerAgent::new(provider).with_config(crate::PlannerConfig {
@@ -483,13 +609,10 @@ impl<T: Transport> RuntimeEngine<T> {
 
             // Forward planner lifecycle events to the transport.
             {
-                let transport = transport.clone();
+                let sink = sink.clone();
                 let current_request_id = current_request_id.clone();
                 planner.on(move |event| {
-                    let _ = transport.write_event(&ProtocolEvent::new(
-                        current_request_id.lock().unwrap().clone(),
-                        event,
-                    ));
+                    sink.send(current_request_id.lock().unwrap().clone(), event);
                 });
             }
 
@@ -497,7 +620,7 @@ impl<T: Transport> RuntimeEngine<T> {
             // confirmation channel the CLI already answers.
             if require_approval {
                 let pending = pending_confirmation.clone();
-                let transport = transport.clone();
+                let sink = sink.clone();
                 let current_request_id = current_request_id.clone();
                 planner.set_approval_callback(move |plan| {
                     let steps = plan
@@ -508,14 +631,14 @@ impl<T: Transport> RuntimeEngine<T> {
                             description: step.description.clone(),
                         })
                         .collect();
-                    let _ = transport.write_event(&ProtocolEvent::new(
+                    sink.send(
                         current_request_id.lock().unwrap().clone(),
                         Event::PlanApprovalRequest {
                             plan_id: plan.id.clone(),
                             goal: plan.goal.clone(),
                             steps,
                         },
-                    ));
+                    );
                     let (sender, receiver) = mpsc::channel();
                     *pending.lock().unwrap() = Some(sender);
                     receiver.recv().unwrap_or(false)
@@ -558,7 +681,7 @@ impl<T: Transport> RuntimeEngine<T> {
             self.emit(
                 Some(request_id),
                 Event::Error {
-                    message: "runtime is not initialized".to_string(),
+                    message: "not initialized".to_string(),
                 },
             );
             return;
@@ -568,7 +691,7 @@ impl<T: Transport> RuntimeEngine<T> {
         orchestrator.reset_cancel();
         orchestrator.clear_event_handlers();
 
-        let transport = self.transport.clone();
+        let sink = self.sink.clone();
         let running = self.running.clone();
         let current_request_id = self.current_request_id.clone();
         let event_request_id = request_id.clone();
@@ -586,32 +709,28 @@ impl<T: Transport> RuntimeEngine<T> {
                 }),
                 _ => None,
             };
-            let _ =
-                transport.write_event(&ProtocolEvent::new(Some(event_request_id.clone()), event));
+            sink.send(Some(event_request_id.clone()), event);
             if let Some(finished) = finished {
-                let _ = transport.write_event(&ProtocolEvent::new(
-                    Some(event_request_id.clone()),
-                    finished,
-                ));
+                sink.send(Some(event_request_id.clone()), finished);
             }
         });
 
-        let transport = self.transport.clone();
+        let sink = self.sink.clone();
         self.run_threads.push(std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("runtime engine tokio runtime");
-            let delta_transport = transport.clone();
+            let delta_sink = sink.clone();
             let delta_request_id = request_id.clone();
             let result = runtime.block_on(orchestrator.run_stream_with_attachments(
                 &task,
                 attachments,
                 move |content| {
-                    let _ = delta_transport.write_event(&ProtocolEvent::new(
+                    delta_sink.send(
                         Some(delta_request_id.clone()),
                         Event::AssistantDelta { content },
-                    ));
+                    );
                 },
             ));
 
@@ -621,24 +740,19 @@ impl<T: Transport> RuntimeEngine<T> {
                     message: error.to_string(),
                 },
             };
-            let _ = transport.write_event(&ProtocolEvent::new(Some(request_id), event));
+            sink.send(Some(request_id), event);
             running.store(false, Ordering::SeqCst);
             *current_request_id.lock().unwrap() = None;
         }));
     }
 
     fn emit(&self, request_id: Option<String>, event: Event) {
-        if let Err(error) = self
-            .transport
-            .write_event(&ProtocolEvent::new(request_id, event))
-        {
-            tracing::warn!(%error, "failed to write runtime event");
-        }
+        self.sink.send(request_id, event);
     }
 }
 
 struct RuntimeQuestionHandler<T: Transport> {
-    transport: Arc<T>,
+    sink: EventSink<T>,
     current_request_id: Arc<Mutex<Option<String>>>,
     pending: Arc<Mutex<Option<mpsc::Sender<Vec<QuestionAnswer>>>>>,
 }
@@ -648,12 +762,12 @@ impl<T: Transport> QuestionHandler for RuntimeQuestionHandler<T> {
         let request_id = self.current_request_id.lock().unwrap().clone();
         let (sender, receiver) = mpsc::channel();
         *self.pending.lock().unwrap() = Some(sender);
-        let _ = self.transport.write_event(&ProtocolEvent::new(
+        self.sink.send(
             request_id,
             Event::QuestionRequest {
                 questions: questions.to_vec(),
             },
-        ));
+        );
         receiver.recv().unwrap_or_else(|_| {
             questions
                 .iter()
@@ -668,18 +782,18 @@ impl<T: Transport> QuestionHandler for RuntimeQuestionHandler<T> {
 }
 
 struct RuntimeTodoHandler<T: Transport> {
-    transport: Arc<T>,
+    sink: EventSink<T>,
     current_request_id: Arc<Mutex<Option<String>>>,
 }
 
 impl<T: Transport> TodoChangeHandler for RuntimeTodoHandler<T> {
     fn on_change(&self, todos: &[TodoItem]) {
         let request_id = self.current_request_id.lock().unwrap().clone();
-        let _ = self.transport.write_event(&ProtocolEvent::new(
+        self.sink.send(
             request_id,
             Event::TodoChanged {
                 todos: todos.to_vec(),
             },
-        ));
+        );
     }
 }
