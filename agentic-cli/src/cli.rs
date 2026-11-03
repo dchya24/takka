@@ -44,6 +44,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "MODE", default_value = "default")]
     pub mode: PermissionModeArg,
 
+    /// How user text typed while a run is active is handled
+    ///
+    /// - follow-up: locally queued; sent as the next run after the
+    ///   current one finishes (default)
+    /// - interrupt: sent to the engine as a steer; injected at the next
+    ///   tool boundary of the running task
+    #[arg(long, global = true, value_name = "MODE", default_value = "follow-up")]
+    pub queue_mode: QueueModeArg,
+
     /// Write all tracing logs (incl. every LLM request/response and agent
     /// loop iteration) to a file. In debug builds this defaults to
     /// `./logs/agentic-<timestamp>.log`; in release it is off unless given.
@@ -81,6 +90,26 @@ impl From<PermissionModeArg> for core_agentic::PermissionMode {
             PermissionModeArg::Default => core_agentic::PermissionMode::Default,
             PermissionModeArg::Plan => core_agentic::PermissionMode::Plan,
             PermissionModeArg::Yolo => core_agentic::PermissionMode::Yolo,
+        }
+    }
+}
+
+/// CLI representation of [`crate::commands::QueueMode`] (how user text
+/// typed while a run is active is handled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum QueueModeArg {
+    /// Locally queue the text; send it as the next run (default)
+    #[default]
+    FollowUp,
+    /// Send it to the engine as a steer at the next tool boundary
+    Interrupt,
+}
+
+impl From<QueueModeArg> for crate::commands::QueueMode {
+    fn from(arg: QueueModeArg) -> Self {
+        match arg {
+            QueueModeArg::FollowUp => crate::commands::QueueMode::FollowUp,
+            QueueModeArg::Interrupt => crate::commands::QueueMode::Interrupt,
         }
     }
 }

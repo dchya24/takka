@@ -288,12 +288,14 @@ fn steering_source_messages_injected_at_iteration_boundary() {
 #[test]
 fn run_without_steering_source_has_no_steered_events() {
     let provider: Arc<dyn LLMProvider> =
-        Arc::new(ScriptedProvider::new(vec![support::text_response("plain answer")]));
+        Arc::new(ScriptedProvider::new(vec![support::text_response(
+            "plain answer",
+        )]));
     let tools = ToolRegistry::new();
     for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
         tools.register(t);
     }
-    let mut orch = Orchestrator::new(provider, tools);
+    let orch = Orchestrator::new(provider, tools);
     orch.set_permission_mode(PermissionMode::Yolo);
 
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));

@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
         .with_color(color_enabled)
         .with_debug(cli.debug)
         .with_permission_mode(cli.mode.into())
+        .with_queue_mode(cli.queue_mode.into())
         .with_runtime_mode(cli.runtime.into());
 
     // ── Command dispatch ───────────────────────────────────

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cli::SkillAction;
-use crate::commands::Commands;
+use crate::commands::{Commands, QueueMode};
 use crate::input_buffer::InputBuffer;
 use crate::input_renderer::{self, PromptMetadata};
 use crate::tui::dropdown::{Dropdown, DropdownType};
@@ -919,6 +919,8 @@ enum ReplAction {
     SkillsLoad(String),
     Search(String),
     Image(String),
+    QueueShow,
+    QueueSet(QueueMode),
 }
 
 fn handle_slash_command(input: &str) -> Option<ReplAction> {
@@ -980,6 +982,19 @@ fn handle_slash_command(input: &str) -> Option<ReplAction> {
             inline::print_blank();
             None
         }
+        "/queue" if !arg.is_empty() => match arg.as_str() {
+            "interrupt" => Some(ReplAction::QueueSet(QueueMode::Interrupt)),
+            "follow-up" => Some(ReplAction::QueueSet(QueueMode::FollowUp)),
+            _ => {
+                inline::print_blank();
+                inline::print_line(&components::warning_badge(
+                    "Usage: /queue [follow-up | interrupt]",
+                ));
+                inline::print_blank();
+                None
+            }
+        },
+        "/queue" => Some(ReplAction::QueueShow),
         _ => {
             inline::print_blank();
             inline::print_line(&components::error_badge(&format!(
@@ -1310,9 +1325,67 @@ async fn handle_repl_action(
         ReplAction::Image(path) => {
             commands.attach_image_inline(path);
         }
+
+        ReplAction::QueueShow => {
+            show_queue_status(commands);
+        }
+
+        ReplAction::QueueSet(mode) => {
+            commands.set_queue_mode(*mode);
+            inline::print_blank();
+            inline::print_line(&components::success_badge(&format!(
+                "Queue mode set to {} — {}",
+                mode.as_str(),
+                mode.description()
+            )));
+            show_queue_status(commands);
+        }
     }
 
     false
+}
+
+/// `/queue` display: active mode + pending follow-up queue (index +
+/// first 80 characters of each entry). Only reachable while the REPL is
+/// idle; input-during-run wiring comes with the TUI phase.
+fn show_queue_status(commands: &Commands) {
+    let mode = commands.queue_mode_getter();
+    inline::print_blank();
+    inline::print_line(&Line::from(vec![
+        RSpan::raw("Queue mode: "),
+        RSpan::styled(
+            mode.as_str(),
+            RStyle::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        RSpan::raw(format!(" — {}", mode.description())),
+    ]));
+
+    let pending = commands.pending_follow_ups();
+    if pending.is_empty() {
+        inline::print_line(&Line::from(RSpan::styled(
+            "Pending follow-ups: (none)",
+            RStyle::default().add_modifier(Modifier::DIM),
+        )));
+    } else {
+        inline::print_line(&Line::from(format!(
+            "Pending follow-ups: {}",
+            pending.len()
+        )));
+        for (i, text) in pending.iter().enumerate() {
+            let preview: String = text.chars().take(80).collect();
+            let ellipsis = if text.chars().count() > 80 { "…" } else { "" };
+            inline::print_line(&Line::from(vec![
+                RSpan::styled(
+                    format!("  {}. ", i + 1),
+                    RStyle::default().fg(Color::DarkGray),
+                ),
+                RSpan::raw(format!("{preview}{ellipsis}")),
+            ]));
+        }
+    }
+    inline::print_blank();
 }
 
 // ── Message processing ────────────────────────────────────
@@ -1761,6 +1834,8 @@ fn print_help() {
 - `/plan <goal>`       Create a plan for a goal
 - `/search <query>`    Search conversation memory (case-insensitive)
 - `/image <path>`      Attach image for next turn (path | data: | http(s) URL)
+- `/queue`             Show queue mode + pending follow-ups
+- `/queue <mode>`      Switch queue mode: follow-up (default) | interrupt
 - `/provider <name>`   Switch provider (not yet supported)
 - `/models`            Pick model interactively
 - `/models <name>`     Switch to model by name (supports auto-complete)
@@ -2182,4 +2257,58 @@ fn show_sessions() {
         RSpan::raw(" to resume a session"),
     ]));
     inline::print_blank();
+}
+
+// ── /queue slash command tests ──────────────────────────────
+
+#[cfg(test)]
+mod slash_queue_tests {
+    use super::*;
+
+    #[test]
+    fn queue_without_arg_maps_to_show() {
+        assert!(matches!(
+            handle_slash_command("/queue"),
+            Some(ReplAction::QueueShow)
+        ));
+    }
+
+    #[test]
+    fn queue_interrupt_switches_mode() {
+        assert!(matches!(
+            handle_slash_command("/queue interrupt"),
+            Some(ReplAction::QueueSet(QueueMode::Interrupt))
+        ));
+    }
+
+    #[test]
+    fn queue_follow_up_switches_mode() {
+        assert!(matches!(
+            handle_slash_command("/queue follow-up"),
+            Some(ReplAction::QueueSet(QueueMode::FollowUp))
+        ));
+    }
+
+    #[test]
+    fn queue_unknown_arg_shows_usage_instead() {
+        // Usage line is printed inline; no action is produced.
+        assert!(handle_slash_command("/queue wat").is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_end_to_end_switch_and_display() {
+        // Runtime side of the slash command: switch + display helpers see
+        // the same state the parser produced. Queue in FollowUp mode
+        // first, then switch — the queued items stay visible (brief:
+        // "ganti mode; isi antrian tampil").
+        let mut commands = Commands::new(core_agentic::Config::fallback());
+        commands
+            .submit_user_text("pending text".to_string())
+            .await
+            .unwrap();
+        assert_eq!(commands.pending_follow_ups().len(), 1);
+        commands.set_queue_mode(QueueMode::Interrupt);
+        assert_eq!(commands.queue_mode_getter(), QueueMode::Interrupt);
+        show_queue_status(&commands); // smoke: must not panic
+    }
 }

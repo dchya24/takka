@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod unit_tests {
-    use crate::cli::{Cli, Command};
+    use crate::cli::{Cli, Command, QueueModeArg};
     use clap::Parser;
 
     #[test]
@@ -43,6 +43,39 @@ mod unit_tests {
             Some(Command::Version) => {}
             _ => panic!("Expected Version command"),
         }
+    }
+
+    #[test]
+    fn queue_mode_flag_defaults_to_follow_up() {
+        let cli = Cli::try_parse_from(["agentic", "run", "task"]).unwrap();
+        assert_eq!(cli.queue_mode, QueueModeArg::FollowUp);
+    }
+
+    #[test]
+    fn queue_mode_flag_accepts_interrupt_before_subcommand() {
+        let cli =
+            Cli::try_parse_from(["agentic", "--queue-mode", "interrupt", "run", "task"]).unwrap();
+        assert_eq!(cli.queue_mode, QueueModeArg::Interrupt);
+    }
+
+    #[test]
+    fn queue_mode_flag_accepts_interrupt_after_subcommand() {
+        let cli =
+            Cli::try_parse_from(["agentic", "interactive", "--queue-mode", "interrupt"]).unwrap();
+        assert_eq!(cli.queue_mode, QueueModeArg::Interrupt);
+    }
+
+    #[test]
+    fn queue_mode_flag_rejects_unknown_value() {
+        assert!(Cli::try_parse_from(["agentic", "run", "--queue-mode", "bogus", "task"]).is_err());
+    }
+
+    #[test]
+    fn queue_mode_arg_converts_to_runtime_queue_mode() {
+        let mode: crate::commands::QueueMode = QueueModeArg::Interrupt.into();
+        assert_eq!(mode, crate::commands::QueueMode::Interrupt);
+        let mode: crate::commands::QueueMode = QueueModeArg::FollowUp.into();
+        assert_eq!(mode, crate::commands::QueueMode::FollowUp);
     }
 
     // The two former tests for `crate::config::Config` were removed when

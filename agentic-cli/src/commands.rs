@@ -458,6 +458,44 @@ const PROVIDER_PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+/// How user text typed while a run is active is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueMode {
+    /// Pesan selama run aktif diantrikan lokal; dikirim sebagai Run
+    /// berikutnya.
+    #[default]
+    FollowUp,
+    /// Pesan selama run aktif dikirim langsung sebagai steer ke engine.
+    Interrupt,
+}
+
+impl QueueMode {
+    /// CLI-facing name (matches the `--queue-mode` values).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueueMode::FollowUp => "follow-up",
+            QueueMode::Interrupt => "interrupt",
+        }
+    }
+
+    /// One-line behavioral description used by `/queue` output.
+    pub fn description(&self) -> &'static str {
+        match self {
+            QueueMode::FollowUp => "text typed during a run is queued and sent as the next run",
+            QueueMode::Interrupt => {
+                "text typed during a run is sent as a steer at the next tool boundary"
+            }
+        }
+    }
+}
+
+/// Safety valve for the client-issued drain loop: each drained follow-up
+/// goes through the full `run()` path, which drains again on completion. In
+/// practice the queue is empty by the time nested drains run; the cap only
+/// guards against a pathological submit-during-drained-run loop (possible
+/// once input-during-run is wired into the TUI).
+const MAX_FOLLOW_UP_DRAIN_DEPTH: usize = 8;
+
 pub struct Commands {
     config: Config,
     // orchestrator removed (P1-1 DoD: no Orchestrator::new in CLI —
@@ -487,6 +525,25 @@ pub struct Commands {
     /// Skill currently active for THIS session (per-instance state
     /// replacing the removed process-global, Fase D).
     active_skill: Option<String>,
+    /// How text typed during an active run is handled: queued locally as a
+    /// follow-up (default) or sent immediately as a steer (interrupt).
+    queue_mode: QueueMode,
+    /// Text submitted while a run was active in FollowUp mode. Drained
+    /// after the run's terminal event: each item is sent as the next run
+    /// (client-issued; see `drain_follow_ups`).
+    pending_follow_ups: std::collections::VecDeque<String>,
+    /// Current nesting depth of `drain_follow_ups` (drained runs drain
+    /// again on completion; capped at [`MAX_FOLLOW_UP_DRAIN_DEPTH`]).
+    drain_depth: usize,
+    /// Test-only taps (cfg(test)): e2e tests prove the client-issued drain
+    /// contract (runs == queue items + 1; the drained run emits its own
+    /// SessionStarted) by counting client-issued Runs and capturing the
+    /// lifecycle events of drained runs — which travel through `run()`'s
+    /// renderer path and are invisible to per-call callbacks.
+    #[cfg(test)]
+    test_runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    test_events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Default for Commands {
@@ -513,6 +570,13 @@ impl Commands {
             interactive_mode: false,
             skill_index: None,
             active_skill: None,
+            queue_mode: QueueMode::default(),
+            pending_follow_ups: std::collections::VecDeque::new(),
+            drain_depth: 0,
+            #[cfg(test)]
+            test_runs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            test_events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -572,6 +636,12 @@ impl Commands {
     /// can render the live input buffer below the progress line.
     pub fn with_permission_mode(mut self, mode: core_agentic::PermissionMode) -> Self {
         self.permission_mode = mode;
+        self
+    }
+
+    /// Select how text typed during an active run is handled.
+    pub fn with_queue_mode(mut self, mode: QueueMode) -> Self {
+        self.queue_mode = mode;
         self
     }
 
@@ -1521,6 +1591,9 @@ impl Commands {
         }
 
         self.ensure_connection().await?;
+        #[cfg(test)]
+        self.test_runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Runtime events are forwarded to the existing single-writer renderer.
         let show_tool_calls = self.config.output.show_tool_calls;
@@ -1718,9 +1791,21 @@ impl Commands {
                         let _ = chunk_tx.send(chunk.to_string());
                     }
                 },
-                |event| {
-                    if !matches!(event, core_agentic::Event::Thinking { .. }) {
-                        let _ = event_tx.send(event);
+                {
+                    // Test tap: drained follow-up runs travel through this
+                    // path, so e2e tests observe their lifecycle here.
+                    #[cfg(test)]
+                    let test_events = std::sync::Arc::clone(&self.test_events);
+                    // `move` (needed for the test tap) would move the
+                    // original sender; forward through a clone instead so
+                    // `drop(event_tx)` below still releases the renderer.
+                    let event_tx = event_tx.clone();
+                    move |event| {
+                        #[cfg(test)]
+                        test_events.lock().unwrap().push(format!("{event:?}"));
+                        if !matches!(event, core_agentic::Event::Thinking { .. }) {
+                            let _ = event_tx.send(event);
+                        }
                     }
                 },
                 |event| match &event.event {
@@ -1795,6 +1880,12 @@ impl Commands {
             }
         }
 
+        // After the run's terminal event (Done or Error), drain queued
+        // follow-ups: text submitted mid-run in FollowUp mode is sent as
+        // the next run (client-issued, depth-guarded loop). Both outcome
+        // branches above converge here.
+        self.drain_follow_ups().await?;
+
         Ok(())
     }
     /// Run task with separate callbacks for streaming chunks and runtime
@@ -1819,6 +1910,9 @@ impl Commands {
     {
         let expanded = crate::file_ref::expand_with_attachments(task);
         self.ensure_connection().await?;
+        #[cfg(test)]
+        self.test_runs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let runtime = self
             .connection
             .as_mut()
@@ -1871,7 +1965,90 @@ impl Commands {
             )
             .await;
 
+        // Same drain-after-Done contract as `run()`: after the run's
+        // terminal event, queued follow-ups are sent as the next run(s).
+        // Fires for both outcomes (Ok/Err) — a failed session also has a
+        // terminal event, and queued text should still reach the engine.
+        self.drain_follow_ups().await?;
+
         result
+    }
+
+    // ── Follow-up queue (QueueMode) ───────────────────────
+
+    /// Active queue mode (how text typed during a run is handled).
+    pub fn queue_mode_getter(&self) -> QueueMode {
+        self.queue_mode
+    }
+
+    /// Switch the queue mode at runtime (the `/queue` slash command).
+    pub fn set_queue_mode(&mut self, mode: QueueMode) {
+        self.queue_mode = mode;
+    }
+
+    /// Text queued in FollowUp mode awaiting the next drain.
+    pub fn pending_follow_ups(&self) -> &std::collections::VecDeque<String> {
+        &self.pending_follow_ups
+    }
+
+    /// Programmatic entrypoint for user text typed while a run may be
+    /// active (unit-tested now; the TUI wires it up in a later phase —
+    /// inline REPL input-during-run is out of scope).
+    ///
+    /// Returns `Ok(true)` when the text was accepted (steered or queued).
+    ///
+    /// - Interrupt mode: fire-and-forget steer to the engine (injected at
+    ///   the next tool boundary; requires an active run, else the engine
+    ///   answers `Error { "no active run" }` on the event stream).
+    /// - FollowUp mode: pushed onto the local queue; sent as the next run
+    ///   once the current one reaches its terminal event.
+    pub(crate) async fn submit_user_text(&mut self, text: String) -> Result<bool> {
+        match self.queue_mode {
+            QueueMode::Interrupt => {
+                let conn = self
+                    .connection
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+                conn.steer(text).await?;
+                Ok(true)
+            }
+            QueueMode::FollowUp => {
+                self.pending_follow_ups.push_back(text);
+                Ok(true)
+            }
+        }
+    }
+
+    /// After a run's terminal event: drain the follow-up queue — send each
+    /// queued item as the next run (client-issued, loop, depth-guarded).
+    ///
+    /// Drained items go through the full `run()` path, which drains again
+    /// on completion; `drain_depth` keeps that nesting bounded (see
+    /// [`MAX_FOLLOW_UP_DRAIN_DEPTH`]). Leftover items past the cap stay
+    /// queued for the next drain.
+    ///
+    /// Returns a boxed future: `run → drain → run` is recursive at the
+    /// type level, and async fns refuse unboxed recursion (the runtime
+    /// bound is the depth guard, not the type).
+    fn drain_follow_ups(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            if self.drain_depth >= MAX_FOLLOW_UP_DRAIN_DEPTH {
+                return Ok(());
+            }
+            self.drain_depth += 1;
+            let result = self.drain_follow_ups_loop().await;
+            self.drain_depth -= 1;
+            result
+        })
+    }
+
+    async fn drain_follow_ups_loop(&mut self) -> Result<()> {
+        while let Some(next) = self.pending_follow_ups.pop_front() {
+            self.run(&next).await?;
+        }
+        Ok(())
     }
 
     // ── Config dispatch ─────────────────────────────────────
@@ -3297,6 +3474,85 @@ mod search_snippet_tests {
     }
 }
 
+// ── QueueMode / follow-up queue unit tests ──────────────
+
+#[cfg(test)]
+mod queue_mode_tests {
+    use super::*;
+
+    #[test]
+    fn queue_mode_default_is_follow_up() {
+        assert_eq!(QueueMode::default(), QueueMode::FollowUp);
+    }
+
+    #[test]
+    fn queue_mode_labels_match_cli_flag_values() {
+        // `/queue <mode>` and `--queue-mode <MODE>` must agree on names.
+        assert_eq!(QueueMode::FollowUp.as_str(), "follow-up");
+        assert_eq!(QueueMode::Interrupt.as_str(), "interrupt");
+    }
+
+    #[test]
+    fn set_queue_mode_switches_mode() {
+        let mut commands = Commands::new(Config::fallback());
+        assert_eq!(commands.queue_mode_getter(), QueueMode::FollowUp);
+        commands.set_queue_mode(QueueMode::Interrupt);
+        assert_eq!(commands.queue_mode_getter(), QueueMode::Interrupt);
+        commands.set_queue_mode(QueueMode::FollowUp);
+        assert_eq!(commands.queue_mode_getter(), QueueMode::FollowUp);
+    }
+
+    #[tokio::test]
+    async fn submit_user_text_follow_up_queues_without_connection() {
+        // FollowUp is a purely local queue: no engine connection needed.
+        let mut commands = Commands::new(Config::fallback());
+        commands
+            .submit_user_text("queued".to_string())
+            .await
+            .expect("follow-up submit should always succeed");
+        let queued: Vec<_> = commands.pending_follow_ups().iter().cloned().collect();
+        assert_eq!(queued, vec!["queued".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn submit_user_text_follow_up_preserves_fifo_order() {
+        let mut commands = Commands::new(Config::fallback());
+        commands
+            .submit_user_text("first".to_string())
+            .await
+            .unwrap();
+        commands
+            .submit_user_text("second".to_string())
+            .await
+            .unwrap();
+        let queued: Vec<_> = commands.pending_follow_ups().iter().cloned().collect();
+        assert_eq!(queued, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn submit_user_text_interrupt_requires_a_connection() {
+        // Interrupt submits a steer to the engine — impossible unconnected.
+        let mut commands = Commands::new(Config::fallback()).with_queue_mode(QueueMode::Interrupt);
+        let err = commands
+            .submit_user_text("hello".to_string())
+            .await
+            .expect_err("interrupt submit without connection must fail");
+        assert!(err.to_string().contains("not connected"));
+        // …and nothing was silently queued either.
+        assert!(commands.pending_follow_ups().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_follow_ups_with_empty_queue_is_a_noop() {
+        let mut commands = Commands::new(Config::fallback());
+        commands
+            .drain_follow_ups()
+            .await
+            .expect("empty drain should be a noop");
+        assert_eq!(commands.test_runs.load(Ordering::Relaxed), 0);
+    }
+}
+
 // ── End-to-end smoke tests ─────────────────────────────────
 //
 // These tests exercise the full `Commands::run` pipeline against a
@@ -3310,6 +3566,7 @@ mod search_snippet_tests {
 mod e2e_tests {
     use super::*;
     use crate::client::RuntimeMode;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
     /// Write a minimal config file pinning the spawned `agentic-runtime`
@@ -3450,6 +3707,149 @@ mod e2e_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn smoke_no_deadlock_spawned() {
         smoke_no_deadlock(RuntimeMode::Spawn).await;
+    }
+
+    /// Follow-up queue flow (both transports), per the steer-queue Task 3
+    /// brief: first run against the hermetic unreachable provider, then
+    /// `submit_user_text` in FollowUp mode queues locally, and
+    /// `drain_follow_ups` issues the queued text as a NEW client-issued
+    /// run — its SessionStarted arrives again, and total client-issued
+    /// Runs == queue items + 1.
+    ///
+    /// The drained run travels through `Commands::run` (the renderer
+    /// path), so its lifecycle is observed through the cfg(test) event tap
+    /// rather than the caller callback used for the first run.
+    async fn smoke_follow_up_queue(mode: RuntimeMode) {
+        let fixture = hermetic_runtime_config();
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(mode)
+            .with_permission_mode(core_agentic::PermissionMode::Yolo);
+        assert_eq!(commands.queue_mode_getter(), QueueMode::FollowUp);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            commands.run_with_callbacks(
+                "first run",
+                |_| {},
+                move |evt| {
+                    captured.lock().unwrap().push(format!("{evt:?}"));
+                },
+            ),
+        )
+        .await
+        .expect("first run hung: no terminal event within 60s");
+        // The provider is unreachable; the session fails deterministically.
+        // The outcome value itself is not the assertion here.
+        let _ = first;
+
+        // FollowUp mode: text submitted once the run is over queues
+        // locally instead of steering.
+        commands
+            .submit_user_text("second run".to_string())
+            .await
+            .expect("submit_user_text should queue in FollowUp mode");
+        assert_eq!(commands.pending_follow_ups().len(), 1);
+
+        // Drain after Done: the queued text is sent as the next run.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            commands.drain_follow_ups(),
+        )
+        .await
+        .expect("drain hung")
+        .expect("drain failed");
+
+        let _ = std::fs::remove_file(&fixture);
+
+        // Client-issued guarantee: exactly one Run per queue item, on top
+        // of the first one.
+        assert_eq!(
+            commands.test_runs.load(Ordering::Relaxed),
+            2,
+            "expected first run + 1 drained follow-up run"
+        );
+
+        // The drained run started its own session (SessionStarted again).
+        let drained: String = commands.test_events.lock().unwrap().join(" ");
+        assert!(
+            drained.contains("SessionStarted"),
+            "drained follow-up run should emit SessionStarted, got: {drained}"
+        );
+
+        // …and the first run streamed its lifecycle to the caller callback.
+        let all: String = events.lock().unwrap().join(" ");
+        assert!(
+            all.contains("SessionStarted"),
+            "Expected SessionStarted on first run, got: {all}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_follow_up_queue_embedded() {
+        smoke_follow_up_queue(RuntimeMode::Embedded).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_follow_up_queue_spawned() {
+        smoke_follow_up_queue(RuntimeMode::Spawn).await;
+    }
+
+    /// Interrupt mode (both transports): text submitted outside an active
+    /// run (the only case this task wires) is sent fire-and-forget as a
+    /// steer — never queued locally. The engine's strict gating answers
+    /// `Error { "no active run" }` on the event stream (Task 2); the stray
+    /// reply is skipped by the next run's request-id filter.
+    async fn smoke_interrupt_mode_does_not_queue(mode: RuntimeMode) {
+        let fixture = hermetic_runtime_config();
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(mode)
+            .with_permission_mode(core_agentic::PermissionMode::Yolo)
+            .with_queue_mode(QueueMode::Interrupt);
+
+        // Establish the connection with a first run (hermetic fixture).
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            commands.run_with_callbacks(
+                "first run",
+                |_| {},
+                move |evt| {
+                    captured.lock().unwrap().push(format!("{evt:?}"));
+                },
+            ),
+        )
+        .await
+        .expect("first run hung");
+
+        // Interrupt mode: fire-and-forget steer, local queue untouched.
+        commands
+            .submit_user_text("steer with no active run".to_string())
+            .await
+            .expect("submit_user_text should send the steer");
+        assert!(
+            commands.pending_follow_ups().is_empty(),
+            "interrupt mode must not queue locally"
+        );
+
+        let _ = std::fs::remove_file(&fixture);
+    }
+
+    #[tokio::test]
+    async fn smoke_interrupt_mode_does_not_queue_embedded() {
+        smoke_interrupt_mode_does_not_queue(RuntimeMode::Embedded).await;
+    }
+
+    #[tokio::test]
+    async fn smoke_interrupt_mode_does_not_queue_spawned() {
+        smoke_interrupt_mode_does_not_queue(RuntimeMode::Spawn).await;
     }
 }
 

@@ -496,9 +496,8 @@ impl<T: Transport> RuntimeEngine<T> {
     /// across the engine field and this closure.
     fn install_steering_source(&self, orchestrator: &mut Orchestrator) {
         let queue = self.steer_queue.clone();
-        orchestrator.set_steering_source(Box::new(move || {
-            queue.lock().unwrap().drain(..).collect()
-        }));
+        orchestrator
+            .set_steering_source(Box::new(move || queue.lock().unwrap().drain(..).collect()));
     }
 
     fn runtime_tool_deps(&self) -> ToolDeps {

@@ -409,6 +409,12 @@ impl AgentConnection {
         send_and_wait_io(self, request).await
     }
 
+    /// Fire-and-forget steer: kirim request, tidak menunggu reply
+    /// (reply `SteerQueued` tiba di stream event biasa).
+    pub async fn steer(&mut self, content: String) -> Result<String> {
+        self.send(Request::Steer { content }).await
+    }
+
     pub async fn run<C, E, R>(
         &mut self,
         task: String,
@@ -578,6 +584,67 @@ mod in_process_tests {
         ))
         .unwrap();
         assert_eq!(frame["capabilities"]["experimentalApi"], true);
+    }
+
+    /// Wire-format pin (closes Task 2 defer #3): the Steer request must
+    /// serialize with the snake_case tag `steer` and carry `content`, and
+    /// must round-trip back to the same variant. This frame crosses the
+    /// JSONL protocol between CLI and daemon — a silent rename would break
+    /// spawned-mode steering.
+    #[test]
+    fn steer_request_serializes_snake_case() {
+        let frame = serde_json::to_value(ProtocolRequest::new(
+            "s1",
+            Request::Steer {
+                content: "hi".into(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(frame["type"], "steer");
+        assert_eq!(frame["content"], "hi");
+
+        // Round-trip: daemon-side deserialization must see the same request.
+        let parsed: ProtocolRequest = serde_json::from_value(frame).unwrap();
+        match parsed.request {
+            Request::Steer { content } => assert_eq!(content, "hi"),
+            other => panic!("expected Request::Steer, got {other:?}"),
+        }
+    }
+
+    /// Hermetic `AgentConnection::steer` (fire-and-forget) against the
+    /// embedded engine's strict gating (Task 2): with no active run the
+    /// engine answers on the normal event stream with
+    /// `Error { "no active run" }` — the reply the caller deliberately
+    /// does not wait for.
+    #[tokio::test]
+    async fn steer_without_active_run_gets_error_on_event_stream() {
+        let mut conn = AgentConnection::connect(
+            RuntimeMode::Embedded,
+            hermetic_overrides(),
+            CLI_CAPABILITIES,
+        )
+        .await
+        .expect("embedded connect");
+
+        // Handshake consumed `cli-1` (Init); this steer is `cli-2`.
+        let id = conn
+            .steer("hello".to_string())
+            .await
+            .expect("steer send failed");
+        assert_eq!(id, "cli-2");
+
+        // The reply arrives as a regular stream event, tagged with the
+        // steer request id.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(10), conn.next_event())
+            .await
+            .expect("timed out waiting for steer reply")
+            .expect("event stream closed");
+        assert_eq!(event.request_id.as_deref(), Some("cli-2"));
+        match event.event {
+            core_agentic::Event::Error { message } => assert_eq!(message, "no active run"),
+            other => panic!("expected Error(no active run), got {other:?}"),
+        }
+        conn.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

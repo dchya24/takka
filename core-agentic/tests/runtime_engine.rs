@@ -756,7 +756,10 @@ fn steer_during_run_injects_at_next_boundary() {
         match event.event {
             Event::ToolStarted { .. } => break,
             Event::Done { .. } | Event::Error { .. } => {
-                panic!("run ended before the steer window opened: {:?}", event.event)
+                panic!(
+                    "run ended before the steer window opened: {:?}",
+                    event.event
+                )
             }
             _ => {}
         }
@@ -779,8 +782,12 @@ fn steer_during_run_injects_at_next_boundary() {
         match &event.event {
             Event::SteerQueued { content } => {
                 assert_eq!(content, STEER_TEXT);
-                steer_queued_ids
-                    .push(event.request_id.clone().expect("SteerQueued must be tagged"));
+                steer_queued_ids.push(
+                    event
+                        .request_id
+                        .clone()
+                        .expect("SteerQueued must be tagged"),
+                );
             }
             Event::Steered { content } => steered.push((
                 event.request_id.clone().expect("Steered must be tagged"),
@@ -803,7 +810,11 @@ fn steer_during_run_injects_at_next_boundary() {
         "SteerQueued must carry the steer request id"
     );
     // 2. Steered di-tag dengan run id, BUKAN id steer.
-    assert_eq!(steered.len(), 1, "exactly one Steered expected: {steered:?}");
+    assert_eq!(
+        steered.len(),
+        1,
+        "exactly one Steered expected: {steered:?}"
+    );
     assert_eq!(
         steered[0].0, "run-1",
         "Steered must carry the RUN request id, not the steer id"
@@ -930,7 +941,10 @@ fn steers_consume_fifo_order() {
         match event.event {
             Event::ToolStarted { .. } => break,
             Event::Done { .. } | Event::Error { .. } => {
-                panic!("run ended before the steer window opened: {:?}", event.event)
+                panic!(
+                    "run ended before the steer window opened: {:?}",
+                    event.event
+                )
             }
             _ => {}
         }
@@ -999,10 +1013,8 @@ fn steer_during_pending_confirmation_gate_is_queued_and_consumed_after_gate() {
     ]));
     let (request_tx, request_rx) = std::sync::mpsc::channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
-    let mut engine = RuntimeEngine::with_provider(
-        MemoryTransport::new(request_rx, event_tx),
-        provider.clone(),
-    );
+    let mut engine =
+        RuntimeEngine::with_provider(MemoryTransport::new(request_rx, event_tx), provider.clone());
     let worker = std::thread::spawn(move || engine.run());
 
     request_tx
