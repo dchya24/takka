@@ -197,7 +197,10 @@ pub(crate) fn spawn_engine_thread<T, F>(
 ) -> std::thread::JoinHandle<()>
 where
     T: core_agentic::runtime::transport::Transport,
-    F: FnOnce(std_mpsc::Receiver<ProtocolRequest>, std_mpsc::Sender<ProtocolEvent>) -> RuntimeEngine<T>
+    F: FnOnce(
+            std_mpsc::Receiver<ProtocolRequest>,
+            std_mpsc::Sender<ProtocolEvent>,
+        ) -> RuntimeEngine<T>
         + Send
         + 'static,
 {
@@ -351,17 +354,17 @@ pub enum RuntimeMode {
 /// `AppServerClient { Embedded, Remote }` pattern): embedded and spawned
 /// are not two products — they are two transports behind one client.
 pub enum AgentConnection {
-    Spawned(RuntimeClient),
+    Spawned(Box<RuntimeClient>),
     InProcess(InProcessClient),
 }
 
 impl AgentConnection {
     pub async fn connect(mode: RuntimeMode, overrides: InitOverrides) -> Result<Self> {
         match mode {
-            RuntimeMode::Embedded => {
-                Ok(Self::InProcess(InProcessClient::start(overrides).await?))
-            }
-            RuntimeMode::Spawn => Ok(Self::Spawned(RuntimeClient::spawn(overrides).await?)),
+            RuntimeMode::Embedded => Ok(Self::InProcess(InProcessClient::start(overrides).await?)),
+            RuntimeMode::Spawn => Ok(Self::Spawned(Box::new(
+                RuntimeClient::spawn(overrides).await?,
+            ))),
         }
     }
 
@@ -510,25 +513,25 @@ mod in_process_tests {
     #[tokio::test]
     async fn agent_connection_connects_in_both_modes() {
         // Embedded (default): tanpa binary agentic-runtime sama sekali.
-        let mut embedded = AgentConnection::connect(
-            RuntimeMode::Embedded,
-            hermetic_overrides(),
-        )
-        .await
-        .expect("embedded connect");
-        let event = embedded.send_and_wait(Request::ListTools).await.expect("list tools");
+        let mut embedded = AgentConnection::connect(RuntimeMode::Embedded, hermetic_overrides())
+            .await
+            .expect("embedded connect");
+        let event = embedded
+            .send_and_wait(Request::ListTools)
+            .await
+            .expect("list tools");
         assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
         embedded.shutdown().await.expect("embedded shutdown");
 
         // Spawn: jalur lama lewat binary daemon (runtime_binary() menemukan
         // target/debug/agentic-runtime hasil cargo test workspace).
-        let mut spawned = AgentConnection::connect(
-            RuntimeMode::Spawn,
-            hermetic_overrides(),
-        )
-        .await
-        .expect("spawned connect");
-        let event = spawned.send_and_wait(Request::ListTools).await.expect("list tools");
+        let mut spawned = AgentConnection::connect(RuntimeMode::Spawn, hermetic_overrides())
+            .await
+            .expect("spawned connect");
+        let event = spawned
+            .send_and_wait(Request::ListTools)
+            .await
+            .expect("list tools");
         assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
         spawned.shutdown().await.expect("spawned shutdown");
     }

@@ -65,6 +65,12 @@ The installer installs **two** binaries into the same directory:
   runtime next to its own binary, or via the `AGENTIC_RUNTIME_BIN`
   environment variable.
 
+Since v0.6.0, the CLI defaults to **embedded mode**: the agent engine runs
+as a thread inside the `agentic` process, so `agentic-runtime` does not need
+to be on PATH at all. Use `agentic --runtime spawn` to run the agent in a
+separate daemon process instead (the `agentic-runtime` binary is discovered
+next to `agentic`, or via the `AGENTIC_RUNTIME_BIN` environment variable).
+
 ### Linux and macOS
 
 Download and inspect the installer first (recommended):

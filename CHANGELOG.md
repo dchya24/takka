@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CLI: **embedded runtime mode** (default) — the agent engine now runs as
+  a thread inside the `agentic` process over in-memory channels, removing
+  the need for a separate `agentic-runtime` binary on PATH. The spawned
+  daemon mode is still available via `agentic --runtime spawn` and honors
+  `AGENTIC_RUNTIME_BIN`. Both modes share the same protocol, handshake,
+  and interactive gates; an engine panic in embedded mode surfaces as a
+  normal terminal `Error` event (same "runtime died" UX as the spawned
+  mode).
+
 ### Changed
 - Tests: the two CLI e2e smoke tests now spawn the real `agentic-runtime`
   daemon against a pinned unreachable provider endpoint, making them
