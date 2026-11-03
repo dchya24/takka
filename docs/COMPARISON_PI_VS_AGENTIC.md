@@ -9,7 +9,7 @@ Dokumen ini membandingkan aliran kerja dua stack agent:
   - `core-agentic` — engine: `Orchestrator` (agent loop), providers, tools, memory/compaction, safety, planner, MCP, skills, subagent.
   - `agentic-cli` — CLI `agentic`: `run`/`interactive`/`tui`, widgets, session JSON, file `@`-ref, confirmation.
 
-Kesimpulan singkat: **arsitekturnya identik secara konsep (engine terpisah dari shell), tapi implementasinya berbeda dalam derajat kompleksitas.** pi unggul di lifecycle-event granular, queueing (steer/follow-up), session tree/branch, dan extension system. agentic unggul di safety/permission engine, planner, subagent, MCP, dan loop-guard (loop detection, graceful finalization). Beberapa hal di pi belum kita punya (steering mid-stream, fork/branch session, extensions), dan beberapa hal di kita tidak ada di pi (safety engine, planner, subagent).
+Kesimpulan singkat: **arsitekturnya identik secara konsep (engine terpisah dari shell), tapi implementasinya berbeda dalam derajat kompleksitas.** pi unggul di lifecycle-event granular, queueing (steer/follow-up), session tree/branch, dan extension system. agentic unggul di safety/permission engine, planner, subagent, MCP, dan loop-guard (loop detection, graceful finalization). Beberapa hal di pi belum kita punya (fork/branch session, extensions), dan beberapa hal di kita tidak ada di pi (safety engine, planner, subagent).
 
 ---
 
@@ -65,7 +65,7 @@ packages/agent (core)                    core-agentic (engine)
 | Eksekusi paralel | Mode `"parallel"`/`"sequential"` per batch; `terminate` dihitung semua tool | Batching: run panjang *consecutive read-only* secara concurrent (`spawn_blocking`), state-changing solo | Kita pakai heuristic read-only; pi pakai mode eksplisit |
 | Loop guard | Auto-retry + auto-compaction (di AgentSession) | `max_iterations` (default 50) + **loop detection** (signature tool+args berulang) + **graceful finalization** (tool dicopot di iterasi terakhir) | **agentic jauh lebih kuat** di sini |
 | Compaction | `shouldCompact` (token estimate), `findCutPoint`, `generateSummary` (LLM) | 3 lapis: truncate (`tool_result_max_chars`) → clear old (`keep_recent_tool_results`) → autocompact (heuristic atau LLM via `summarizer_model`) | Konsep identik (3 lapis) |
-| Queueing | `steer()`/`followUp()`/`nextRun()` + `QueueMode` | **Tidak ada**; interrupt hanya via cancel flag | **Gap besar**: pi bisa "memotong" agent yang sedang streaming |
+| Queueing | `steer()`/`followUp()`/`nextRun()` + `QueueMode` | `Request::Steer` (queue → injeksi FIFO user-message di batas iterasi, gate-safe) + `QueueMode` (`interrupt` steer live; `follow-up` antre lokal lalu jalankan run berikutnya) | Sekarang **split ala pi**: event `SteerQueued`/`Steered` di wire; interrupt cancel flag lama tetap ada |
 | Persistence | `SessionManager` JSONL: tree/branch, `leafId`, fork, navigateTree, versioned | `session.rs` JSON: satu file per sesi, flat array `messages`, auto-title, cost/token | **pi jauh lebih canggih** (branch/fork); kita flat tapi cukup |
 | System prompt | Di-assemble di coding-agent (system-prompt.ts, templates) | `assemble_system_prompt`: DEFAULT + AGENT.md (project) + skills section + config override + persistent memory | Mirip; kita tambah **persistent memory** dan AGENT.md auto-load |
 | Extension | `ExtensionRunner` + hooks (`input`, `context`, `before_agent_start`, `message_end`, `tool_call`...) | **Tidak ada** | **Gap besar**: pi punya plugin system |
