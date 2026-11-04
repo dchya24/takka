@@ -100,7 +100,7 @@ fi
 RELEASE_BASE_URL=${RELEASE_BASE_URL%/}
 
 command -v curl >/dev/null 2>&1 || fail "curl is required to download takka"
-command -v tar >/dev/null 2>&1 || fail "tar is required to extract Agentic"
+command -v tar >/dev/null 2>&1 || fail "tar is required to extract takka"
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256_file() { sha256sum "$1" | awk '{print $1}'; }

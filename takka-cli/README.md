@@ -1,6 +1,6 @@
 # takka CLI
 
-AI agent orchestration command-line interface using [takka-core](https://github.com/dchya24/takka/tree/main/takka-cli).
+AI agent orchestration command-line interface using [takka-core](https://github.com/dchya24/takka/tree/main/takka-core).
 
 ## Installation
 

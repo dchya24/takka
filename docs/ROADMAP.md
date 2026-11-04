@@ -195,7 +195,7 @@ prompt-injection scanner) added a lot of new surface area that benefits
 from end-to-end tests.
 
 ---
-## v0.3.0 (takka-cli) / v0.1.1 (takka-core)
+## v0.3.0 (agentic-cli) / v0.1.1 (core-agentic)
 
 ```text
 refactor(cli): TUI input widget (ratatui) replacing reedline, ESC to abort
