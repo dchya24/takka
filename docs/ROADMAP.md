@@ -93,7 +93,9 @@ Next: **Fase 2b — steer/follow-up queue** sudah landed (engine + CLI); sisa **
 
 ## Open work
 
-**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed — berikutnya **Fase 3: daemon long-lived**.
+**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed. **Fase 3a: daemon mode** (Unix socket broker + token + `agentic attach`; satu sesi aktif) juga sudah landed — berikutnya **Fase 3b: multiplexing (protokol v2)** atau **Fase 4: SDK bahasa lain**.
+
+**Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`agentic --runtime daemon` gagal dengan pesan aksi di Windows).
 
 **Fase UX (open):** input-during-run di REPL inline (non-blokir) belum diimplementasikan — steer/follow-up tersedia di engine/CLI, tapi REPL masih idle-only untuk `/queue`.
 

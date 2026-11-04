@@ -31,6 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command: `interrupt` sends live steers, `follow-up` (default) queues
   text client-side and issues the next run itself. Additive; protocol
   version stays 1.
+- Runtime: **daemon mode (Fase 3a)** — `agentic-runtime --daemon` hosts a
+  single long-lived engine behind a Unix domain socket (`#[cfg(unix)]`),
+  discovered via `~/.config/agentic/daemon.json` (pid, socket path, random
+  token, version). CLIs attach with `--runtime daemon`
+  (auto-spawns the daemon when absent/stale) or `agentic attach`; a second
+  attach is refused with `daemon in use`; detach keeps the engine running
+  and a re-attach adopts the live session (`InitOk` + `session_adopted`),
+  with config/capability mismatches producing actionable errors. Windows
+  daemon mode and named-pipe transport are planned (TODO).
 
 ### Changed
 - Tests: the two CLI e2e smoke tests now spawn the real `agentic-runtime`

@@ -198,7 +198,17 @@ agentic interactive
 
 # Start the full-screen interface
 agentic tui
+
+# Attach to the long-lived daemon (auto-starts one if absent),
+# or run a one-off task through it via --runtime daemon
+agentic attach
+agentic --runtime daemon run "explain the architecture of this repository"
 ```
+
+`agentic attach` drops you into the REPL routed through the running daemon's
+engine; the daemon keeps the session alive across attach/detach cycles, and
+`agentic attach --shutdown` stops it. On Windows use `--runtime embedded`
+(the default) or `--runtime spawn` instead — daemon mode is Unix-only for now.
 
 Useful configuration and discovery commands:
 
@@ -211,6 +221,9 @@ agentic --help
 
 ## Known Limitations and Roadmap
 
+- [ ] Daemon mode (`--runtime daemon` / `agentic attach`) is Unix-only for now;
+      the Windows named-pipe transport is still a TODO — use `--runtime embedded`
+      or `--runtime spawn` on Windows.
 - [ ] Publish Linux ARM64/aarch64 and Windows ARM64 prebuilt releases.
 - [ ] Distribute through package managers such as Homebrew, Scoop, Winget,
       and community Linux repositories.

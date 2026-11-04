@@ -101,7 +101,7 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 | Versioning protokol | versi + gating capability per-method | `PROTOCOL_VERSION = 1` + capabilities + opt-out | ✅ setara |
 | Korelasi request↔event | `sub_id` + event id per turn | `request_id` di envelope | ✅ setara |
 | Antrian saat streaming | `thread/queue/add` (steer/follow-up) | `Request::Steer` antrian engine + follow-up client-side | ✅ ala pi (split shell/core) |
-| Daemon long-lived | `LocalDaemon` (Unix socket) | — | 🔜 fase lanjut |
+| Daemon long-lived | `LocalDaemon` (Unix socket) | `agentic-runtime --daemon` (Unix socket, satu attach) | ✅ (3a: unix socket, satu attach) |
 | Kontrol subprocess terisolasi | `exec-server` + pty + sandbox | `run_command` di core | 🔜 beda scope |
 | SDK bahasa lain | TS SDK resmi | — | 🔜 terbuka otomatis begitu protokol stabil |
 
@@ -153,11 +153,23 @@ CLI: flag global `--queue-mode interrupt|follow-up` + slash `/queue`. `interrupt
 mengirim steer live ke engine; `follow-up` (default) mengantri teks client-side dan
 memicu run berikutnya sendiri setelah `Done`. Additive — `PROTOCOL_VERSION` tetap 1.
 
-### Fase 3 — Daemon mode (ala `LocalDaemon` opencode/codex)
+### Fase 3 — Daemon mode ✅ (landed 2026-11, sebagai 3a: satu sesi aktif; 3b multi-session open)
 
-1. `TcpTransport`/`UnixSocketTransport` di `core-agentic::runtime::transport` (trait `Transport` sudah siap).
-2. `agentic-runtime --daemon` long-lived; beberapa CLI attach ke satu engine; session store shared.
-3. `agentic attach <endpoint>` di CLI.
+1. `UnixSocketTransport` di `core-agentic::runtime::transport` (trait `Transport` sudah siap; `#[cfg(unix)]`).
+2. `agentic-runtime --daemon` long-lived, satu sesi aktif; CLI attach lewat discovery `daemon.json`.
+3. `agentic attach` di CLI (+ `--shutdown`).
+
+#### Fase 3b — Multiplexing (open)
+
+3a sengaja membatasi diri ke **satu sesi aktif** (attach kedua ditolak dengan
+`daemon in use`). Sisa gap menuju daemon multi-sesi ala codex:
+
+- **Session id routing** — `Request`/`Event` belum membawa `session_id`; engine
+  broker hanya melayani satu sesi. Perlu routing per-sesi di broker + session store shared.
+- **Protokol v2** — `PROTOCOL_VERSION` naik ketika envelope berubah (session id,
+  multiplexing), plus capability gating per-method.
+- **SQ/EQ** — pemisahan submission queue / event queue ala codex bila beberapa
+  client menulis ke satu engine secara konkuren.
 
 ### Fase 4 — (Opsional) SDK eksternal
 
