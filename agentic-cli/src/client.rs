@@ -825,6 +825,10 @@ pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
         }
     };
     let deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_TIMEOUT;
+    // Emitted both when a refusal frame arrives and when the race below
+    // turns into a write error. Kept identical so the terminal message is
+    // stable regardless of which path the broker/OS takes.
+    let busy = || anyhow!("daemon busy: another client is attached; detach it and retry shutdown");
     loop {
         let stream = match UnixStream::connect(&info.socket_path).await {
             Ok(stream) => stream,
@@ -837,7 +841,17 @@ pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
             }
         };
         let mut connection = DaemonConnection::from_stream(stream);
-        connection.send(Request::Shutdown).await?;
+        // The refusing broker writes its `daemon in use` frame and closes the
+        // socket without spawning a reader. A fast writer can race that close
+        // and observe EPIPE instead of the frame; the request was not
+        // delivered either way, so retry until the deadline like a refusal.
+        if connection.send(Request::Shutdown).await.is_err() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(busy());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        }
 
         /// Only the refusal case loses the request: the refusing broker
         /// never reads it. Any other outcome means a live reader holds
@@ -848,9 +862,7 @@ pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
             Ok(Ok(event)) => match event.event {
                 core_agentic::Event::Error { message } if message.trim() == "daemon in use" => {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(anyhow!(
-                            "daemon busy: another client is attached; detach it and retry shutdown"
-                        ));
+                        return Err(busy());
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
