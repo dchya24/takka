@@ -1,26 +1,26 @@
-# Agentic CLI
+# takka CLI
 
-AI agent orchestration command-line interface using [core-agentic](https://github.com/nutec/agentic/tree/main/agentic-cli).
+AI agent orchestration command-line interface using [takka-core](https://github.com/dchya24/takka/tree/main/takka-cli).
 
 ## Installation
 
 Prebuilt binaries and user-local installers for Linux, macOS, and Windows are
 documented in the repository's [main installation guide](../README.md#installation).
 The installers verify GitHub Release archives with SHA-256 and do not alter
-existing Agentic configuration.
+existing takka configuration.
 
 To build from source instead:
 
 ```bash
-cargo install --path agentic-cli
+cargo install --path takka-cli
 ```
 
 Or build without installing:
 
 ```bash
-cd agentic-cli
+cd takka-cli
 cargo build --release
-# Binary at target/release/agentic
+# Binary at target/release/takka
 ```
 
 ## Quick Start
@@ -30,13 +30,13 @@ cargo build --release
 export OPENAI_API_KEY="sk-your-key"
 
 # Run a single task
-agentic run "list files in current directory"
+takka run "list files in current directory"
 
 # Interactive REPL with @ file completion and sessions
-agentic interactive
+takka interactive
 
 # TUI mode
-agentic tui
+takka tui
 ```
 
 ## Usage
@@ -45,12 +45,12 @@ agentic tui
 
 | Command | Description |
 |---------|------------|
-| `agentic run <task>` | Run a single task |
-| `agentic interactive` | Start interactive REPL mode |
-| `agentic tui` | Start full TUI mode |
-| `agentic config show` | Display current configuration |
-| `agentic config init --interactive` | Guided config wizard |
-| `agentic version` | Show version |
+| `takka run <task>` | Run a single task |
+| `takka interactive` | Start interactive REPL mode |
+| `takka tui` | Start full TUI mode |
+| `takka config show` | Display current configuration |
+| `takka config init --interactive` | Guided config wizard |
+| `takka version` | Show version |
 
 ### Options
 
@@ -72,7 +72,7 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 ### Config File
 
-Location: `~/.config/agentic/config.json` or custom via `--config`
+Location: `~/.config/takka/config.json` or custom via `--config`
 
 ```json
 {
@@ -185,9 +185,9 @@ Sessions are automatically saved and can be resumed across runs.
 ### Session Lifecycle
 
 ```
-agentic interactive
+takka interactive
   → Session created (auto-titled from first user message)
-  → Each turn: auto-saved to ~/.config/agentic/sessions/
+  → Each turn: auto-saved to ~/.config/takka/sessions/
   → /new → saves current session, creates fresh one
   → /sessions → list all sessions (most recent first)
   → /sessions <id> → resume a previous session
@@ -196,10 +196,10 @@ agentic interactive
 
 ### Session Storage
 
-Sessions are stored as JSON files in `~/.config/agentic/sessions/`:
+Sessions are stored as JSON files in `~/.config/takka/sessions/`:
 
 ```
-~/.config/agentic/
+~/.config/takka/
 ├── config.json
 └── sessions/
     ├── ses_18a3b2c_001f.json
@@ -216,7 +216,7 @@ Each session captures:
 ### Example
 
 ```bash
-agentic interactive
+takka interactive
 
 # Work on something
 > help me fix the auth module in user.service.ts
@@ -268,22 +268,22 @@ When running tasks, the agent has access to:
 
 ```bash
 # Single task
-agentic run "hello world"
+takka run "hello world"
 
 # File operations
-agentic run "create a hello.txt file with 'hello world'"
+takka run "create a hello.txt file with 'hello world'"
 
 # List files
-agentic run "show me all files in src directory"
+takka run "show me all files in src directory"
 
 # Interactive with session management
-agentic interactive
+takka interactive
 
 # Debug mode
-agentic run "list files" -v trace
+takka run "list files" -v trace
 
 # Custom config
-agentic -c ~/my-config.json interactive
+takka -c ~/my-config.json interactive
 ```
 
 ## Building

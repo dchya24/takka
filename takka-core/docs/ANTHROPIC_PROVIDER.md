@@ -1,6 +1,6 @@
 # Anthropic Provider Documentation
 
-This provider enables using Anthropic's Claude models via the Anthropic API with the core-agentic library.
+This provider enables using Anthropic's Claude models via the Anthropic API with the takka-core library.
 
 ## Overview
 
@@ -17,7 +17,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-core-agentic = { version = "0.1", features = ["anthropic"] }
+takka-core = { version = "0.1", features = ["anthropic"] }
 ```
 
 ## Configuration
@@ -25,7 +25,7 @@ core-agentic = { version = "0.1", features = ["anthropic"] }
 The `AnthropicProviderConfig` struct is used to configure the provider:
 
 ```rust
-use core_agentic::providers::AnthropicProviderConfig;
+use takka_core::providers::AnthropicProviderConfig;
 
 // Basic configuration
 let config = AnthropicProviderConfig::new(
@@ -56,7 +56,7 @@ let config = AnthropicProviderConfig::new(
 The provider automatically retries requests on failures with exponential backoff:
 
 ```rust
-use core_agentic::providers::{AnthropicProviderConfig, RetryConfig};
+use takka_core::providers::{AnthropicProviderConfig, RetryConfig};
 
 let config = AnthropicProviderConfig::new("anthropic", "api-key", "model");
 
@@ -81,7 +81,7 @@ config.retry = retry_config;
 ### Creating the Provider
 
 ```rust
-use core_agentic::providers::{AnthropicProvider, AnthropicProviderConfig};
+use takka_core::providers::{AnthropicProvider, AnthropicProviderConfig};
 
 let config = AnthropicProviderConfig::new(
     "anthropic",
@@ -95,7 +95,7 @@ let provider = AnthropicProvider::new(config);
 ### Chat Completions
 
 ```rust
-use core_agentic::providers::{ChatRequest, ChatMessageRequest};
+use takka_core::providers::{ChatRequest, ChatMessageRequest};
 
 let request = ChatRequest::new(
     "claude-3-5-sonnet-20241022",
@@ -170,7 +170,7 @@ while let Some(chunk) = stream.next().await {
 Anthropic supports function/tool calling:
 
 ```rust
-use core_agentic::providers::{ChatRequest, ChatMessageRequest, ToolDefinition, ToolFunction};
+use takka_core::providers::{ChatRequest, ChatMessageRequest, ToolDefinition, ToolFunction};
 
 let request = ChatRequest::new(
     "claude-3-5-sonnet-20241022",
@@ -244,7 +244,7 @@ let config = AnthropicProviderConfig::new(
 The provider returns `ProviderError` for any issues:
 
 ```rust
-use core_agentic::providers::ProviderError;
+use takka_core::providers::ProviderError;
 
 match provider.chat(request) {
     Ok(response) => {
@@ -316,4 +316,4 @@ You can also configure the Anthropic provider via a configuration file:
 
 ## License
 
-This provider implementation is part of core-agentic and follows the same license.
+This provider implementation is part of takka-core and follows the same license.

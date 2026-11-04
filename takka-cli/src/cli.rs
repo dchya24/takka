@@ -286,7 +286,7 @@ pub enum SkillAction {
     Create {
         /// Name for the new skill (lowercase a-z, 0-9, hyphens, 1-64 chars)
         name: String,
-        /// Create in user-global directory (~/.config/agentic/skills/) instead of project-local
+        /// Create in user-global directory (~/.config/takka/skills/) instead of project-local
         #[arg(long)]
         global: bool,
     },

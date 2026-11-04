@@ -1,7 +1,7 @@
-# Agentic Tools Reference
+# takka Tools Reference
 
-The `core-agentic/src/tools/` directory contains **18 registered builtin tools**.
-Each tool implements the `Tool` trait (`core-agentic/src/tool.rs`) with
+The `takka-core/src/tools/` directory contains **18 registered builtin tools**.
+Each tool implements the `Tool` trait (`takka-core/src/tool.rs`) with
 `name()`, `description()`, `schema()`, `execute()`, and `is_read_only()`.
 
 ## Architecture
@@ -227,7 +227,7 @@ Loaded into the system prompt on session start.
 | Parameter | Type   | Required | Description                                                          |
 | --------- | ------ | -------- | -------------------------------------------------------------------- |
 | content   | string | yes      | Markdown text to append                                              |
-| scope     | string | no       | `user` (global `~/.config/agentic/memory.md`) or `project` (`.agentic/memory.md`). Default: `user` |
+| scope     | string | no       | `user` (global `~/.config/takka/memory.md`) or `project` (`.agentic/memory.md`). Default: `user` |
 
 ---
 
@@ -303,7 +303,7 @@ These tools are always registered in `builtin_tools()`. Conditional gating is ha
 
 ## Not implemented (intentional)
 
-These tools from the opencode reference are **not planned** for agentic:
+These tools from the opencode reference are **not planned** for takka:
 
 | Tool | Reason |
 | ---- | ------ |

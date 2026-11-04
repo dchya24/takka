@@ -35,37 +35,37 @@ make_release_fixture() {
   fixture_dir=$1
   marker=$2
   mkdir -p "$fixture_dir/build"
-  cat > "$fixture_dir/build/agentic" <<EOF
+  cat > "$fixture_dir/build/takka" <<EOF
 #!/bin/sh
 printf '%s\\n' '$marker'
 if [ "\${1:-}" = config ]; then
-  printf '%s\\n' "\$*" > "\${AGENTIC_INIT_LOG:?}"
+  printf '%s\\n' "\$*" > "\${TAKKA_INIT_LOG:?}"
 fi
 EOF
-  chmod +x "$fixture_dir/build/agentic"
+  chmod +x "$fixture_dir/build/takka"
 
-  # The installer also fetches the agentic-runtime daemon (a bare binary
+  # The installer also fetches the takka-runtime daemon (a bare binary
   # asset per platform) and verifies it against the same checksum file —
   # ship fixture runtime binaries and their hashes alongside the CLI.
-  cat > "$fixture_dir/build/agentic-runtime" <<EOF
+  cat > "$fixture_dir/build/takka-runtime" <<EOF
 #!/bin/sh
 printf '%s\n' '$marker-runtime'
 EOF
-  chmod +x "$fixture_dir/build/agentic-runtime"
+  chmod +x "$fixture_dir/build/takka-runtime"
 
-  for asset in agentic-linux-x86_64.tar.gz agentic-macos-x86_64.tar.gz agentic-macos-aarch64.tar.gz; do
-    tar -czf "$fixture_dir/$asset" -C "$fixture_dir/build" agentic
+  for asset in takka-linux-x86_64.tar.gz takka-macos-x86_64.tar.gz takka-macos-aarch64.tar.gz; do
+    tar -czf "$fixture_dir/$asset" -C "$fixture_dir/build" takka
   done
-  for runtime in agentic-runtime-linux-x86_64 agentic-runtime-macos-x86_64 agentic-runtime-macos-aarch64; do
-    cp "$fixture_dir/build/agentic-runtime" "$fixture_dir/$runtime"
+  for runtime in takka-runtime-linux-x86_64 takka-runtime-macos-x86_64 takka-runtime-macos-aarch64; do
+    cp "$fixture_dir/build/takka-runtime" "$fixture_dir/$runtime"
   done
 
   : > "$fixture_dir/checksums-linux.txt"
   : > "$fixture_dir/checksums-macos.txt"
-  for asset in agentic-linux-x86_64.tar.gz agentic-runtime-linux-x86_64; do
+  for asset in takka-linux-x86_64.tar.gz takka-runtime-linux-x86_64; do
     printf '%s  %s\n' "$(sha256_file "$fixture_dir/$asset")" "$asset" >> "$fixture_dir/checksums-linux.txt"
   done
-  for asset in agentic-macos-x86_64.tar.gz agentic-macos-aarch64.tar.gz agentic-runtime-macos-x86_64 agentic-runtime-macos-aarch64; do
+  for asset in takka-macos-x86_64.tar.gz takka-macos-aarch64.tar.gz takka-runtime-macos-x86_64 takka-runtime-macos-aarch64; do
     printf '%s  %s\n' "$(sha256_file "$fixture_dir/$asset")" "$asset" >> "$fixture_dir/checksums-macos.txt"
   done
 }
@@ -124,9 +124,9 @@ run_installer() {
 
   HOME="$case_dir/home" \
   PATH="$case_dir/stubs:/usr/bin:/bin" \
-  AGENTIC_INSTALL_DIR="$case_dir/bin" \
-  AGENTIC_RELEASE_BASE_URL="https://fixtures.invalid/releases/latest/download" \
-  AGENTIC_INIT_LOG="$case_dir/init.log" \
+  TAKKA_INSTALL_DIR="$case_dir/bin" \
+  TAKKA_RELEASE_BASE_URL="https://fixtures.invalid/releases/latest/download" \
+  TAKKA_INIT_LOG="$case_dir/init.log" \
   TEST_FIXTURE_DIR="$FIXTURE_DIR" \
   TEST_DOWNLOAD_LOG="$case_dir/download.log" \
   env "${env_args[@]}" sh "$INSTALLER" "${installer_args[@]}"
@@ -150,20 +150,21 @@ case_unsupported_linux_arm64() {
 case_linux_install() {
   dir="$TEST_ROOT/linux-install"
   if run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 >/dev/null 2>&1 \
-    && [ -x "$dir/bin/agentic" ] \
-    && [ "$(AGENTIC_INIT_LOG="$dir/init.log" "$dir/bin/agentic")" = fixture-v1 ]; then
-    record_pass "Linux x86_64 installs verified binary"
+    && [ -x "$dir/bin/takka" ] \
+    && [ -x "$dir/bin/takka-runtime" ] \
+    && [ "$(TAKKA_INIT_LOG="$dir/init.log" "$dir/bin/takka")" = fixture-v1 ]; then
+    record_pass "Linux x86_64 installs verified binaries"
   else
-    record_fail "Linux x86_64 installs verified binary"
+    record_fail "Linux x86_64 installs verified binaries"
   fi
 }
 
 case_macos_x86_64_install() {
   dir="$TEST_ROOT/macos-x86_64"
   if run_installer "$dir" TEST_UNAME_S=Darwin TEST_UNAME_M=x86_64 >/dev/null 2>&1 \
-    && grep -q 'agentic-macos-x86_64.tar.gz' "$dir/download.log" \
+    && grep -q 'takka-macos-x86_64.tar.gz' "$dir/download.log" \
     && grep -q 'checksums-macos.txt' "$dir/download.log" \
-    && [ -x "$dir/bin/agentic" ]; then
+    && [ -x "$dir/bin/takka" ]; then
     record_pass "macOS x86_64 selects matching release assets"
   else
     record_fail "macOS x86_64 selects matching release assets"
@@ -173,9 +174,9 @@ case_macos_x86_64_install() {
 case_macos_aarch64_install() {
   dir="$TEST_ROOT/macos-aarch64"
   if run_installer "$dir" TEST_UNAME_S=Darwin TEST_UNAME_M=arm64 >/dev/null 2>&1 \
-    && grep -q 'agentic-macos-aarch64.tar.gz' "$dir/download.log" \
+    && grep -q 'takka-macos-aarch64.tar.gz' "$dir/download.log" \
     && grep -q 'checksums-macos.txt' "$dir/download.log" \
-    && [ -x "$dir/bin/agentic" ]; then
+    && [ -x "$dir/bin/takka" ]; then
     record_pass "macOS aarch64 selects matching release assets"
   else
     record_fail "macOS aarch64 selects matching release assets"
@@ -185,16 +186,16 @@ case_macos_aarch64_install() {
 case_checksum_mismatch() {
   dir="$TEST_ROOT/checksum-mismatch"
   mkdir -p "$dir/bin"
-  printf '%s\n' old-binary > "$dir/bin/agentic"
-  chmod +x "$dir/bin/agentic"
+  printf '%s\n' old-binary > "$dir/bin/takka"
+  chmod +x "$dir/bin/takka"
   cp "$FIXTURE_DIR/checksums-linux.txt" "$FIXTURE_DIR/checksums-linux.txt.good"
-  printf '%064d  %s\n' 0 agentic-linux-x86_64.tar.gz > "$FIXTURE_DIR/checksums-linux.txt"
+  printf '%064d  %s\n' 0 takka-linux-x86_64.tar.gz > "$FIXTURE_DIR/checksums-linux.txt"
   output=$(run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 2>&1)
   status=$?
   mv "$FIXTURE_DIR/checksums-linux.txt.good" "$FIXTURE_DIR/checksums-linux.txt"
   if [ "$status" -ne 0 ] \
     && printf '%s' "$output" | grep -qi 'checksum mismatch' \
-    && grep -q old-binary "$dir/bin/agentic"; then
+    && grep -q old-binary "$dir/bin/takka"; then
     record_pass "checksum mismatch preserves existing binary"
   else
     record_fail "checksum mismatch preserves existing binary" "status=$status"
@@ -203,7 +204,7 @@ case_checksum_mismatch() {
 
 case_explicit_version() {
   dir="$TEST_ROOT/explicit-version"
-  if run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 AGENTIC_VERSION=0.3.2 >/dev/null 2>&1 \
+  if run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 TAKKA_VERSION=0.3.2 >/dev/null 2>&1 \
     && grep -q '/releases/download/v0.3.2/' "$dir/download.log"; then
     record_pass "explicit version selects tagged release URL"
   else
@@ -213,26 +214,74 @@ case_explicit_version() {
 
 case_invalid_version() {
   dir="$TEST_ROOT/invalid-version"
-  output=$(run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 AGENTIC_VERSION=0.3.2-beta 2>&1)
+  output=$(run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 TAKKA_VERSION=0.3.2-beta 2>&1)
   status=$?
   if [ "$status" -ne 0 ] \
-    && printf '%s' "$output" | grep -q 'Invalid AGENTIC_VERSION' \
-    && [ ! -e "$dir/bin/agentic" ]; then
+    && printf '%s' "$output" | grep -q 'Invalid TAKKA_VERSION' \
+    && [ ! -e "$dir/bin/takka" ]; then
     record_pass "invalid version is rejected before installation"
   else
     record_fail "invalid version is rejected before installation" "status=$status output=$output"
   fi
 }
 
+case_legacy_env_fallback() {
+  dir="$TEST_ROOT/legacy-env-fallback"
+  output=$(run_installer_env_legacy "$dir" 2>&1)
+  status=$?
+  if [ "$status" -eq 0 ] \
+    && [ -x "$dir/bin/takka" ] \
+    && printf '%s' "$output" | grep -q 'using legacy AGENTIC_INSTALL_DIR' \
+    && printf '%s' "$output" | grep -q 'using legacy AGENTIC_RELEASE_BASE_URL'; then
+    record_pass "legacy AGENTIC_* installer vars still work with warning"
+  else
+    record_fail "legacy AGENTIC_* installer vars still work with warning" "status=$status output=$output"
+  fi
+}
+
+# Same harness as run_installer but passes pre-rebrand AGENTIC_* vars.
+run_installer_env_legacy() {
+  case_dir=$1
+  mkdir -p "$case_dir/home" "$case_dir/bin" "$case_dir/stubs"
+  make_stubs "$case_dir/stubs"
+  : > "$case_dir/download.log"
+  : > "$case_dir/init.log"
+
+  HOME="$case_dir/home" \
+  PATH="$case_dir/stubs:/usr/bin:/bin" \
+  AGENTIC_INSTALL_DIR="$case_dir/bin" \
+  AGENTIC_RELEASE_BASE_URL="https://fixtures.invalid/releases/latest/download" \
+  TAKKA_INIT_LOG="$case_dir/init.log" \
+  TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 \
+  TEST_FIXTURE_DIR="$FIXTURE_DIR" \
+  TEST_DOWNLOAD_LOG="$case_dir/download.log" \
+  sh "$INSTALLER"
+}
+
 case_config_preserved() {
   dir="$TEST_ROOT/config-preserved"
-  mkdir -p "$dir/home/.config/agentic"
-  printf '%s\n' '{"keep":true}' > "$dir/home/.config/agentic/config.json"
+  mkdir -p "$dir/home/.config/takka"
+  printf '%s\n' '{"keep":true}' > "$dir/home/.config/takka/config.json"
   if run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 >/dev/null 2>&1 \
-    && grep -q '"keep":true' "$dir/home/.config/agentic/config.json"; then
+    && grep -q '"keep":true' "$dir/home/.config/takka/config.json"; then
     record_pass "existing config is preserved"
   else
     record_fail "existing config is preserved"
+  fi
+}
+
+case_legacy_config_hint() {
+  dir="$TEST_ROOT/legacy-config-hint"
+  mkdir -p "$dir/home/.config/agentic"
+  printf '%s\n' '{"keep":true}' > "$dir/home/.config/agentic/config.json"
+  output=$(run_installer "$dir" TEST_UNAME_S=Linux TEST_UNAME_M=x86_64 2>&1)
+  status=$?
+  if [ "$status" -eq 0 ] \
+    && grep -q '"keep":true' "$dir/home/.config/agentic/config.json" \
+    && printf '%s' "$output" | grep -q 'takka config migrate'; then
+    record_pass "pre-rebrand config is left in place with a migrate hint"
+  else
+    record_fail "pre-rebrand config is left in place with a migrate hint" "status=$status"
   fi
 }
 
@@ -263,7 +312,9 @@ case_macos_aarch64_install
 case_checksum_mismatch
 case_explicit_version
 case_invalid_version
+case_legacy_env_fallback
 case_config_preserved
+case_legacy_config_hint
 case_default_skips_init
 case_init_opt_in
 

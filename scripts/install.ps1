@@ -1,22 +1,35 @@
 [CmdletBinding()]
 param(
     [switch]$Init,
-    [string]$Version = $env:AGENTIC_VERSION,
-    [string]$InstallDir = $env:AGENTIC_INSTALL_DIR,
+    [string]$Version = $env:TAKKA_VERSION,
+    [string]$InstallDir = $env:TAKKA_INSTALL_DIR,
     [switch]$SkipPathUpdate
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Repository = 'dchya24/agentic'
+$Repository = 'dchya24/takka'
 $DefaultReleaseBaseUrl = "https://github.com/$Repository/releases/latest/download"
-$Asset = 'agentic-windows-x86_64.zip'
-$RuntimeAsset = 'agentic-runtime-windows-x86_64.exe'
+$Asset = 'takka-windows-x86_64.zip'
+$RuntimeAsset = 'takka-runtime-windows-x86_64.exe'
 $ChecksumAsset = 'checksums-windows.txt'
 
 function Fail([string]$Message) {
-    throw "Agentic installer: $Message"
+    throw "takka installer: $Message"
+}
+
+# Pre-rebrand compat: honor legacy AGENTIC_* installer variables for one
+# release cycle, with a deprecation warning (never silently).
+function ResolveLegacyEnv([string]$NewName, [string]$LegacyName) {
+    $New = [Environment]::GetEnvironmentVariable($NewName)
+    if (-not [string]::IsNullOrWhiteSpace($New)) { return $New }
+    $Legacy = [Environment]::GetEnvironmentVariable($LegacyName)
+    if (-not [string]::IsNullOrWhiteSpace($Legacy)) {
+        Write-Host "takka: warning: using legacy $LegacyName; set $NewName instead"
+        return $Legacy
+    }
+    return $null
 }
 
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
@@ -25,25 +38,33 @@ if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
 }
 
 $Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-if ($env:AGENTIC_INSTALLER_TESTING -eq '1' -and $env:AGENTIC_TEST_ARCHITECTURE) {
-    $Architecture = $env:AGENTIC_TEST_ARCHITECTURE
+if ($env:TAKKA_INSTALLER_TESTING -eq '1' -and $env:TAKKA_TEST_ARCHITECTURE) {
+    $Architecture = $env:TAKKA_TEST_ARCHITECTURE
 }
 if ($Architecture -ne 'X64') {
     Fail "Unsupported Windows architecture '$Architecture'. Prebuilt releases currently support Windows x64 only."
 }
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    $InstallDir = ResolveLegacyEnv 'TAKKA_INSTALL_DIR' 'AGENTIC_INSTALL_DIR'
+}
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         Fail 'LOCALAPPDATA is not set; pass -InstallDir explicitly.'
     }
-    $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\agentic\bin'
+    $InstallDir = Join-Path $env:LOCALAPPDATA 'Programs\takka\bin'
 }
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
-$ReleaseBaseUrl = if ($env:AGENTIC_RELEASE_BASE_URL) {
-    $env:AGENTIC_RELEASE_BASE_URL.TrimEnd('/')
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = ResolveLegacyEnv 'TAKKA_VERSION' 'AGENTIC_VERSION'
+}
+
+$ReleaseBaseUrl = if ($env:TAKKA_RELEASE_BASE_URL) {
+    $env:TAKKA_RELEASE_BASE_URL.TrimEnd('/')
 } else {
-    $DefaultReleaseBaseUrl
+    $LegacyBaseUrl = ResolveLegacyEnv 'TAKKA_RELEASE_BASE_URL' 'AGENTIC_RELEASE_BASE_URL'
+    if ($LegacyBaseUrl) { $LegacyBaseUrl.TrimEnd('/') } else { $DefaultReleaseBaseUrl }
 }
 
 if (-not [string]::IsNullOrWhiteSpace($Version)) {
@@ -60,7 +81,7 @@ if (-not [string]::IsNullOrWhiteSpace($Version)) {
     }
 }
 
-$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("agentic-install-" + [Guid]::NewGuid().ToString('N'))
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("takka-install-" + [Guid]::NewGuid().ToString('N'))
 $ArchivePath = Join-Path $TempDir $Asset
 $ChecksumPath = Join-Path $TempDir $ChecksumAsset
 $StageDir = Join-Path $TempDir 'stage'
@@ -96,24 +117,28 @@ try {
     Write-Host 'Checksums verified.'
 
     Expand-Archive -LiteralPath $ArchivePath -DestinationPath $StageDir -Force
-    $StagedBinary = Join-Path $StageDir 'agentic-windows-x86_64.exe'
+    $StagedBinary = Join-Path $StageDir 'takka-windows-x86_64.exe'
     if (-not (Test-Path -LiteralPath $StagedBinary -PathType Leaf)) {
-        Fail 'Downloaded archive does not contain agentic-windows-x86_64.exe.'
+        Fail 'Downloaded archive does not contain takka-windows-x86_64.exe.'
     }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $Destination = Join-Path $InstallDir 'agentic.exe'
-    $RuntimeDestination = Join-Path $InstallDir 'agentic-runtime.exe'
-    $DestinationTemp = Join-Path $InstallDir ('.agentic.install.' + [Guid]::NewGuid().ToString('N') + '.exe')
+    $Destination = Join-Path $InstallDir 'takka.exe'
+    $RuntimeDestination = Join-Path $InstallDir 'takka-runtime.exe'
+    $DestinationTemp = Join-Path $InstallDir ('.takka.install.' + [Guid]::NewGuid().ToString('N') + '.exe')
     Copy-Item -LiteralPath $StagedBinary -Destination $DestinationTemp -Force
     Move-Item -LiteralPath $DestinationTemp -Destination $Destination -Force
     Copy-Item -LiteralPath $RuntimePath -Destination $RuntimeDestination -Force
-    Write-Host "Agentic installed successfully: $Destination"
-    Write-Host "Runtime daemon installed:       $RuntimeDestination"
+    Write-Host "takka installed successfully: $Destination"
+    Write-Host "Runtime daemon installed:     $RuntimeDestination"
 
-    $ConfigPath = Join-Path $env:USERPROFILE '.config\agentic\config.json'
+    $ConfigPath = Join-Path $env:USERPROFILE '.config\takka\config.json'
+    $LegacyConfigPath = Join-Path $env:USERPROFILE '.config\agentic\config.json'
     if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
         Write-Host "Existing config preserved: $ConfigPath"
+    } elseif (Test-Path -LiteralPath $LegacyConfigPath -PathType Leaf) {
+        Write-Host "Pre-rebrand config found at $LegacyConfigPath; it is still read."
+        Write-Host 'Run `takka config migrate` to move it to the new location.'
     } else {
         Write-Host 'No config was created. Initialize it when ready.'
     }
@@ -127,7 +152,7 @@ try {
         if (-not $AlreadyPresent) {
             $NewUserPath = (@($PathEntries) + $InstallDir) -join ';'
             [Environment]::SetEnvironmentVariable('Path', $NewUserPath, 'User')
-            Write-Host 'Added Agentic to the current user PATH. Open a new terminal to use it.'
+            Write-Host 'Added takka to the current user PATH. Open a new terminal to use it.'
         }
     }
 

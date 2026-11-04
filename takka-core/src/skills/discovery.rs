@@ -3,10 +3,11 @@
 //! ## Discovery order (first-found wins on name collision)
 //!
 //! 1. `~/.agents/skills/` (global, pi/opencode/codex compatible)
-//! 2. `~/.config/agentic/skills/` (global, agentic-specific)
-//! 3. `.agents/skills/` — walk-up from cwd (project, cross-agent)
-//! 4. `.agentic/skills/` — walk-up from cwd (project, agentic-specific)
-//! 5. `compat_dirs` from config (e.g. `~/.claude/skills`)
+//! 2. `~/.config/takka/skills/` (global, takka-specific — new wins)
+//! 3. `~/.config/agentic/skills/` (global, pre-rebrand fallback)
+//! 4. `.agents/skills/` — walk-up from cwd (project, cross-agent)
+//! 5. `.agentic/skills/` — walk-up from cwd (project, legacy)
+//! 6. `compat_dirs` from config (e.g. `~/.claude/skills`)
 
 use std::path::{Path, PathBuf};
 
@@ -68,26 +69,32 @@ fn discovery_directories(config: &DiscoveryConfig) -> Vec<PathBuf> {
         dirs.push(home.join(".agents").join("skills"));
     }
 
-    // 2. Global: ~/.config/agentic/skills/
+    // 2. Global: ~/.config/takka/skills/ (new wins over the legacy dir below)
+    if let Some(config_dir) = config_dir() {
+        dirs.push(config_dir.join("takka").join("skills"));
+    }
+
+    // 3. Global: ~/.config/agentic/skills/ (pre-rebrand fallback — still read
+    //    while the takka dir is missing or empty; no automatic migration)
     if let Some(config_dir) = config_dir() {
         dirs.push(config_dir.join("agentic").join("skills"));
     }
 
-    // 3. Project: walk-up from cwd, .agents/skills/
+    // 4. Project: walk-up from cwd, .agents/skills/
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(agents_dir) = walk_up(&cwd, ".agents") {
             dirs.push(agents_dir.join("skills"));
         }
     }
 
-    // 4. Project: walk-up from cwd, .agentic/skills/
+    // 5. Project: walk-up from cwd, .agentic/skills/
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(agentic_dir) = walk_up(&cwd, ".agentic") {
             dirs.push(agentic_dir.join("skills"));
         }
     }
 
-    // 5. Compat dirs from config (e.g. ~/.claude/skills)
+    // 6. Compat dirs from config (e.g. ~/.claude/skills)
     for compat in &config.compat_dirs {
         let expanded = expand_path(compat);
         dirs.push(expanded);
@@ -567,5 +574,131 @@ description: Just enough
         // (may also find global skills if user has them — we just check
         // that our project skill is there)
         assert!(index.get("my-skill").is_some() || !index.is_empty());
+    }
+
+    // ── Global skills dir: takka new-wins + legacy fallback ──
+
+    /// Process-unique temp home directory (never touches the real one).
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("takka_skills_test_{}_{}", std::process::id(), tag));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Hermetic env guard for tests that redirect the home directory.
+    /// Saves/restores HOME, USERPROFILE (Windows), and XDG_CONFIG_HOME
+    /// while holding the crate-wide ENV_LOCK so parallel tests that
+    /// mutate env don't race. Mirrors `config.rs` `HomeGuard`.
+    struct HomeEnvGuard {
+        /// Held for the whole test body; released after `drop` restores env.
+        _lock: std::sync::MutexGuard<'static, ()>,
+        home: Option<std::ffi::OsString>,
+        #[cfg(windows)]
+        userprofile: Option<std::ffi::OsString>,
+        xdg_config_home: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn hold(home: &Path) -> Self {
+            let lock = crate::test_env_lock::ENV_LOCK.lock().unwrap();
+            let guard = Self {
+                _lock: lock,
+                home: std::env::var_os("HOME"),
+                #[cfg(windows)]
+                userprofile: std::env::var_os("USERPROFILE"),
+                xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            };
+            std::env::set_var("HOME", home);
+            #[cfg(windows)]
+            std::env::set_var("USERPROFILE", home);
+            std::env::remove_var("XDG_CONFIG_HOME");
+            guard
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            #[cfg(windows)]
+            match &self.userprofile {
+                Some(h) => std::env::set_var("USERPROFILE", h),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            match self.xdg_config_home.take() {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn takka_global_skills_win_over_legacy() {
+        let home = temp_home("new_wins");
+        let takka_dir = home.join(".config").join("takka").join("skills");
+        let legacy_dir = home.join(".config").join("agentic").join("skills");
+        write_skill(&takka_dir, "takka-win-skill", "From takka dir", "# Takka");
+        write_skill(
+            &legacy_dir,
+            "takka-win-skill",
+            "From legacy dir",
+            "# Legacy",
+        );
+
+        let _guard = HomeEnvGuard::hold(&home);
+        let index = discover_skills(&DiscoveryConfig::default());
+
+        let skill = index
+            .get("takka-win-skill")
+            .expect("skill should be discovered");
+        assert_eq!(skill.description(), "From takka dir");
+        assert!(skill.dir.starts_with(&takka_dir));
+    }
+
+    #[test]
+    fn legacy_global_skills_fallback_when_takka_missing() {
+        let home = temp_home("legacy_missing");
+        let legacy_dir = home.join(".config").join("agentic").join("skills");
+        write_skill(
+            &legacy_dir,
+            "takka-fallback-skill",
+            "From legacy dir",
+            "# Legacy",
+        );
+
+        let _guard = HomeEnvGuard::hold(&home);
+        let index = discover_skills(&DiscoveryConfig::default());
+
+        let skill = index
+            .get("takka-fallback-skill")
+            .expect("legacy skill should be discovered");
+        assert_eq!(skill.description(), "From legacy dir");
+        assert!(skill.dir.starts_with(&legacy_dir));
+    }
+
+    #[test]
+    fn legacy_global_skills_fallback_when_takka_dir_empty() {
+        let home = temp_home("legacy_empty");
+        fs::create_dir_all(home.join(".config").join("takka").join("skills")).unwrap();
+        let legacy_dir = home.join(".config").join("agentic").join("skills");
+        write_skill(
+            &legacy_dir,
+            "takka-empty-skill",
+            "From legacy dir",
+            "# Legacy",
+        );
+
+        let _guard = HomeEnvGuard::hold(&home);
+        let index = discover_skills(&DiscoveryConfig::default());
+
+        let skill = index
+            .get("takka-empty-skill")
+            .expect("legacy skill should be discovered when takka dir is empty");
+        assert_eq!(skill.description(), "From legacy dir");
+        assert!(skill.dir.starts_with(&legacy_dir));
     }
 }

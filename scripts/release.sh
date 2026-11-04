@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# release.sh — cut a new agentic release.
+# release.sh — cut a new takka release.
 #
 # One-command process for releasing the next version:
 #
@@ -10,8 +10,8 @@
 #
 # What it does:
 #   1. Preflight checks (clean tree, last release reachable)
-#   2. Bumps `version` in the Cargo.toml of agentic-cli (always) and
-#      core-agentic (only when it has unreleased commits)
+#   2. Bumps `version` in the Cargo.toml of takka-cli (always) and
+#      takka-core (only when it has unreleased commits)
 #   3. Runs the same checks as CI (fmt, clippy, tests)
 #   4. Commits the version bump and creates the annotated tag
 #   5. Pushes the branch and tag — this triggers the Release workflow
@@ -21,9 +21,9 @@
 #
 # Conventions (kept consistent with past releases):
 #   - tag:            vX.Y.Z            (annotated)
-#   - tag message:    release: vX.Y.Z (agentic-cli X.Y.Z, core-agentic A.B.C)
+#   - tag message:    release: vX.Y.Z (takka-cli X.Y.Z, takka-core A.B.C)
 #   - release title:  vX.Y.Z
-#   - assets:         agentic-<os>-<arch> for updater compat, plus
+#   - assets:         takka-<os>-<arch> for updater compat, plus
 #                     .deb / .rpm / .tar.gz / .exe / .msi packages
 #
 # See docs/RELEASING.md for the full process.
@@ -42,9 +42,9 @@ for arg in "$@"; do
 done
 
 # ── Config ──────────────────────────────────────────────────
-REPO="dchya24/agentic"
-CLI_CRATE="agentic-cli"
-CORE_CRATE="core-agentic"
+REPO="dchya24/takka"
+CLI_CRATE="takka-cli"
+CORE_CRATE="takka-core"
 RELEASE_BRANCHES=("dev" "main" "master")
 
 # ── Helpers ─────────────────────────────────────────────────
@@ -152,12 +152,12 @@ CORE_OLD="$(read_version "$CORE_CRATE")"
 
 CLI_NEW="$(bump_version "$CLI_OLD" "$BUMP")"
 
-# Bump core-agentic only when it has unreleased commits. Keeps the two
+# Bump takka-core only when it has unreleased commits. Keeps the two
 # crates in lockstep when the core changed, and avoids churn otherwise.
 CORE_NEW="$CORE_OLD"
 if [ -n "$PREV_TAG" ] && [ -n "$(git log "${PREV_TAG}..HEAD" -- "${CORE_CRATE}/" 2>/dev/null)" ]; then
     CORE_NEW="$(bump_version "$CORE_OLD" "$BUMP")"
-    info "core-agentic ${CORE_OLD} → ${CORE_NEW} (has unreleased commits)"
+    info "takka-core ${CORE_OLD} → ${CORE_NEW} (has unreleased commits)"
 fi
 
 TAG="v${CLI_NEW}"

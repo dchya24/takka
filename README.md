@@ -1,16 +1,16 @@
-# Agentic
+# takka
 
-Agentic is a Rust-based coding agent that can inspect a codebase, edit files,
+takka is a Rust-based coding agent that can inspect a codebase, edit files,
 run commands, use external tools, and work through multi-step development tasks
 from your terminal. It combines a reusable agent runtime with a standalone CLI
 for one-shot tasks, an interactive REPL, and a full-screen TUI.
 
-> Agentic is under active development. Review commands and file changes before
+> takka is under active development. Review commands and file changes before
 > approving them, especially when using permissive execution modes.
 
 ## Highlights
 
-- **Agentic workflows** — iterative tool use, streaming responses, cancellation,
+- **Agent workflows** — iterative tool use, streaming responses, cancellation,
   planning, replanning, and subagent delegation.
 - **Developer tools** — file read/write/edit, glob and grep, command execution,
   web access, memory, questions, task tracking, and patch application.
@@ -28,8 +28,8 @@ for one-shot tasks, an interactive REPL, and a full-screen TUI.
 
 | Crate | Purpose |
 |---|---|
-| [`core-agentic`](core-agentic/) | Agent loop, providers, tools, memory, safety, MCP, planning, and skills. |
-| [`agentic-cli`](agentic-cli/) | The `agentic` executable, configuration commands, REPL, and TUI. |
+| [`takka-core`](takka-core/) | Agent loop, providers, tools, memory, safety, MCP, planning, and skills. |
+| [`takka-cli`](takka-cli/) | The `takka` executable, configuration commands, REPL, and TUI. |
 
 ## Supported Platforms
 
@@ -50,26 +50,27 @@ not fall back to compiling untrusted source automatically.
 
 The installation scripts download the matching archive from the latest GitHub
 Release, verify it against the published SHA-256 checksum manifest, and install
-Agentic without administrator privileges.
+takka without administrator privileges.
 
 Default destinations:
 
-- Linux/macOS: `${AGENTIC_INSTALL_DIR:-$HOME/.local/bin}`
-- Windows: `%LOCALAPPDATA%\Programs\agentic\bin`
+- Linux/macOS: `${TAKKA_INSTALL_DIR:-$HOME/.local/bin}`
+- Windows: `%LOCALAPPDATA%\Programs\takka\bin`
 
 The installer installs **two** binaries into the same directory:
 
-- `agentic` — the CLI (parser, renderer, REPL/TUI)
-- `agentic-runtime` — the headless agent daemon the CLI spawns for every
+- `takka` — the CLI (parser, renderer, REPL/TUI)
+- `takka-runtime` — the headless agent daemon the CLI spawns for every
   run (protocol: JSON Lines over stdin/stdout). The CLI looks for the
-  runtime next to its own binary, or via the `AGENTIC_RUNTIME_BIN`
-  environment variable.
+  runtime next to its own binary, or via the `TAKKA_RUNTIME_BIN`
+  environment variable (the pre-rebrand `AGENTIC_RUNTIME_BIN` still works
+  with a deprecation warning).
 
 Since v0.6.0, the CLI defaults to **embedded mode**: the agent engine runs
-as a thread inside the `agentic` process, so `agentic-runtime` does not need
-to be on PATH at all. Use `agentic --runtime spawn` to run the agent in a
-separate daemon process instead (the `agentic-runtime` binary is discovered
-next to `agentic`, or via the `AGENTIC_RUNTIME_BIN` environment variable).
+as a thread inside the `takka` process, so `takka-runtime` does not need
+to be on PATH at all. Use `takka --runtime spawn` to run the agent in a
+separate daemon process instead (the `takka-runtime` binary is discovered
+next to `takka`, or via the `TAKKA_RUNTIME_BIN` environment variable).
 
 ### Linux and macOS
 
@@ -77,7 +78,7 @@ Download and inspect the installer first (recommended):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/dchya24/agentic/dev/scripts/install.sh \
+  https://raw.githubusercontent.com/dchya24/takka/dev/scripts/install.sh \
   -o install.sh
 less install.sh
 sh install.sh
@@ -86,13 +87,13 @@ sh install.sh
 Optional one-liner:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/dchya24/agentic/dev/scripts/install.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/dchya24/takka/dev/scripts/install.sh | sh
 ```
 
 Install a specific release or destination:
 
 ```sh
-AGENTIC_VERSION=v0.3.2 AGENTIC_INSTALL_DIR="$HOME/bin" sh install.sh
+TAKKA_VERSION=v0.3.2 TAKKA_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
 ### Windows
@@ -101,7 +102,7 @@ Download and inspect the installer first (recommended):
 
 ```powershell
 Invoke-WebRequest `
-  https://raw.githubusercontent.com/dchya24/agentic/dev/scripts/install.ps1 `
+  https://raw.githubusercontent.com/dchya24/takka/dev/scripts/install.ps1 `
   -OutFile install.ps1
 Get-Content .\install.ps1
 .\install.ps1
@@ -110,7 +111,7 @@ Get-Content .\install.ps1
 Optional one-liner:
 
 ```powershell
-irm https://raw.githubusercontent.com/dchya24/agentic/dev/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/dchya24/takka/dev/scripts/install.ps1 | iex
 ```
 
 Install a specific release or destination:
@@ -128,29 +129,36 @@ startup files. Open a new terminal if instructed after installation.
 A Rust toolchain is only required when building from source:
 
 ```sh
-git clone https://github.com/dchya24/agentic.git
-cd agentic
-cargo install --path agentic-cli
+git clone https://github.com/dchya24/takka.git
+cd takka
+cargo install --path takka-cli
 ```
 
 ## Configuration
 
 Binary installation and configuration are intentionally separate. Installing
-or upgrading Agentic **does not create, overwrite, or delete your config,
+or upgrading takka **does not create, overwrite, or delete your config,
 sessions, memory, or skills**.
 
 Default config locations:
 
 | Platform | Path |
 |---|---|
-| Linux/macOS | `~/.config/agentic/config.json` |
-| Windows | `%USERPROFILE%\.config\agentic\config.json` |
+| Linux/macOS | `~/.config/takka/config.json` |
+| Windows | `%USERPROFILE%\.config\takka\config.json` |
+
+> **Upgrading from a pre-rebrand install (product formerly named
+> `agentic`)?** Your existing user state under `~/.config/agentic` is still
+> read, and the legacy `AGENTIC_*` environment variables still work with a
+> deprecation warning. Run `takka config migrate` to move config, sessions,
+> memory, and skills to `~/.config/takka` — nothing is moved without your
+> confirmation.
 
 Run the guided wizard explicitly:
 
 ```sh
-agentic config init --interactive
-agentic config validate
+takka config init --interactive
+takka config validate
 ```
 
 Or ask the installer to run the wizard only after a successful installation:
@@ -191,38 +199,38 @@ examples.
 
 ```sh
 # Run one task
-agentic run "explain the architecture of this repository"
+takka run "explain the architecture of this repository"
 
 # Start the inline REPL
-agentic interactive
+takka interactive
 
 # Start the full-screen interface
-agentic tui
+takka tui
 
 # Attach to the long-lived daemon (a daemon must already be running —
 # `attach` never auto-starts one), or run a one-off task through it via
 # --runtime daemon (which auto-spawns the daemon when absent)
-agentic attach
-agentic --runtime daemon run "explain the architecture of this repository"
+takka attach
+takka --runtime daemon run "explain the architecture of this repository"
 ```
 
-`agentic attach` drops you into the REPL routed through the running daemon's
+`takka attach` drops you into the REPL routed through the running daemon's
 engine; the daemon keeps the session alive across attach/detach cycles, and
-`agentic attach --shutdown` stops it. On Windows use `--runtime embedded`
+`takka attach --shutdown` stops it. On Windows use `--runtime embedded`
 (the default) or `--runtime spawn` instead — daemon mode is Unix-only for now.
 
 Useful configuration and discovery commands:
 
 ```sh
-agentic config show
-agentic config path
-agentic skill list
-agentic --help
+takka config show
+takka config path
+takka skill list
+takka --help
 ```
 
 ## Known Limitations and Roadmap
 
-- [ ] Daemon mode (`--runtime daemon` / `agentic attach`) is Unix-only for now;
+- [ ] Daemon mode (`--runtime daemon` / `takka attach`) is Unix-only for now;
       the Windows named-pipe transport is still a TODO — use `--runtime embedded`
       or `--runtime spawn` on Windows.
 - [ ] Publish Linux ARM64/aarch64 and Windows ARM64 prebuilt releases.
@@ -236,7 +244,7 @@ The authoritative implementation status and longer-term work live in the
 
 ## Documentation
 
-- [CLI reference and examples](agentic-cli/README.md)
+- [CLI reference and examples](takka-cli/README.md)
 - [Configuration guide](docs/CONFIGURATION.md)
 - [Architecture](AGENT_ARCHITECTURE.md)
 - [Roadmap](docs/ROADMAP.md)
@@ -246,4 +254,4 @@ The authoritative implementation status and longer-term work live in the
 
 ## License
 
-Agentic is available under the [MIT License](LICENSE).
+takka is available under the [MIT License](LICENSE).

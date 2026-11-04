@@ -1,4 +1,4 @@
-# core-agentic
+# takka-core
 
 Rust library for AI agent orchestration with multi-step task execution, tool system, LLM provider integration, memory management, and safety features.
 
@@ -15,7 +15,7 @@ Rust library for AI agent orchestration with multi-step task execution, tool sys
 ## Quick Start
 
 ```rust
-use core_agentic::{
+use takka_core::{
     Orchestrator, ToolRegistry,
     OpenAIProvider, OpenAIProviderConfig,
 };
@@ -31,8 +31,8 @@ let provider = std::sync::Arc::new(OpenAIProvider::new(config));
 
 // 2. Register tools
 let tools = ToolRegistry::new();
-tools.register(Box::new(core_agentic::RunCommandTool::new()));
-tools.register(Box::new(core_agentic::ReadFileTool::new()));
+tools.register(Box::new(takka_core::RunCommandTool::new()));
+tools.register(Box::new(takka_core::ReadFileTool::new()));
 
 // 3. Run the orchestrator
 let mut orchestrator = Orchestrator::new(provider, tools);
@@ -57,7 +57,7 @@ When no custom prompt is provided, all providers use `DEFAULT_SYSTEM_PROMPT`:
 Override the system prompt for a single chat request:
 
 ```rust
-use core_agentic::providers::{ChatRequest, ChatMessageRequest};
+use takka_core::providers::{ChatRequest, ChatMessageRequest};
 
 let request = ChatRequest::new("gpt-4o", vec![
     ChatMessageRequest::user("Explain ownership in Rust"),
@@ -81,7 +81,7 @@ orchestrator.set_system_prompt("You are a security-focused code reviewer.");
 Configure via `AgentConfig`:
 
 ```rust
-use core_agentic::AgentConfig;
+use takka_core::AgentConfig;
 
 let config = AgentConfig::new("reviewer", "openai", "gpt-4o")
     .with_system_prompt("You review code for security vulnerabilities.");
@@ -89,7 +89,7 @@ let config = AgentConfig::new("reviewer", "openai", "gpt-4o")
 
 ### Global Config File
 
-Set in `~/.config/agentic/config.json`:
+Set in `~/.config/takka/config.json`:
 
 ```json
 {
@@ -119,7 +119,7 @@ DEFAULT_SYSTEM_PROMPT              →  fallback
 Supports any OpenAI-compatible API (OpenAI, Groq, Together, local models, etc.):
 
 ```rust
-use core_agentic::OpenAIProviderConfig;
+use takka_core::OpenAIProviderConfig;
 
 let config = OpenAIProviderConfig::new(
     "my-provider",
@@ -136,7 +136,7 @@ See [Anthropic Provider Docs](docs/ANTHROPIC_PROVIDER.md).
 ### Z.ai
 
 ```rust
-use core_agentic::ZaiProviderConfig;
+use takka_core::ZaiProviderConfig;
 
 let config = ZaiProviderConfig::new("api-key", "z-1")
     .with_base_url("https://api.z.ai/v1");
@@ -147,7 +147,7 @@ let config = ZaiProviderConfig::new("api-key", "z-1")
 Chain multiple providers with automatic failover:
 
 ```rust
-use core_agentic::FailoverProvider;
+use takka_core::FailoverProvider;
 
 let failover = FailoverProvider::new(vec![
     Arc::new(primary_provider),
@@ -176,7 +176,7 @@ let failover = FailoverProvider::new(vec![
 Implement the `Tool` trait:
 
 ```rust
-use core_agentic::{Tool, ToolResult, ToolError};
+use takka_core::{Tool, ToolResult, ToolError};
 
 struct MyTool;
 
@@ -207,7 +207,7 @@ impl Tool for MyTool {
 Decompose goals into step-by-step plans with dependencies:
 
 ```rust
-use core_agentic::{PlannerAgent, ToolRegistry};
+use takka_core::{PlannerAgent, ToolRegistry};
 
 let planner = PlannerAgent::new(provider);
 let tools = ToolRegistry::new();
@@ -224,7 +224,7 @@ let result = planner.execute_plan(&mut plan, &tools)?;
 
 ## Configuration
 
-Config file: `~/.config/agentic/config.json`
+Config file: `~/.config/takka/config.json`
 
 ```json
 {

@@ -6,8 +6,8 @@ description = "CLI for AI agent orchestration using takka-core"
 authors = ["devchya"]
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/dchya24/agentic"
-repository = "https://github.com/dchya24/agentic"
+homepage = "https://github.com/dchya24/takka"
+repository = "https://github.com/dchya24/takka"
 
 [[bin]]
 name = "takka"

@@ -1,6 +1,6 @@
 //! Self-update mechanism via GitHub Releases.
 //!
-//! Checks `https://api.github.com/repos/dchya24/agentic/releases/latest`
+//! Checks `https://api.github.com/repos/dchya24/takka/releases/latest`
 //! for a newer version, downloads the matching binary asset, and replaces
 //! the running executable in-place.
 
@@ -19,7 +19,7 @@ use crate::widgets::{components, inline};
 // ── Constants ──────────────────────────────────────────────
 
 const REPO_OWNER: &str = "dchya24";
-const REPO_NAME: &str = "agentic";
+const REPO_NAME: &str = "takka";
 const GITHUB_API: &str = "https://api.github.com";
 
 /// Current version embedded at compile time from `CARGO_PKG_VERSION`.
@@ -208,9 +208,9 @@ fn run_curl(url: &str, method: &str) -> Result<String> {
 
 /// Use `curl` to download a file to a temp path, with progress output.
 fn download_to_temp(url: &str) -> Result<PathBuf> {
-    let tmp_dir = std::env::temp_dir().join("agentic-update");
+    let tmp_dir = std::env::temp_dir().join("takka-update");
     fs::create_dir_all(&tmp_dir)?;
-    let tmp_path = tmp_dir.join("agentic-new");
+    let tmp_path = tmp_dir.join("takka-new");
 
     let mut cmd = std::process::Command::new("curl");
     cmd.arg("-f")
@@ -339,12 +339,12 @@ fn pick_asset(assets: &[GithubAsset]) -> Result<&GithubAsset> {
     )
 }
 
-/// Build expected asset name like `agentic-linux-x86_64`.
+/// Build expected asset name like `takka-linux-x86_64`.
 /// Includes the OS so assets are unambiguous across platforms
-/// (e.g. `agentic-x86_64` alone would collide between Linux and
+/// (e.g. `takka-x86_64` alone would collide between Linux and
 /// macOS x86_64 builds).
 fn asset_target_name() -> String {
-    format!("agentic-{}-{}", env::consts::OS, env::consts::ARCH)
+    format!("takka-{}-{}", env::consts::OS, env::consts::ARCH)
 }
 
 // ── Display helpers ────────────────────────────────────────
@@ -413,9 +413,9 @@ mod tests {
     #[test]
     fn test_asset_target_name() {
         let name = asset_target_name();
-        assert!(name.starts_with("agentic-"));
+        assert!(name.starts_with("takka-"));
         // Must be OS-qualified so platform assets never collide.
-        let os = name.trim_start_matches("agentic-");
+        let os = name.trim_start_matches("takka-");
         assert!(os.contains('-'));
     }
 }

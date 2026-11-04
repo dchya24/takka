@@ -53,7 +53,7 @@ impl Tool for UpdateMemoryTool {
             ToolParam {
                 param_type: "string".to_string(),
                 description: Some(
-                    "Where to write: 'user' (global, ~/.config/agentic/memory.md) \
+                    "Where to write: 'user' (global, ~/.config/takka/memory.md) \
                      or 'project' (./.agentic/memory.md). Defaults to 'user'."
                         .to_string(),
                 ),

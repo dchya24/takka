@@ -777,12 +777,6 @@ mod tests {
 
     // ── Config path + env compat (takka rebrand) ────────────
 
-    /// Helper (kept for documentation; tests use `HomeGuard::hold`).
-    #[allow(dead_code)]
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock::ENV_LOCK.lock().unwrap()
-    }
-
     use std::path::Path;
 
     fn temp_home(tag: &str) -> PathBuf {
@@ -800,8 +794,9 @@ mod tests {
     }
 
     /// Save HOME/USERPROFILE and restore them on drop. Every test that
-    /// mutates HOME must hold one of these (plus `env_guard`) so no test
-    /// leaks a HOME-less process state to the next test.
+    /// mutates HOME must hold one of these (which also locks the shared
+    /// ENV_LOCK) so no test leaks a HOME-less process state to the next
+    /// test.
     struct HomeGuard {
         home: Option<std::ffi::OsString>,
         #[cfg(windows)]

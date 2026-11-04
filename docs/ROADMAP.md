@@ -1,6 +1,6 @@
 # Roadmap
 
-> Consolidated current-state + next-steps for the agentic CLI + core library.
+> Consolidated current-state + next-steps for the takka CLI + core library.
 > Last updated: 2026-08-05.
 
 This replaces the older `PLAN.md` / `IMPLEMENTATION_ROADMAP.md` /
@@ -14,9 +14,9 @@ this repo.
 
 A two-crate workspace:
 
-- **`core-agentic`** — Rust library: agent loop, tools, memory, safety, MCP
+- **`takka-core`** — Rust library: agent loop, tools, memory, safety, MCP
   client, multi-provider LLM support, streaming.
-- **`agentic-cli`** — standalone binary: shared widgets stack (`ratatui`),
+- **`takka-cli`** — standalone binary: shared widgets stack (`ratatui`),
   inline + full-screen TUI modes, REPL with slash commands, config wizard.
 
 Reference docs:
@@ -33,7 +33,7 @@ Reference docs:
 
 Foundation is complete; coverage of the architecture spec is at ~95%.
 
-### Library (`core-agentic`)
+### Library (`takka-core`)
 
 | Layer | Surface |
 |-------|---------|
@@ -43,15 +43,15 @@ Foundation is complete; coverage of the architecture spec is at ~95%.
 | Safety | Risk scoring (0.0–1.0), pattern-based detection, hard blocklist, path sandboxing, URL allowlist (+ optional IP-literal block), per-tool rate limiting, audit log, permission modes (`default` / `plan` / `yolo`). Prompt-injection scanner for content brought in by `fetch` / `web_search`. |
 | Compression | Three-layer pipeline: tool-result truncation → older tool-result clearing → autocompact (heuristic or LLM-driven) at ~85% of token budget. |
 | Providers | OpenAI-compatible, Anthropic-compatible. |
-| Vision | Image attachments (PNG/JPEG/GIF/WebP) flow through `core_agentic::Attachment`; OpenAI-compatible providers serialize them as multimodal content. Per-model `ModelCapabilities` gate the request before dispatch. |
+| Vision | Image attachments (PNG/JPEG/GIF/WebP) flow through `takka_core::Attachment`; OpenAI-compatible providers serialize them as multimodal content. Per-model `ModelCapabilities` gate the request before dispatch. |
 | MCP | stdio + HTTP + SSE transports. |
 
-### CLI (`agentic-cli`)
+### CLI (`takka-cli`)
 
 | Layer | Surface |
 |-------|---------|
-| Modes | `agentic run`, `agentic interactive`, `agentic tui`, `agentic config …`. `--mode default|plan|yolo`. |
-| REPL | Custom `crossterm`/ratatui input loop + slash commands (`/help`, `/new`, `/config`, `/history`, `/tools`, `/stats`, `/mcp`, `/sessions`, `/models`, `/plan`, `/search`, `/image`, `/provider`, `/quit`). `@` file completion (auto-detects images for vision channel), `/` command completion, `/models ` model completion. Sessions auto-saved to `~/.config/agentic/sessions/`. Resize-safe prompt with active provider/model metadata. |
+| Modes | `takka run`, `takka interactive`, `takka tui`, `takka config …`. `--mode default|plan|yolo`. |
+| REPL | Custom `crossterm`/ratatui input loop + slash commands (`/help`, `/new`, `/config`, `/history`, `/tools`, `/stats`, `/mcp`, `/sessions`, `/models`, `/plan`, `/search`, `/image`, `/provider`, `/quit`). `@` file completion (auto-detects images for vision channel), `/` command completion, `/models ` model completion. Sessions auto-saved to `~/.config/takka/sessions/`. Resize-safe prompt with active provider/model metadata. |
 | Widgets | One ratatui-based stack used by inline + TUI: markdown, spinner, progress, panels, badges, headers, tool-call panel, unified-diff renderer. Capability detection (`NO_COLOR`, `TERM=dumb`, isatty, `--color`). Zero raw `\x1b[` escapes in the source. |
 | Safety UX | Risk-coloured confirmation panel. Diff preview in the confirmation prompt for `write_file` / `edit_file` / `apply_patch`. |
 | Cancel | Two-stage Ctrl+C → cooperative cancel (process-global `Arc<AtomicBool>`). |
@@ -68,7 +68,7 @@ panel, and goodbye summary. Session persistence includes cache token counters.
 
 **Deferred (v2):**
 - ~~Wire usage events from the orchestrator to `SessionStats`~~ — caching works, just no visibility UI.
-- ~~Expose cache settings in `agentic config` wizard~~ — configurable via manual config.toml edit.
+- ~~Expose cache settings in `takka config` wizard~~ — configurable via manual config.toml edit.
 
 ---
 
@@ -93,9 +93,9 @@ Next: **Fase 2b — steer/follow-up queue** sudah landed (engine + CLI); sisa **
 
 ## Open work
 
-**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed. **Fase 3a: daemon mode** (Unix socket broker + token + `agentic attach`; satu sesi aktif) juga sudah landed — berikutnya **Fase 3b: multiplexing (protokol v2)** atau **Fase 4: SDK bahasa lain**.
+**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed. **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) juga sudah landed — berikutnya **Fase 3b: multiplexing (protokol v2)** atau **Fase 4: SDK bahasa lain**.
 
-**Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`agentic --runtime daemon` gagal dengan pesan aksi di Windows).
+**Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`takka --runtime daemon` gagal dengan pesan aksi di Windows).
 
 **Fase UX (open):** input-during-run di REPL inline (non-blokir) belum diimplementasikan — steer/follow-up tersedia di engine/CLI, tapi REPL masih idle-only untuk `/queue`.
 
@@ -112,7 +112,7 @@ Sized by effort. Each item has its own home in
       Banner + status bar surface `📄 AGENT.md` / `🧠 memory.md`
       chips when those sources are folded into the system prompt.
 - [x] **Session management.** Auto-save conversations to
-      `~/.config/agentic/sessions/` as JSON. `/sessions` to list,
+      `~/.config/takka/sessions/` as JSON. `/sessions` to list,
       `/sessions <id>` to resume. No more `history.txt`.
 - [x] **`question` and `todowrite` tools.** Interactive question tool
       + session-scoped task list. Documented in
@@ -122,13 +122,13 @@ Sized by effort. Each item has its own home in
 ### Medium (2–4 days)
 
 - [x] **Integration tests for the orchestrator agent loop.** 7 tests in
-      `core-agentic/tests/orchestrator_loop.rs` covering happy-path tool
+      `takka-core/tests/orchestrator_loop.rs` covering happy-path tool
       execution, max-iterations cap, plan-mode denial, cooperative
       cancel, event emission, memory recording, and the
       `/restart` workflow.
 - [x] **Streaming markdown polish.** `MarkdownContent::parse_partial`
       auto-closes unclosed code fences for in-flight delta streams.
-- [x] **End-to-end smoke test** for `agentic run` against a mock provider,
+- [x] **End-to-end smoke test** for `takka run` against a mock provider,
        so refactors flag regressions before they hit a release.
 
 ### Medium (2–4 days)
@@ -136,7 +136,7 @@ Sized by effort. Each item has its own home in
 - [x] **Wire `question` + `todowrite` CLI handlers.** Register
        `QuestionHandler` in interactive/TUI modes, `TodoChangeHandler`
        for progress rendering. See milestone-4 doc.
-- [x] **End-to-end smoke test** for `agentic run` against a mock provider,
+- [x] **End-to-end smoke test** for `takka run` against a mock provider,
        so refactors flag regressions before they hit a release.
 
 ### Larger (1–2 weeks)
@@ -149,7 +149,8 @@ Sized by effort. Each item has its own home in
       through the planner agent. Implemented in a parallel branch and
       merged alongside milestone-3/4 work.
 - [x] **Skill system.** Skill format (`SKILL.md`), discovery
-      (5 locations: global `~/.agents/skills/`, `~/.config/agentic/skills/`,
+      (6 locations: global `~/.agents/skills/`, `~/.config/takka/skills/`,
+      legacy `~/.config/agentic/skills/` fallback,
       project `.agents/skills/`, `.agentic/skills/` walk-up, + compat dirs),
       `skill` tool to load domain-specific instructions, and
       `skill create` / `skill list` / `skill info` CLI commands.
@@ -194,7 +195,7 @@ prompt-injection scanner) added a lot of new surface area that benefits
 from end-to-end tests.
 
 ---
-## v0.3.0 (agentic-cli) / v0.1.1 (core-agentic)
+## v0.3.0 (takka-cli) / v0.1.1 (takka-core)
 
 ```text
 refactor(cli): TUI input widget (ratatui) replacing reedline, ESC to abort

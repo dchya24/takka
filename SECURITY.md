@@ -14,7 +14,7 @@ Only the latest release is supported with security updates.
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
 Instead, report privately by emailing the maintainer (devchya) or opening a
-[GitHub Security Advisory](https://github.com/dchya24/agentic/security/advisories/new).
+[GitHub Security Advisory](https://github.com/dchya24/takka/security/advisories/new).
 
 Include:
 

@@ -1,4 +1,4 @@
-# Contributing to agentic
+# Contributing to takka
 
 Thanks for your interest in contributing! 🎉
 
@@ -19,8 +19,8 @@ The CI pipeline runs exactly these checks, so passing locally means a green PR.
 
 ## Project Layout
 
-- `core-agentic/` — library crate with the agent core (memory, tools, safety, model providers)
-- `agentic-cli/` — binary crate (`agentic`) providing the interactive CLI
+- `takka-core/` — library crate with the agent core (memory, tools, safety, model providers)
+- `takka-cli/` — binary crate (`takka`) providing the interactive CLI
 
 ## Code Style
 

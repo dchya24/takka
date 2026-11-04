@@ -1,7 +1,7 @@
-# Releasing agentic
+# Releasing takka
 
-This document describes the release process for the agentic workspace
-(`core-agentic` + `agentic-cli`). Releases are published as **annotated git
+This document describes the release process for the takka workspace
+(`takka-core` + `takka-cli`). Releases are published as **annotated git
 tags**; pushing the tag triggers a **GitHub Actions workflow** that builds
 all platform packages and creates the **GitHub Release**.
 
@@ -12,8 +12,8 @@ plus [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 - The project follows [Semantic Versioning](https://semver.org).
 - The **tag** is the authority: `v<cli-version>` (e.g. `v0.3.1`).
-- `agentic-cli` is bumped on every release.
-- `core-agentic` is bumped in lockstep **only when it has unreleased
+- `takka-cli` is bumped on every release.
+- `takka-core` is bumped in lockstep **only when it has unreleased
   commits** since the last tag; otherwise its version stays put.
 
 | Bump | When |
@@ -25,7 +25,7 @@ plus [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 ## Prerequisites
 
 - Clean working tree (commit or stash pending work first).
-- Git remote `origin` pointing at `github.com:dchya24/agentic`.
+- Git remote `origin` pointing at `github.com:dchya24/takka`.
 - Rust toolchain with `rustfmt` and `clippy` components.
 - (Optional) [`gh` CLI](https://cli.github.com) to inspect releases.
 
@@ -45,12 +45,12 @@ git pull
 The script:
 1. **Preflight** — verifies the repo, warns about dirty tree / off-branch.
 2. **Version bump** — computes the next version, bumps `version` in
-   `agentic-cli/Cargo.toml` (and `core-agentic/Cargo.toml` when it changed),
+   `takka-cli/Cargo.toml` (and `takka-core/Cargo.toml` when it changed),
    updates `Cargo.lock`.
 3. **Quality gates** — runs the same checks as CI:
    `cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace`.
 4. **Commit + tag** — commits as
-   `release: vX.Y.Z (agentic-cli X.Y.Z, core-agentic A.B.C)` and creates the
+   `release: vX.Y.Z (takka-cli X.Y.Z, takka-core A.B.C)` and creates the
    annotated tag with the same message.
 5. **Push** — pushes the branch and tag to `origin`.
 
@@ -62,9 +62,9 @@ Runs on the pushed tag (`v*`) and builds every platform package in CI:
 
 | Platform | Artifacts |
 |----------|-----------|
-| Linux (`ubuntu-latest`) | `agentic-linux-x86_64` (raw, for self-update), `.deb` (cargo-deb), `.rpm` (cargo-generate-rpm), `.tar.gz` |
-| Windows (`windows-latest`) | `agentic-windows-x86_64` (raw, for self-update), `.exe`, `.zip`, `.msi` (cargo-wix / WiX) |
-| macOS (`macos-latest`) | `agentic-macos-x86_64`, `agentic-macos-aarch64` (raw, for self-update), `.tar.gz` per arch |
+| Linux (`ubuntu-latest`) | `takka-linux-x86_64` (raw, for self-update), `.deb` (cargo-deb), `.rpm` (cargo-generate-rpm), `.tar.gz` |
+| Windows (`windows-latest`) | `takka-windows-x86_64` (raw, for self-update), `.exe`, `.zip`, `.msi` (cargo-wix / WiX) |
+| macOS (`macos-latest`) | `takka-macos-x86_64`, `takka-macos-aarch64` (raw, for self-update), `.tar.gz` per arch |
 | all | `checksums-<platform>.txt`, `install.sh`, `install.ps1` |
 
 The final `publish` job adds the installer scripts to the collected assets and
@@ -73,7 +73,7 @@ these archives and require the platform checksum manifest before replacing an
 existing binary.
 
 Monitor the run at
-`https://github.com/dchya24/agentic/actions/workflows/release.yml`.
+`https://github.com/dchya24/takka/actions/workflows/release.yml`.
 A release can also be rebuilt/re-published manually from the Actions tab
 (workflow_dispatch with a tag input) — useful after a workflow fix.
 
@@ -87,7 +87,7 @@ Optionally install the new build locally using the release installer:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/dchya24/agentic/dev/scripts/install.sh \
+  https://raw.githubusercontent.com/dchya24/takka/dev/scripts/install.sh \
   -o install.sh
 sh install.sh
 ```
@@ -99,28 +99,28 @@ when the wizard should run after installation.
 ## Asset naming
 
 Asset names follow the updater's expectation in
-`agentic-cli/src/update.rs` (`agentic-<os>-<arch>`):
+`takka-cli/src/update.rs` (`takka-<os>-<arch>`):
 
 ```
-agentic-linux-x86_64      agentic-windows-x86_64      agentic-macos-aarch64
-agentic-linux-x86_64.deb  agentic-windows-x86_64.exe  agentic-macos-x86_64.tar.gz
-agentic-linux-x86_64.rpm  agentic-windows-x86_64.zip
-agentic-linux-x86_64.tar.gz
+takka-linux-x86_64      takka-windows-x86_64      takka-macos-aarch64
+takka-linux-x86_64.deb  takka-windows-x86_64.exe  takka-macos-x86_64.tar.gz
+takka-linux-x86_64.rpm  takka-windows-x86_64.zip
+takka-linux-x86_64.tar.gz
 install.sh                 install.ps1                checksums-<platform>.txt
 ```
 
-The OS-qualified raw binaries (`agentic-<os>-<arch>`) are what
-`agentic update` downloads; the packages are for distribution.
+The OS-qualified raw binaries (`takka-<os>-<arch>`) are what
+`takka update` downloads; the packages are for distribution.
 
 ## Packaging metadata
 
-Debian and RPM package definitions live in `agentic-cli/Cargo.toml`:
+Debian and RPM package definitions live in `takka-cli/Cargo.toml`:
 
 - `[package.metadata.deb]` — used by `cargo deb` (maintainer, section…)
 - `[package.metadata.generate-rpm]` — used by `cargo generate-rpm` (bindir,
   assets)
 
-The Windows MSI template lives in `agentic-cli/wix/` (generated by
+The Windows MSI template lives in `takka-cli/wix/` (generated by
 `cargo wix init`, built by `cargo wix`).
 
 ## Manual release (fallback)
@@ -128,17 +128,17 @@ The Windows MSI template lives in `agentic-cli/wix/` (generated by
 If CI is unavailable, the local steps are:
 
 ```bash
-# 1. bump versions in agentic-cli/Cargo.toml (and core-agentic if changed)
+# 1. bump versions in takka-cli/Cargo.toml (and takka-core if changed)
 # 2. checks
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets
 # 3. commit + tag
-git add agentic-cli/Cargo.toml core-agentic/Cargo.toml Cargo.lock
-git commit -m "release: vX.Y.Z (agentic-cli X.Y.Z, core-agentic A.B.C)"
-git tag -a vX.Y.Z -m "release: vX.Y.Z (agentic-cli X.Y.Z, core-agentic A.B.C)"
+git add takka-cli/Cargo.toml takka-core/Cargo.toml Cargo.lock
+git commit -m "release: vX.Y.Z (takka-cli X.Y.Z, takka-core A.B.C)"
+git tag -a vX.Y.Z -m "release: vX.Y.Z (takka-cli X.Y.Z, takka-core A.B.C)"
 git push origin dev vX.Y.Z
 # 4. build current-platform binary and publish (best effort, single platform)
-cargo build --release -p agentic-cli
-gh release create vX.Y.Z target/release/agentic --title vX.Y.Z --notes "..."
+cargo build --release -p takka-cli
+gh release create vX.Y.Z target/release/takka --title vX.Y.Z --notes "..."
 ```
 
 ## Troubleshooting
@@ -152,6 +152,6 @@ gh release create vX.Y.Z target/release/agentic --title vX.Y.Z --notes "..."
 - **Workflow failed / assets missing** → fix the workflow, then re-run it
   manually from the Actions tab (workflow_dispatch, enter the tag). The
   publish job updates an existing release instead of failing.
-- **Windows self-update** → `agentic update` replaces the running exe; on
+- **Windows self-update** → `takka update` replaces the running exe; on
   Windows a running binary cannot be overwritten, so the rename falls back
   and may report an error — use the `.msi`/`.zip` in that case.

@@ -60,7 +60,7 @@
 
     <Product
         Id='*'
-        Name='agentic-cli'
+        Name='takka-cli'
         UpgradeCode='3E04AF73-62F2-42B0-AC01-E0BE6C3FBC48'
         Manufacturer='devchya'
         Language='1033'
@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='CLI for AI agent orchestration using core-agentic'
+            Description='CLI for AI agent orchestration using takka-core'
             Manufacturer='devchya'
             InstallerVersion='450'
             Languages='1033'
@@ -83,11 +83,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='agentic-cli Installation'/>
+        <Property Id='DiskPrompt' Value='takka-cli Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='agentic-cli'>
+                <Directory Id='APPLICATIONFOLDER' Name='takka-cli'>
                     <Directory Id='Bin' Name='bin'>
                         <Component Id='Path' Guid='4AD80AFC-C515-4C5A-840D-B180AB629846' KeyPath='yes'>
                             <Environment
@@ -102,9 +102,9 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='agentic.exe'
+                                Name='takka.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\agentic.exe'
+                                Source='$(var.CargoTargetBinDir)\takka.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -145,7 +145,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/dchya24/agentic'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/dchya24/takka'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>

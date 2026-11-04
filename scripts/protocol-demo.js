@@ -4,17 +4,17 @@ const { spawn } = require("node:child_process");
 const readline = require("node:readline");
 const path = require("node:path");
 
-const runtimeBin = process.env.AGENTIC_RUNTIME_BIN
-  || path.resolve(__dirname, "../target/debug/agentic-runtime");
+const runtimeBin = process.env.TAKKA_RUNTIME_BIN
+  || path.resolve(__dirname, "../target/debug/takka-runtime");
 const task = process.argv.slice(2).join(" ").trim();
-const autoApprove = process.env.AGENTIC_PROTOCOL_AUTO_APPROVE === "1";
+const autoApprove = process.env.TAKKA_PROTOCOL_AUTO_APPROVE === "1";
 const child = spawn(runtimeBin, [], { stdio: ["pipe", "pipe", "inherit"] });
 let sequence = 0;
 let runStarted = false;
 
 function send(type, payload = {}) {
   sequence += 1;
-  child.stdin.write(`${JSON.stringify({ v: 1, id: `node-${sequence}`, type, ...payload })}\n`);
+  child.stdin.write(`${JSON.stringify({ v: 2, id: `node-${sequence}`, type, ...payload })}\n`);
 }
 
 const lines = readline.createInterface({ input: child.stdout });

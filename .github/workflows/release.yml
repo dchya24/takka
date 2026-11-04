@@ -7,24 +7,24 @@ name: Release
 # with a tag input to rebuild/re-publish an existing release.
 #
 # Produces, per platform:
-#   linux   : agentic-linux-x86_64            (raw binary for self-update)
-#             agentic-runtime-linux-x86_64    (headless daemon — CLI requires it)
-#             agentic-linux-x86_64.deb        (cargo-deb)
-#             agentic-linux-x86_64.rpm        (cargo-generate-rpm)
-#             agentic-linux-x86_64.tar.gz     (contains both binaries)
-#   windows : agentic-windows-x86_64          (raw binary for self-update)
-#             agentic-runtime-windows-x86_64.exe (headless daemon)
-#             agentic-windows-x86_64.exe
-#             agentic-windows-x86_64.zip      (contains both binaries)
-#             agentic-windows-x86_64.msi      (cargo-wix / WiX)
-#   macos   : agentic-macos-x86_64            (raw binary for self-update)
-#             agentic-macos-aarch64
-#             agentic-runtime-macos-<arch>    (headless daemon)
-#             agentic-macos-<arch>.tar.gz     (contains both binaries)
+#   linux   : takka-linux-x86_64            (raw binary for self-update)
+#             takka-runtime-linux-x86_64    (headless daemon — CLI requires it)
+#             takka-linux-x86_64.deb        (cargo-deb)
+#             takka-linux-x86_64.rpm        (cargo-generate-rpm)
+#             takka-linux-x86_64.tar.gz     (contains both binaries)
+#   windows : takka-windows-x86_64          (raw binary for self-update)
+#             takka-runtime-windows-x86_64.exe (headless daemon)
+#             takka-windows-x86_64.exe
+#             takka-windows-x86_64.zip      (contains both binaries)
+#             takka-windows-x86_64.msi      (cargo-wix / WiX)
+#   macos   : takka-macos-x86_64            (raw binary for self-update)
+#             takka-macos-aarch64
+#             takka-runtime-macos-<arch>    (headless daemon)
+#             takka-macos-<arch>.tar.gz     (contains both binaries)
 #   plus a per-platform checksums-*.txt
 #
 # Asset names follow the updater's expectation in
-# agentic-cli/src/update.rs (`agentic-<os>-<arch>`).
+# takka-cli/src/update.rs (`takka-<os>-<arch>`).
 
 on:
   push:
@@ -61,22 +61,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: |
-          cargo build --release -p agentic-cli
-          cargo build --release -p agentic-runtime
+          cargo build --release -p takka-cli
+          cargo build --release -p takka-runtime
       - name: Install packaging tools
         run: cargo install cargo-deb cargo-generate-rpm --locked
       - name: Build .deb
-        run: cargo deb -p agentic-cli --no-build
+        run: cargo deb -p takka-cli --no-build
       - name: Build .rpm
-        run: cargo generate-rpm -p agentic-cli
+        run: cargo generate-rpm -p takka-cli
       - name: Stage assets
         run: |
           mkdir -p dist
-          cp target/release/agentic dist/agentic-linux-x86_64
-          cp target/release/agentic-runtime dist/agentic-runtime-linux-x86_64
-          cp target/debian/*.deb dist/agentic-linux-x86_64.deb
-          cp target/generate-rpm/*.rpm dist/agentic-linux-x86_64.rpm
-          tar -czf dist/agentic-linux-x86_64.tar.gz -C target/release agentic agentic-runtime
+          cp target/release/takka dist/takka-linux-x86_64
+          cp target/release/takka-runtime dist/takka-runtime-linux-x86_64
+          cp target/debian/*.deb dist/takka-linux-x86_64.deb
+          cp target/generate-rpm/*.rpm dist/takka-linux-x86_64.rpm
+          tar -czf dist/takka-linux-x86_64.tar.gz -C target/release takka takka-runtime
           cd dist && sha256sum * > checksums-linux.txt
       - uses: actions/upload-artifact@v4
         with:
@@ -101,24 +101,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: |
-          cargo build --release -p agentic-cli
-          cargo build --release -p agentic-runtime
+          cargo build --release -p takka-cli
+          cargo build --release -p takka-runtime
       - name: Stage exe + zip
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/agentic.exe dist/agentic-windows-x86_64          # updater-compatible name
-          cp target/release/agentic.exe dist/agentic-windows-x86_64.exe      # user-friendly name
-          cp target/release/agentic-runtime.exe dist/agentic-runtime-windows-x86_64.exe  # daemon (CLI requires it)
+          cp target/release/takka.exe dist/takka-windows-x86_64          # updater-compatible name
+          cp target/release/takka.exe dist/takka-windows-x86_64.exe      # user-friendly name
+          cp target/release/takka-runtime.exe dist/takka-runtime-windows-x86_64.exe  # daemon (CLI requires it)
       - name: Zip binaries
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/agentic-windows-x86_64.exe,dist/agentic-runtime-windows-x86_64.exe -DestinationPath dist/agentic-windows-x86_64.zip -Force
+          Compress-Archive -Path dist/takka-windows-x86_64.exe,dist/takka-runtime-windows-x86_64.exe -DestinationPath dist/takka-windows-x86_64.zip -Force
       - name: Build .msi (cargo-wix)
         run: |
           cargo install cargo-wix --locked
-          cargo wix -p agentic-cli --nocapture
-          cp target/wix/*.msi dist/agentic-windows-x86_64.msi
+          cargo wix -p takka-cli --nocapture
+          cp target/wix/*.msi dist/takka-windows-x86_64.msi
       - name: Checksums
         shell: bash
         run: |
@@ -146,19 +146,19 @@ jobs:
       - name: Build for both architectures
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release -p agentic-cli --target x86_64-apple-darwin
-          cargo build --release -p agentic-runtime --target x86_64-apple-darwin
-          cargo build --release -p agentic-cli --target aarch64-apple-darwin
-          cargo build --release -p agentic-runtime --target aarch64-apple-darwin
+          cargo build --release -p takka-cli --target x86_64-apple-darwin
+          cargo build --release -p takka-runtime --target x86_64-apple-darwin
+          cargo build --release -p takka-cli --target aarch64-apple-darwin
+          cargo build --release -p takka-runtime --target aarch64-apple-darwin
       - name: Stage assets
         run: |
           mkdir -p dist
-          cp target/x86_64-apple-darwin/release/agentic dist/agentic-macos-x86_64
-          cp target/aarch64-apple-darwin/release/agentic dist/agentic-macos-aarch64
-          cp target/x86_64-apple-darwin/release/agentic-runtime dist/agentic-runtime-macos-x86_64
-          cp target/aarch64-apple-darwin/release/agentic-runtime dist/agentic-runtime-macos-aarch64
-          tar -czf dist/agentic-macos-x86_64.tar.gz -C target/x86_64-apple-darwin/release agentic agentic-runtime
-          tar -czf dist/agentic-macos-aarch64.tar.gz -C target/aarch64-apple-darwin/release agentic agentic-runtime
+          cp target/x86_64-apple-darwin/release/takka dist/takka-macos-x86_64
+          cp target/aarch64-apple-darwin/release/takka dist/takka-macos-aarch64
+          cp target/x86_64-apple-darwin/release/takka-runtime dist/takka-runtime-macos-x86_64
+          cp target/aarch64-apple-darwin/release/takka-runtime dist/takka-runtime-macos-aarch64
+          tar -czf dist/takka-macos-x86_64.tar.gz -C target/x86_64-apple-darwin/release takka takka-runtime
+          tar -czf dist/takka-macos-aarch64.tar.gz -C target/aarch64-apple-darwin/release takka takka-runtime
           cd dist && shasum -a 256 * > checksums-macos.txt
       - uses: actions/upload-artifact@v4
         with:
@@ -210,12 +210,12 @@ jobs:
             echo
             echo "### Install"
             echo
-            echo '- Debian/Ubuntu:  `sudo dpkg -i agentic-linux-x86_64.deb`'
-            echo '- Fedora/RHEL:    `sudo dnf install agentic-linux-x86_64.rpm`'
-            echo '- Windows:        run `agentic-windows-x86_64.msi` or use `install.ps1` for a user-local install'
+            echo '- Debian/Ubuntu:  `sudo dpkg -i takka-linux-x86_64.deb`'
+            echo '- Fedora/RHEL:    `sudo dnf install takka-linux-x86_64.rpm`'
+            echo '- Windows:        run `takka-windows-x86_64.msi` or use `install.ps1` for a user-local install'
             echo '- Linux/macOS:    use `install.sh` for a checksum-verified user-local install'
-            echo '- Any platform:   unpack the `.tar.gz`/`.zip` or update an existing install with `agentic update`'
-            echo '- Configuration:  installation does not modify config; use `agentic config init --interactive` explicitly'
+            echo '- Any platform:   unpack the `.tar.gz`/`.zip` or update an existing install with `takka update`'
+            echo '- Configuration:  installation does not modify config; use `takka config init --interactive` explicitly'
           } > NOTES.md
           cat NOTES.md
       - name: Add installer scripts

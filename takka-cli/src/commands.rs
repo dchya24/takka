@@ -2277,7 +2277,7 @@ impl Commands {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             std::path::PathBuf::from(home)
                 .join(".config")
-                .join("agentic")
+                .join("takka")
                 .join("skills")
         } else {
             // Project-local: .agentic/skills/ in cwd (or walk-up)

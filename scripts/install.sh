@@ -1,10 +1,16 @@
 #!/bin/sh
 set -eu
 
-REPOSITORY="dchya24/agentic"
+REPOSITORY="dchya24/takka"
 DEFAULT_RELEASE_BASE_URL="https://github.com/$REPOSITORY/releases/latest/download"
-INSTALL_DIR=${AGENTIC_INSTALL_DIR:-"${HOME:?HOME is not set}/.local/bin"}
+INSTALL_DIR=${TAKKA_INSTALL_DIR:-${AGENTIC_INSTALL_DIR:-"${HOME:?HOME is not set}/.local/bin"}}
 RUN_INIT=false
+
+# Pre-rebrand compat: honor legacy AGENTIC_* installer vars for one
+# release cycle, with a deprecation warning (never silently).
+if [ -z "${TAKKA_INSTALL_DIR:-}" ] && [ -n "${AGENTIC_INSTALL_DIR:-}" ]; then
+  printf 'takka: warning: using legacy AGENTIC_INSTALL_DIR; set TAKKA_INSTALL_DIR instead\n' >&2
+fi
 
 fail() {
   printf 'Error: %s\n' "$*" >&2
@@ -13,18 +19,21 @@ fail() {
 
 usage() {
   cat <<'EOF'
-Install Agentic into a user-local directory.
+Install takka into a user-local directory.
 
 Usage: install.sh [--init] [--help]
 
 Options:
-  --init  Run `agentic config init --interactive` after installation.
+  --init  Run `takka config init --interactive` after installation.
   --help  Show this help.
 
 Environment:
-  AGENTIC_VERSION           Release version, for example v0.3.2 or 0.3.2.
-  AGENTIC_INSTALL_DIR       Destination directory (default: $HOME/.local/bin).
-  AGENTIC_RELEASE_BASE_URL  Override the GitHub Release download base URL.
+  TAKKA_VERSION           Release version, for example v0.3.2 or 0.3.2.
+  TAKKA_INSTALL_DIR       Destination directory (default: $HOME/.local/bin).
+  TAKKA_RELEASE_BASE_URL  Override the GitHub Release download base URL.
+
+  Pre-rebrand legacy names (AGENTIC_VERSION, AGENTIC_INSTALL_DIR,
+  AGENTIC_RELEASE_BASE_URL) are still honored with a deprecation warning.
 EOF
 }
 
@@ -55,19 +64,29 @@ case "$(uname -m)" in
   *) fail "Unsupported architecture: $(uname -m)" ;;
 esac
 
-ASSET="agentic-$OS-$ARCH.tar.gz"
-RUNTIME_ASSET="agentic-runtime-$OS-$ARCH"
+ASSET="takka-$OS-$ARCH.tar.gz"
+RUNTIME_ASSET="takka-runtime-$OS-$ARCH"
 CHECKSUMS="checksums-$OS.txt"
-RELEASE_BASE_URL=${AGENTIC_RELEASE_BASE_URL:-$DEFAULT_RELEASE_BASE_URL}
+RELEASE_BASE_URL=${TAKKA_RELEASE_BASE_URL:-${AGENTIC_RELEASE_BASE_URL:-$DEFAULT_RELEASE_BASE_URL}}
+if [ -z "${TAKKA_RELEASE_BASE_URL:-}" ] && [ -n "${AGENTIC_RELEASE_BASE_URL:-}" ]; then
+  printf 'takka: warning: using legacy AGENTIC_RELEASE_BASE_URL; set TAKKA_RELEASE_BASE_URL instead\n' >&2
+fi
 
-if [ -n "${AGENTIC_VERSION:-}" ]; then
-  VERSION=$AGENTIC_VERSION
+if [ -n "${TAKKA_VERSION:-}" ]; then
+  VERSION=$TAKKA_VERSION
+else
+  VERSION=${AGENTIC_VERSION:-}
+  if [ -n "$VERSION" ]; then
+    printf 'takka: warning: using legacy AGENTIC_VERSION; set TAKKA_VERSION instead\n' >&2
+  fi
+fi
+if [ -n "$VERSION" ]; then
   case "$VERSION" in
     v*) ;;
     *) VERSION="v$VERSION" ;;
   esac
   if ! printf '%s\n' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-    fail "Invalid AGENTIC_VERSION '$AGENTIC_VERSION'; expected vX.Y.Z or X.Y.Z"
+    fail "Invalid TAKKA_VERSION '$VERSION'; expected vX.Y.Z or X.Y.Z"
   fi
   # Preserve custom hosts used by mirrors/tests while replacing the standard
   # GitHub latest-release suffix with the requested tag.
@@ -80,7 +99,7 @@ if [ -n "${AGENTIC_VERSION:-}" ]; then
 fi
 RELEASE_BASE_URL=${RELEASE_BASE_URL%/}
 
-command -v curl >/dev/null 2>&1 || fail "curl is required to download Agentic"
+command -v curl >/dev/null 2>&1 || fail "curl is required to download takka"
 command -v tar >/dev/null 2>&1 || fail "tar is required to extract Agentic"
 
 if command -v sha256sum >/dev/null 2>&1; then
@@ -92,7 +111,7 @@ else
 fi
 
 umask 077
-TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t agentic-install)
+TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t takka-install)
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT HUP INT TERM
 
@@ -124,7 +143,7 @@ ACTUAL_RUNTIME_HASH=$(sha256_file "$RUNTIME_PATH")
 printf 'Checksum verified.\n'
 
 tar -xzf "$ARCHIVE_PATH" -C "$STAGE_DIR"
-[ -f "$STAGE_DIR/agentic" ] || fail "Downloaded archive does not contain the agentic binary"
+[ -f "$STAGE_DIR/takka" ] || fail "Downloaded archive does not contain the takka binary"
 mkdir -p "$INSTALL_DIR"
 install_binary() {
   src=$1
@@ -136,14 +155,18 @@ install_binary() {
   # the old executable.
   mv -f "$dest_tmp" "$INSTALL_DIR/$dest_name"
 }
-install_binary "$STAGE_DIR/agentic" "agentic"
-install_binary "$RUNTIME_PATH" "agentic-runtime"
-printf 'Agentic installed successfully: %s\n' "$INSTALL_DIR/agentic"
-printf 'Runtime daemon installed:       %s\n' "$INSTALL_DIR/agentic-runtime"
+install_binary "$STAGE_DIR/takka" "takka"
+install_binary "$RUNTIME_PATH" "takka-runtime"
+printf 'takka installed successfully: %s\n' "$INSTALL_DIR/takka"
+printf 'Runtime daemon installed:     %s\n' "$INSTALL_DIR/takka-runtime"
 
-CONFIG_PATH="${HOME:?HOME is not set}/.config/agentic/config.json"
+CONFIG_PATH="${HOME:?HOME is not set}/.config/takka/config.json"
+LEGACY_CONFIG_PATH="${HOME:?HOME is not set}/.config/agentic/config.json"
 if [ -f "$CONFIG_PATH" ]; then
   printf 'Existing config preserved: %s\n' "$CONFIG_PATH"
+elif [ -f "$LEGACY_CONFIG_PATH" ]; then
+  printf 'Pre-rebrand config found at %s; it is still read.\n' "$LEGACY_CONFIG_PATH"
+  printf 'Run `takka config migrate` to move it to %s.\n' "$(dirname "$CONFIG_PATH")"
 else
   printf 'No config was created. Initialize it when ready.\n'
 fi
@@ -151,13 +174,13 @@ fi
 case ":${PATH:-}:" in
   *:"$INSTALL_DIR":*) ;;
   *)
-    printf '\nAdd Agentic to PATH for future shells:\n'
+    printf '\nAdd takka to PATH for future shells:\n'
     printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR"
     ;;
 esac
 
 if [ "$RUN_INIT" = true ]; then
-  "$INSTALL_DIR/agentic" config init --interactive
+  "$INSTALL_DIR/takka" config init --interactive
 else
-  printf '\nNext: %s/agentic config init --interactive\n' "$INSTALL_DIR"
+  printf '\nNext: %s/takka config init --interactive\n' "$INSTALL_DIR"
 fi
