@@ -1,5 +1,5 @@
 use super::protocol::{
-    ConnectionCapabilities, NotificationKind, ProtocolEvent, Request, PROTOCOL_NAME,
+    ConnectionCapabilities, InitOverrides, NotificationKind, ProtocolEvent, Request, PROTOCOL_NAME,
     PROTOCOL_VERSION,
 };
 use super::transport::Transport;
@@ -82,6 +82,16 @@ pub struct RuntimeEngine<T: Transport> {
     initialized: bool,
     /// Capabilities declared at `Init` — immutable afterwards.
     capabilities: ConnectionCapabilities,
+    /// Daemon shared secret (Fase 3a). `None` (default) = non-daemon:
+    /// `Init` tokens are ignored entirely (jalur lama).
+    daemon_token: Option<String>,
+    /// Adopt-on-re-init (Fase 3a, daemon-only): ketika true, `Init`
+    /// kedua yang kompatibel meng-adopt session berjalan alih-alih
+    /// ditolak strict. Default `false` — embedded/spawned tidak berubah.
+    adopt_on_reinit: bool,
+    /// Overrides yang BERJALAN: disimpan saat init pertama sukses saja
+    /// (adopt tidak menimpa) — pembanding untuk mismatch config.
+    current_overrides: InitOverrides,
     /// Discovered skill index — populated by [`Self::initialize`], used
     /// by `Request::SkillActivate` (resolve + inject).
     skill_index: Option<Arc<std::sync::RwLock<crate::SkillIndex>>>,
@@ -110,6 +120,9 @@ impl<T: Transport> RuntimeEngine<T> {
             orchestrator: None,
             initialized: false,
             capabilities: ConnectionCapabilities::default(),
+            daemon_token: None,
+            adopt_on_reinit: false,
+            current_overrides: InitOverrides::default(),
             skill_index: None,
             steer_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             running: Arc::new(AtomicBool::new(false)),
@@ -137,6 +150,20 @@ impl<T: Transport> RuntimeEngine<T> {
         self.sink.set_opt_outs(&capabilities.opt_out_notify);
         self.capabilities = capabilities;
         self
+    }
+
+    /// Declare the daemon shared secret (Fase 3a). `None` (default)
+    /// berarti engine bukan daemon: token pada `Init` di-ignored dan
+    /// jalur strict lama tetap berlaku.
+    pub fn set_daemon_token(&mut self, token: Option<String>) {
+        self.daemon_token = token;
+    }
+
+    /// Enable adopt-on-re-init (Fase 3a, daemon-only): a second
+    /// compatible `Init` adopts the running session instead of being
+    /// rejected. Default `false`.
+    pub fn set_adopt_on_reinit(&mut self, enabled: bool) {
+        self.adopt_on_reinit = enabled;
     }
 
     pub fn with_provider(transport: T, provider: Arc<dyn LLMProvider>) -> Self {
@@ -218,30 +245,82 @@ impl<T: Transport> RuntimeEngine<T> {
                 Request::Init {
                     overrides,
                     capabilities,
+                    daemon_token,
                 } => {
-                    if self.initialized {
+                    // Daemon token (Fase 3a): dicek SEBELUM jalur
+                    // init/adopt mana pun — token salah tidak pernah
+                    // menyentuh session.
+                    if let Some(expected) = &self.daemon_token {
+                        if daemon_token.as_deref() != Some(expected.as_str()) {
+                            self.emit(
+                                Some(request.id),
+                                Event::Error {
+                                    message: "unauthorized".to_string(),
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                    if self.initialized && !self.adopt_on_reinit {
                         self.emit(
                             Some(request.id),
                             Event::Error {
                                 message: "already initialized".to_string(),
                             },
                         );
-                    } else {
-                        match self.initialize(overrides) {
-                            Ok(()) => {
-                                self.capabilities = capabilities.clone();
-                                self.sink.set_opt_outs(&capabilities.opt_out_notify);
-                                self.initialized = true;
-                                self.emit(
-                                    Some(request.id),
-                                    Event::InitOk {
-                                        protocol: PROTOCOL_NAME.to_string(),
-                                        version: PROTOCOL_VERSION,
-                                    },
-                                );
-                            }
-                            Err(message) => self.emit(Some(request.id), Event::Error { message }),
+                        continue;
+                    }
+                    if self.initialized {
+                        // Adopt path (daemon-only): frontend yang reconnect
+                        // mengambil alih session berjalan. Caps dan opt-out
+                        // TIDAK ditimpa — engine berjalan tetap menang
+                        // (opt-out baru di-ignore, bukan fatal).
+                        if !self.capabilities.compatible_caps(&capabilities) {
+                            self.emit(
+                                Some(request.id),
+                                Event::Error {
+                                    message: "capability 'experimental_api' required".to_string(),
+                                },
+                            );
+                            continue;
                         }
+                        if self.current_overrides != overrides {
+                            self.emit(
+                                Some(request.id),
+                                Event::Error {
+                                    message:
+                                        "daemon already running with different config; restart daemon or match its config"
+                                            .to_string(),
+                                },
+                            );
+                            continue;
+                        }
+                        let session_id = self.orchestrator.as_ref().and_then(|o| o.session_id());
+                        self.emit(
+                            Some(request.id.clone()),
+                            Event::InitOk {
+                                protocol: PROTOCOL_NAME.to_string(),
+                                version: PROTOCOL_VERSION,
+                            },
+                        );
+                        self.emit(Some(request.id), Event::SessionAdopted { session_id });
+                        continue;
+                    }
+                    match self.initialize(overrides.clone()) {
+                        Ok(()) => {
+                            self.current_overrides = overrides;
+                            self.capabilities = capabilities.clone();
+                            self.sink.set_opt_outs(&capabilities.opt_out_notify);
+                            self.initialized = true;
+                            self.emit(
+                                Some(request.id),
+                                Event::InitOk {
+                                    protocol: PROTOCOL_NAME.to_string(),
+                                    version: PROTOCOL_VERSION,
+                                },
+                            );
+                        }
+                        Err(message) => self.emit(Some(request.id), Event::Error { message }),
                     }
                 }
                 Request::Run { task, attachments } => {

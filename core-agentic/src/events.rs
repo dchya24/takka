@@ -238,6 +238,16 @@ pub enum Event {
     /// iteration boundary and added to memory as a user message.
     #[serde(rename = "steered")]
     Steered { content: String },
+
+    // ------------------------------------------------------------------
+    // Daemon mode (Fase 3a). Adopt-on-re-init handshake.
+    // ------------------------------------------------------------------
+    /// Emitted by the engine right after a daemon accepted a second
+    /// `Init` (adopt-on-re-init): the reconnecting frontend now drives
+    /// the pre-existing session. Carries the tracked session id, if any.
+    #[serde(rename = "session_adopted")]
+    #[serde(rename_all = "camelCase")]
+    SessionAdopted { session_id: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +313,7 @@ pub enum EventType {
     SessionFailed,
     SteerQueued,
     Steered,
+    SessionAdopted,
 }
 
 impl Event {
@@ -346,6 +357,7 @@ impl Event {
             Event::SessionFailed { .. } => EventType::SessionFailed,
             Event::SteerQueued { .. } => EventType::SteerQueued,
             Event::Steered { .. } => EventType::Steered,
+            Event::SessionAdopted { .. } => EventType::SessionAdopted,
         }
     }
 }
@@ -532,5 +544,26 @@ mod tests {
         assert_eq!(json["content"], "focus on tests");
         let parsed: Event = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.event_type(), EventType::Steered);
+    }
+
+    #[test]
+    fn session_adopted_serializes_with_wire_tag() {
+        // Fase 3a: adopt-on-re-init announcement must round-trip with
+        // the stable snake_case tag `session_adopted` and carry the
+        // adopted session id (absent when untracked).
+        let adopted = Event::SessionAdopted {
+            session_id: Some("sess-1".into()),
+        };
+        let json = serde_json::to_value(&adopted).unwrap();
+        assert_eq!(json["type"], "session_adopted");
+        assert_eq!(json["sessionId"], "sess-1");
+        let parsed: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.event_type(), EventType::SessionAdopted);
+
+        let untracked = Event::SessionAdopted { session_id: None };
+        let json = serde_json::to_value(&untracked).unwrap();
+        assert_eq!(json["type"], "session_adopted");
+        let parsed: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.event_type(), EventType::SessionAdopted);
     }
 }

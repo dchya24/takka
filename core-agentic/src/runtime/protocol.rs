@@ -69,6 +69,12 @@ pub enum Request {
         overrides: InitOverrides,
         #[serde(default)]
         capabilities: ConnectionCapabilities,
+        /// Daemon shared-secret (Fase 3a): engine yang di-set token
+        /// menolak Init tanpa token yang cocok dengan `unauthorized`
+        /// SEBELUM menyentuh jalur init/adopt. `None` = non-daemon
+        /// (token di-ignored, jalur lama).
+        #[serde(default, rename = "daemonToken")]
+        daemon_token: Option<String>,
     },
     Run {
         task: String,
@@ -117,7 +123,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitOverrides {
     pub config_path: Option<String>,
@@ -139,6 +145,15 @@ pub struct ConnectionCapabilities {
     /// direpresentasikan (embedded) / gagal deserialisasi (spawn).
     #[serde(default)]
     pub opt_out_notify: Vec<NotificationKind>,
+}
+
+impl ConnectionCapabilities {
+    /// Kompatibilitas adopt (Fase 3a): requested capability TIDAK boleh
+    /// minta API eksperimental yang belum dipegang engine berjalan.
+    /// Opt-out baru di-IGNORE (bukan fatal) — tidak masuk kompatibilitas.
+    pub fn compatible_caps(&self, requested: &Self) -> bool {
+        !requested.experimental_api || self.experimental_api
+    }
 }
 
 /// Allowlist tertutup notification yang boleh di-opt-out. Event di luar
@@ -219,5 +234,45 @@ mod tests {
         // Allowlist tertutup: nama di luar enum tidak bisa lewat jalur wire.
         let frame = r#"{"v":1,"id":"i3","type":"init","capabilities":{"experimentalApi":false,"optOutNotify":["done"]}}"#;
         assert!(serde_json::from_str::<ProtocolRequest>(frame).is_err());
+    }
+
+    #[test]
+    fn init_carries_daemon_token_and_defaults_absent() {
+        let frame = r#"{"v":1,"id":"i","type":"init","daemonToken":"tok-1"}"#;
+        let req: ProtocolRequest = serde_json::from_str(frame).unwrap();
+        match req.request {
+            Request::Init { daemon_token, .. } => {
+                assert_eq!(daemon_token.as_deref(), Some("tok-1"))
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+        let bare: Request = serde_json::from_str(r#"{"type":"init"}"#).unwrap();
+        assert!(matches!(
+            bare,
+            Request::Init {
+                daemon_token: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn capabilities_compatibility_gates_only_experimental() {
+        let base = ConnectionCapabilities::default();
+        assert!(base.compatible_caps(&ConnectionCapabilities::default()));
+        assert!(!base.compatible_caps(&ConnectionCapabilities {
+            experimental_api: true,
+            opt_out_notify: vec![],
+        }));
+        let granted = ConnectionCapabilities {
+            experimental_api: true,
+            opt_out_notify: vec![],
+        };
+        assert!(granted.compatible_caps(&base));
+        // opt-out baru di-IGNORE (bukan fatal), tidak masuk kompatibilitas.
+        assert!(granted.compatible_caps(&ConnectionCapabilities {
+            experimental_api: true,
+            opt_out_notify: vec![NotificationKind::Thinking],
+        }));
     }
 }

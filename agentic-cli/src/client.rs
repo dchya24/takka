@@ -41,6 +41,7 @@ pub(crate) async fn perform_handshake(
     io.raw_send(Request::Init {
         overrides,
         capabilities: caps,
+        daemon_token: None,
     })
     .await?;
     let initialized = io.raw_next_event().await?;
@@ -580,6 +581,7 @@ mod in_process_tests {
             Request::Init {
                 overrides: Default::default(),
                 capabilities: CLI_CAPABILITIES,
+                daemon_token: None,
             },
         ))
         .unwrap();

@@ -466,6 +466,7 @@ fn second_init_is_rejected() {
             Request::Init {
                 overrides: Default::default(),
                 capabilities: Default::default(),
+                daemon_token: None,
             },
         ))
         .unwrap();
@@ -1100,4 +1101,204 @@ fn steer_during_pending_confirmation_gate_is_queued_and_consumed_after_gate() {
         "steer must reach the model after the gate: {:?}",
         requests[1].messages
     );
+}
+
+// ── Daemon mode (Fase 3a, Task 1): daemon_token + adopt-on-re-init ──
+
+/// (non-daemon engine) token di-ignore; (daemon engine) token salah →
+/// "unauthorized" SEBELUM adopt logic — init tidak pernah berulang.
+#[test]
+fn daemon_wrong_token_is_unauthorized_before_init() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    engine.set_daemon_token(Some("secret".into()));
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "init-1",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: Default::default(),
+                daemon_token: Some("wrong".into()),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.event, Event::Error { message } if message == "unauthorized")),
+        "expected unauthorized error: {events:?}"
+    );
+    // Token salah tidak pernah sampai ke jalur init/adopt: tidak ada
+    // InitOk dan tidak ada SessionAdopted.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.event, Event::InitOk { .. })),
+        "wrong token must not produce InitOk: {events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.event, Event::SessionAdopted { .. })));
+}
+
+/// Adopt path bahagia: engine daemon (with_session + adopt flag + token)
+/// menerima Init kedua yang kompatibel → InitOk lalu SessionAdopted,
+/// keduanya di-tag dengan request id adopt.
+#[test]
+fn adopt_on_reinit_accepts_compatible_init_and_emits_session_adopted() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    engine.set_adopt_on_reinit(true);
+    engine.set_daemon_token(Some("secret".into()));
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "adopt-1",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: Default::default(),
+                daemon_token: Some("secret".into()),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    let init_ok = events
+        .iter()
+        .find(|e| matches!(e.event, Event::InitOk { .. }))
+        .expect("adopt must reply InitOk: {events:?}");
+    assert_eq!(init_ok.request_id.as_deref(), Some("adopt-1"));
+    let adopted = events
+        .iter()
+        .find(|e| matches!(e.event, Event::SessionAdopted { .. }))
+        .expect("adopt must emit SessionAdopted: {events:?}");
+    assert_eq!(adopted.request_id.as_deref(), Some("adopt-1"));
+    // Tidak ada error di jalur bahagia.
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.event, Event::Error { .. })));
+}
+
+/// Adopt path menolak Init yang TIDAK kompatibel: capability baru yang
+/// lebih besar → capability error; overrides berbeda → config error.
+#[test]
+fn adopt_rejects_new_capability_and_overrides_mismatch() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    engine.set_adopt_on_reinit(true);
+    engine.set_daemon_token(Some("secret".into()));
+    let worker = std::thread::spawn(move || engine.run());
+
+    // Init kedua: minta capability experimental yang belum dipegang engine
+    // → ditolak (compatible_caps = implisit: engine lama tetap menang).
+    request_tx
+        .send(ProtocolRequest::new(
+            "adopt-caps",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: ConnectionCapabilities {
+                    experimental_api: true,
+                    opt_out_notify: vec![],
+                },
+                daemon_token: Some("secret".into()),
+            },
+        ))
+        .unwrap();
+    // Init ketiga: overrides berbeda dari yang berjalan → ditolak.
+    request_tx
+        .send(ProtocolRequest::new(
+            "adopt-overrides",
+            Request::Init {
+                overrides: core_agentic::runtime::protocol::InitOverrides {
+                    model: Some("x".into()),
+                    ..Default::default()
+                },
+                capabilities: Default::default(),
+                daemon_token: Some("secret".into()),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(&e.event, Event::Error { message }
+        if message == "capability 'experimental_api' required")),
+        "expected capability error on adopt: {events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(&e.event, Event::Error { message }
+    if message == "daemon already running with different config; restart daemon or match its config")),
+        "expected overrides-mismatch error on adopt: {events:?}");
+    // Kedua penolakan tidak meng-adopt: tidak ada InitOk/SessionAdopted.
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.event, Event::InitOk { .. })));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.event, Event::SessionAdopted { .. })));
+}
+
+/// Regresi eksplisit Fase 2a: engine TANPA adopt flag tetap strict —
+/// Init kedua = "already initialized" (byte-for-byte), bukan adopt.
+#[test]
+fn strict_already_initialized_still_default_without_adopt_flag() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "init-2",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: Default::default(),
+                daemon_token: None,
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.event, Event::Error { message } if message == "already initialized")
+        ),
+        "expected strict already-initialized error: {events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e.event, Event::SessionAdopted { .. })));
 }
