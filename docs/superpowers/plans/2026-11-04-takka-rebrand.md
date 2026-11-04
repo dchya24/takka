@@ -87,8 +87,9 @@
 - Test: tidak ada (docs-only) + gates penuh.
 
 - [ ] **Step 1: Rename docs + scripts** (grep `agentic` case-insensitive sisa → takka; kecuali: `AGENTIC_*` legacy fallback docs, changelog history entries versi lama tetap `agentic` — catat eksplisit).
-- [ ] **Step 2: Gates** — `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` + windows check.
-- [ ] **Step 3: Commit** `docs: rebrand docs + installer to takka`.
+- [ ] **Step 2: Skills dir fallback (triage dari Task 2 review — gap lintas plan)** — `takka-core/src/skills/discovery.rs`: tambah `~/.config/takka/skills` sebagai lokasi global pertama (new-wins), fallback legacy `~/.config/agentic/skills` bila takka kosong/tak ada. TANPA migrate (skills user-install jarang; fallback cukup). Update help text `takka-cli/src/cli.rs` yang menyebut `~/.config/agentic/skills` ke path baru + tool description `update_memory.rs:56` (`~/.config/agentic/memory.md` → takka). Test: new-wins + legacy-fallback.
+- [ ] **Step 3: Gates** — `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` + windows check (`cargo check -p takka-cli --target x86_64-pc-windows-gnu`, rustup target terinstal).
+- [ ] **Step 4: Commit** `docs: rebrand docs + installer to takka`.
 
 ## Self-Review
 
