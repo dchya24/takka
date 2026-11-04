@@ -1,5 +1,9 @@
 use super::protocol::{ProtocolEvent, ProtocolRequest};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io;
+// Buf* + Write hanya dipakai jalur unix di bawah; di-gate supaya build
+// non-UNIX (windows-latest clippy -D warnings) tetap bebas peringatan.
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::{mpsc, Mutex};
 
 pub trait Transport: Send + Sync + 'static {
@@ -147,10 +151,9 @@ impl Transport for SocketConnectionTransport {
 #[cfg(unix)]
 #[cfg(test)]
 mod unix_socket_tests {
-    use super::super::protocol::ProtocolEvent;
     use super::*;
     use crate::events::Event;
-    use crate::runtime::protocol::Request;
+    use crate::runtime::protocol::{ProtocolEvent, Request};
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;

@@ -1302,3 +1302,74 @@ fn strict_already_initialized_still_default_without_adopt_flag() {
         .iter()
         .any(|e| matches!(e.event, Event::SessionAdopted { .. })));
 }
+
+/// (non-daemon engine, tanpa `set_daemon_token`) `daemon_token` pada Init
+/// di-ignore sepenuhnya: init biasa diterima → InitOk, tanpa error.
+#[test]
+fn non_daemon_engine_ignores_init_token() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::new(MemoryTransport::new(request_rx, event_tx));
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "init-1",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: Default::default(),
+                daemon_token: Some("whatever".into()),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let ready = recv_until(&event_rx, deadline);
+    assert!(matches!(ready.event, Event::Ready { .. }));
+    let event = recv_until(&event_rx, deadline);
+    match &event.event {
+        Event::InitOk { .. } => {}
+        other => panic!("expected InitOk on non-daemon engine, got {other:?}"),
+    }
+    worker.join().unwrap();
+}
+
+/// Engine daemon dengan adopt-on-reinit aktif: token salah tetap ditolak
+/// "unauthorized" SEBELUM cabang adopt dievaluasi — tidak ada error
+/// capability/overrides, tidak ada InitOk/SessionAdopted.
+#[test]
+fn daemon_wrong_token_is_unauthorized_before_adopt_branch() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    engine.set_daemon_token(Some("secret".into()));
+    engine.set_adopt_on_reinit(true);
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "init-1",
+            Request::Init {
+                overrides: Default::default(),
+                capabilities: Default::default(),
+                daemon_token: Some("wrong".into()),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let ready = recv_until(&event_rx, deadline);
+    assert!(matches!(ready.event, Event::Ready { .. }));
+    let event = recv_until(&event_rx, deadline);
+    match &event.event {
+        Event::Error { message } => assert_eq!(message, "unauthorized"),
+        other => panic!("expected unauthorized error before adopt branch, got {other:?}"),
+    }
+    worker.join().unwrap();
+}
