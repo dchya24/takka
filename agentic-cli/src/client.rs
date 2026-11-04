@@ -578,20 +578,24 @@ impl AgentConnection {
     /// daemon would be a run in disguise). Unix-only: on other hosts this
     /// returns [`DAEMON_NOT_SUPPORTED_MESSAGE`], the single actionable
     /// guard asserted verbatim by a platform-independent unit test.
+    #[cfg(unix)]
     pub async fn connect_daemon(
         overrides: InitOverrides,
         caps: ConnectionCapabilities,
         spawn_if_missing: bool,
     ) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            Self::connect_daemon_at(&daemon_info_path(), overrides, caps, spawn_if_missing).await
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (overrides, caps, spawn_if_missing);
-            Err(anyhow!(DAEMON_NOT_SUPPORTED_MESSAGE))
-        }
+        Self::connect_daemon_at(&daemon_info_path(), overrides, caps, spawn_if_missing).await
+    }
+
+    /// Non-unix stub for [`Self::connect_daemon`]: daemon mode is
+    /// Unix-only; the actionable message is the contract.
+    #[cfg(not(unix))]
+    pub async fn connect_daemon(
+        _overrides: InitOverrides,
+        _caps: ConnectionCapabilities,
+        _spawn_if_missing: bool,
+    ) -> Result<Self> {
+        Err(anyhow!(DAEMON_NOT_SUPPORTED_MESSAGE))
     }
 
     /// [`Self::connect_daemon`] against an explicit discovery file — the

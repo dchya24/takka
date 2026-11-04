@@ -505,7 +505,10 @@ pub struct Commands {
     runtime_mode: crate::client::RuntimeMode,
     /// Explicit daemon discovery file for `attach_daemon` (default:
     /// [`crate::client::daemon_info_path`]). Test seam for hermetic e2e
-    /// smokes; production builds leave it `None`.
+    /// smokes; production builds leave it `None`. Unix-only (daemon mode
+    /// is not supported on Windows); `allow(dead_code)` keeps non-unix
+    /// builds warning-clean under `-D warnings`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     daemon_info_path_override: Option<std::path::PathBuf>,
     color_enabled: bool,
     debug_enabled: bool,
@@ -596,7 +599,8 @@ impl Commands {
     }
 
     /// Point `attach_daemon` at an explicit discovery file (test seam for
-    /// hermetic daemon smokes).
+    /// hermetic daemon smokes; unix-only — the non-unix build never reads
+    /// the field, hence the field-level `allow(dead_code)` above).
     #[cfg(test)]
     pub(crate) fn with_daemon_info_path(mut self, path: std::path::PathBuf) -> Self {
         self.daemon_info_path_override = Some(path);
@@ -612,19 +616,20 @@ impl Commands {
     /// with this same `Commands`, and `ensure_connection` reuses the
     /// established connection).
     pub async fn attach_daemon(&mut self, shutdown: bool) -> Result<()> {
+        self.attach_daemon_inner(shutdown).await
+    }
+
+    /// Unix implementation: shutdown or connect to the live daemon.
+    /// On non-unix this variant does not exist; the stub below returns
+    /// the actionable error.
+    #[cfg(unix)]
+    async fn attach_daemon_inner(&mut self, shutdown: bool) -> Result<()> {
         if shutdown {
-            #[cfg(unix)]
-            {
-                let info_path = self
-                    .daemon_info_path_override
-                    .clone()
-                    .unwrap_or_else(crate::client::daemon_info_path);
-                crate::client::shutdown_daemon_at(&info_path).await?;
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(anyhow::anyhow!(crate::client::DAEMON_NOT_SUPPORTED_MESSAGE));
-            }
+            let info_path = self
+                .daemon_info_path_override
+                .clone()
+                .unwrap_or_else(crate::client::daemon_info_path);
+            crate::client::shutdown_daemon_at(&info_path).await?;
             inline::print_blank();
             inline::print_line(&components::success_badge("Daemon shutdown requested."));
             inline::print_blank();
@@ -639,7 +644,7 @@ impl Commands {
             model: self.config.active_model().map(|model| model.model.clone()),
             system_prompt: self.config.system_prompt.clone(),
         };
-        self.connection = Some(match &self.daemon_info_path_override {
+        let connection = match &self.daemon_info_path_override {
             Some(path) => {
                 crate::client::AgentConnection::connect_daemon_at(
                     path,
@@ -657,8 +662,19 @@ impl Commands {
                 )
                 .await?
             }
-        });
+        };
+        self.connection = Some(connection);
         Ok(())
+    }
+
+    /// Non-unix stub: daemon mode is Unix-only. This is the ONLY
+    /// `attach_daemon` body compiled on Windows — the unix variant above
+    /// (with its `connect_daemon_at` / `shutdown_daemon_at` references)
+    /// does not exist there, so no unix-only symbol leaks into the
+    /// Windows build under `-D warnings`.
+    #[cfg(not(unix))]
+    async fn attach_daemon_inner(&mut self, _shutdown: bool) -> Result<()> {
+        Err(anyhow::anyhow!(crate::client::DAEMON_NOT_SUPPORTED_MESSAGE))
     }
 
     async fn ensure_connection(&mut self) -> Result<()> {

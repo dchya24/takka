@@ -105,7 +105,7 @@ Artinya frontend boleh import tipe engine langsung (seperti `agentic-cli` meng-i
 | Kontrol subprocess terisolasi | `exec-server` + pty + sandbox | `run_command` di core | 🔜 beda scope |
 | SDK bahasa lain | TS SDK resmi | — | 🔜 terbuka otomatis begitu protokol stabil |
 
-**Ringkasan gap:** yang memisahkan kita dari pola codex bukan fondasi — fondasinya (protokol versioned, handshake, engine generik atas `Transport`) sudah ada. Gap Fase 1 — **abstraction koneksi di sisi CLI** (`AgentConnection { InProcess, Spawned }`) dan **pemakaian `MemoryTransport`** lewat `InProcessClient` sebagai mode embedded default — **sudah tertutup di branch ini**. Jarak yang tersisa ke pola codex adalah **daemon long-lived** (Fase 3) dan **SDK bahasa lain** (Fase 4).
+**Ringkasan gap:** yang memisahkan kita dari pola codex bukan fondasi — fondasinya (protokol versioned, handshake, engine generik atas `Transport`) sudah ada. Gap Fase 1 — **abstraction koneksi di sisi CLI** (`AgentConnection { InProcess, Spawned }`) dan **pemakaian `MemoryTransport`** lewat `InProcessClient` sebagai mode embedded default — **sudah tertutup di branch ini**. Fase 3a juga sudah landed (daemon eksklusif, unix socket). Jarak yang tersisa ke pola codex adalah **multiplexing multi-sesi** (Fase 3b: session id routing, protokol v2) dan **SDK bahasa lain** (Fase 4).
 
 ---
 

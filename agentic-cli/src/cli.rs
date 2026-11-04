@@ -124,7 +124,7 @@ pub enum RuntimeModeArg {
     Embedded,
     /// Spawn the agentic-runtime daemon subprocess
     Spawn,
-    /// Attach to a running agentic-runtime --daemon broker (unix socket;
+    /// Run the agent through a long-lived daemon broker (unix socket;
     /// auto-spawns one when none is running)
     Daemon,
 }
@@ -203,7 +203,7 @@ pub enum Command {
         Keybindings: /help, Ctrl+C to cancel, Ctrl+D to quit")]
     Tui,
 
-    /// Attach to a running agentic daemon (Fase 3a)
+    /// Attach to a running agentic daemon
     #[command(long_about = "Attach this CLI to an already-running agentic daemon\n\
         (agentic-runtime --daemon) over its unix socket.\n\
         \n\

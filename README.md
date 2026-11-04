@@ -199,8 +199,9 @@ agentic interactive
 # Start the full-screen interface
 agentic tui
 
-# Attach to the long-lived daemon (auto-starts one if absent),
-# or run a one-off task through it via --runtime daemon
+# Attach to the long-lived daemon (a daemon must already be running —
+# `attach` never auto-starts one), or run a one-off task through it via
+# --runtime daemon (which auto-spawns the daemon when absent)
 agentic attach
 agentic --runtime daemon run "explain the architecture of this repository"
 ```
