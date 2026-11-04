@@ -151,8 +151,10 @@ Default config locations:
 > `agentic`)?** Your existing user state under `~/.config/agentic` is still
 > read, and the legacy `AGENTIC_*` environment variables still work with a
 > deprecation warning. Run `takka config migrate` to move config, sessions,
-> memory, and skills to `~/.config/takka` — nothing is moved without your
-> confirmation.
+> and memory to `~/.config/takka` — nothing is moved without your
+> confirmation. (Skills directories are not moved; the new
+> `~/.config/takka/skills` location wins and the legacy one keeps working
+> as a fallback.)
 
 Run the guided wizard explicitly:
 

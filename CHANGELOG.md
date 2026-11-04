@@ -7,21 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (BREAKING — rebrand)
+- **Renamed `agentic` → `takka`.** Binary is now `takka` (was `agentic`),
+  runtime daemon `takka-runtime`, crates `takka-cli` / `takka-core` /
+  `takka-runtime` (library identifier `takka_core`), and the wire protocol
+  identifies itself as `"takka"` with `PROTOCOL_VERSION = 2` (was 1).
+  Existing user state is preserved: `~/.config/agentic` keeps being read
+  (new `~/.config/takka` wins when present), legacy `AGENTIC_*` env vars
+  are still honored with a deprecation warning, and
+  `takka config migrate` moves config, sessions, and memory after
+  confirmation. A v2 CLI rejects a v1 daemon (and vice versa) with an
+  explicit `unsupported protocol version` error — CLI and daemon must be
+  upgraded together.
+
 ### Added
 - CLI: **embedded runtime mode** (default) — the agent engine now runs as
-  a thread inside the `agentic` process over in-memory channels, removing
-  the need for a separate `agentic-runtime` binary on PATH. The spawned
-  daemon mode is still available via `agentic --runtime spawn` and honors
-  `AGENTIC_RUNTIME_BIN`. Both modes share the same protocol, handshake,
-  and interactive gates; an engine panic in embedded mode surfaces as a
-  normal terminal `Error` event (same "runtime died" UX as the spawned
-  mode).
+  a thread inside the `takka` process over in-memory channels, removing
+  the need for a separate `takka-runtime` binary on PATH. The spawned
+  daemon mode is still available via `takka --runtime spawn` and honors
+  `TAKKA_RUNTIME_BIN` (legacy `AGENTIC_RUNTIME_BIN` still works with a
+  warning). Both modes share the same protocol, handshake, and interactive
+  gates; an engine panic in embedded mode surfaces as a normal terminal
+  `Error` event (same "runtime died" UX as the spawned mode).
 - Runtime: **protocol hardening** (Fase 2a) — `Init` wajib tepat sekali
   (`not initialized` / `already initialized` errors), capability
   negotiation (`experimental_api` opt-in, `Request::Plan` kini API
   eksperimental), dan notification opt-out (`ConnectionCapabilities.
   optOutNotify`, allowlist: thinking/assistant_delta/warning/todo_changed).
-  Semua additive; `PROTOCOL_VERSION` tetap 1.
+  Semua additive di dalam versi protokol saat itu.
 - Runtime: **steer & queue** (Fase 2b) — the agent can now be steered
   mid-run: `Request::Steer { content }` queues user text engine-side;
   at the next tool boundary it is injected as a real user message and
@@ -29,25 +42,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   initialized` / `no active run`. Pending gates never lose user input.
   CLI adds `--queue-mode interrupt|follow-up` and the `/queue` slash
   command: `interrupt` sends live steers, `follow-up` (default) queues
-  text client-side and issues the next run itself. Additive; protocol
-  version stays 1.
-- Runtime: **daemon mode (Fase 3a)** — `agentic-runtime --daemon` hosts a
+  text client-side and issues the next run itself.
+- Runtime: **daemon mode (Fase 3a)** — `takka-runtime --daemon` hosts a
   single long-lived engine behind a Unix domain socket (`#[cfg(unix)]`),
-  discovered via `~/.config/agentic/daemon.json` (pid, socket path, random
-  token, version). CLIs attach with `--runtime daemon`
-  (auto-spawns the daemon when absent/stale) or `agentic attach`; a second
+  discovered via `~/.config/takka/daemon.json` (pid, socket path, random
+  token, version). CLIs attach with `takka --runtime daemon`
+  (auto-spawns the daemon when absent/stale) or `takka attach`; a second
   attach is refused with `daemon in use`; detach keeps the engine running
   and a re-attach adopts the live session (`InitOk` + `session_adopted`),
   with config/capability mismatches producing actionable errors. Windows
   daemon mode and named-pipe transport are planned (TODO).
 
 ### Changed
-- Tests: the two CLI e2e smoke tests now spawn the real `agentic-runtime`
+- Tests: the two CLI e2e smoke tests now spawn the real `takka-runtime`
   daemon against a pinned unreachable provider endpoint, making them
-  hermetic — they no longer read the ambient `~/.config/agentic/config.json`
+  hermetic — they no longer read the ambient user config (`~/.config/takka/config.json`)
   or call a real LLM provider (which broke CI and risked using the
   developer's credentials). Tool-call / response semantics stay covered by
-  the in-process `core-agentic/tests/runtime_engine.rs` suite, and the dead
+  the in-process `takka-core/tests/runtime_engine.rs` suite, and the dead
   mock-provider plumbing (`Commands::with_mock_provider`, `ScriptedProvider`)
   was removed.
 
@@ -61,7 +73,7 @@ lookup fix.
   an item is accepted, and the render cycle that follows no longer erases
   the command output printed below it (e.g. the skill "📖 Preview" section
   after activation)
-- CLI: `runtime_binary()` no longer mistakes the `agentic-runtime/` source
+- CLI: `runtime_binary()` no longer mistakes the `takka-runtime/` source
   directory at the workspace root for the daemon binary, which made the
   spawn fail with a cryptic "Permission denied"
 
