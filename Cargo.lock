@@ -9,49 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agentic-cli"
-version = "0.5.1"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "comfy-table",
- "console",
- "core-agentic",
- "crossterm 0.28.1",
- "dialoguer",
- "dirs",
- "futures",
- "ignore",
- "indicatif",
- "libc",
- "log",
- "pulldown-cmark",
- "ratatui",
- "regex",
- "serde",
- "serde_json",
- "syntect",
- "termcolor",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tui-textarea",
- "uuid",
-]
-
-[[package]]
-name = "agentic-runtime"
-version = "0.1.0"
-dependencies = [
- "core-agentic",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,31 +325,6 @@ dependencies = [
  "once_cell",
  "unicode-width 0.2.0",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "core-agentic"
-version = "0.3.1"
-dependencies = [
- "async-stream",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "futures",
- "glob",
- "log",
- "parking_lot",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "similar",
- "thiserror 2.0.18",
- "tiktoken-rs",
- "tokio",
- "tokio-test",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2174,6 +2106,74 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "takka-cli"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "console",
+ "crossterm 0.28.1",
+ "dialoguer",
+ "dirs",
+ "futures",
+ "ignore",
+ "indicatif",
+ "libc",
+ "log",
+ "pulldown-cmark",
+ "ratatui",
+ "regex",
+ "serde",
+ "serde_json",
+ "syntect",
+ "takka-core",
+ "termcolor",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tui-textarea",
+ "uuid",
+]
+
+[[package]]
+name = "takka-core"
+version = "0.3.1"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "glob",
+ "log",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "similar",
+ "thiserror 2.0.18",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "takka-runtime"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "takka-core",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

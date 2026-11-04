@@ -1,0 +1,17 @@
+[package]
+name = "takka-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Headless JSON Lines runtime for takka-core"
+authors = ["devchya"]
+license = "MIT"
+
+[[bin]]
+name = "takka-runtime"
+path = "src/main.rs"
+
+[dependencies]
+takka-core = { path = "../takka-core" }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "core-agentic",
-    "agentic-cli",
-    "agentic-runtime",
+    "takka-core",
+    "takka-cli",
+    "takka-runtime",
 ]
 
 [workspace.package]
