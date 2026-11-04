@@ -1,7 +1,7 @@
-use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
-use takka_core::runtime::transport::Transport;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::sync::Mutex;
+use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
+use takka_core::runtime::transport::Transport;
 
 pub struct StdioTransport {
     input: Mutex<BufReader<io::Stdin>>,

@@ -9,8 +9,8 @@
 //! unit tests: the tests exercise filesystem operations through builtin
 //! tools, matching Cargo's integration-test boundary.
 
-use takka_core::{planner::*, tools::RunCommandTool, Event, LLMProvider, ToolRegistry};
 use std::sync::Arc;
+use takka_core::{planner::*, tools::RunCommandTool, Event, LLMProvider, ToolRegistry};
 
 mod support;
 use support::{text_response, ScriptedProvider};

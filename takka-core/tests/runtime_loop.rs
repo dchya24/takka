@@ -5,16 +5,16 @@
 //! iteration boundaries, cancel plumbing, status observation, and the
 //! P1-2 `on_state_change` handler.
 
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use takka_core::{
     AgentLoop, AgentRuntime, Event, FileTracker, LLMProvider, Orchestrator, OrchestratorState,
     ToolRegistry,
 };
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 mod support;
-use takka_core::providers::ChatResponse;
 use support::{text_response, tool_call_response, ScriptedProvider, StreamingScriptedProvider};
+use takka_core::providers::ChatResponse;
 
 fn tools() -> ToolRegistry {
     let reg = ToolRegistry::new();

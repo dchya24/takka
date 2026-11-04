@@ -1,9 +1,9 @@
-use takka_core::{ConfirmationRequest, RiskLevel};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use std::sync::atomic::Ordering;
+use takka_core::{ConfirmationRequest, RiskLevel};
 
 use crate::widgets::components::{panel, BoxStyle};
 use crate::widgets::diff as diff_widget;

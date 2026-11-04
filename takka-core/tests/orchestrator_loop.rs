@@ -11,6 +11,8 @@
 //! integration crate makes the boundary explicit (no access to private
 //! orchestrator internals) and matches Cargo's standard layout.
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use takka_core::{
     providers::{
         ChatChunk, ChatRequest, ChatResponse, ProviderError, ProviderResult, StreamResult,
@@ -19,8 +21,6 @@ use takka_core::{
     tools::builtin_tools_with_tracker,
     Event, FileTracker, LLMProvider, Orchestrator, ToolRegistry,
 };
-use std::sync::Arc;
-use std::sync::Mutex;
 
 mod support;
 use support::{tool_call, ScriptedProvider, StreamingScriptedProvider};

@@ -1,6 +1,8 @@
 //! Session management — auto-save, list, resume conversations.
 //!
-//! Sessions are stored as JSON files in `~/.config/agentic/sessions/`.
+//! Sessions are stored as JSON files in `~/.config/takka/sessions/`
+//! (legacy `~/.config/agentic/sessions/` still read until
+//! `takka config migrate` moves them).
 //! Each session captures the full conversation history plus metadata
 //! (model, provider, working directory, timestamps, cost).
 //!
@@ -60,13 +62,11 @@ pub struct SessionSummary {
 
 // ── Storage helpers ─────────────────────────────────────────
 
-/// Root directory for session files.
+/// Root directory for session files. Delegates to the shared core
+/// helper so the CLI and the runtime's memory persistence agree on the
+/// effective directory (new-first, legacy fallback).
 fn sessions_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".config")
-        .join("agentic")
-        .join("sessions")
+    takka_core::config::sessions_dir()
 }
 
 /// Ensure the sessions directory exists.

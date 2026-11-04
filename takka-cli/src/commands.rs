@@ -2,7 +2,6 @@ use anyhow::Result;
 use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color as TColor, Table,
 };
-use takka_core::Config;
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::ExecutableCommand;
@@ -12,6 +11,7 @@ use ratatui::text::{Line as RLine, Span as RSpan};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use takka_core::Config;
 use termcolor::{Color, ColorSpec, StandardStream, WriteColor};
 
 use crate::cli::{ConfigAction, OutputFormat, SkillAction};
@@ -63,10 +63,7 @@ pub(crate) static RENDER_GATE: Mutex<()> = Mutex::new(());
 struct CliQuestionHandler;
 
 impl takka_core::QuestionHandler for CliQuestionHandler {
-    fn handle(
-        &self,
-        questions: &[takka_core::QuestionPrompt],
-    ) -> Vec<takka_core::QuestionAnswer> {
+    fn handle(&self, questions: &[takka_core::QuestionPrompt]) -> Vec<takka_core::QuestionAnswer> {
         // Pause the streaming renderer for the whole prompt sequence.
         // The spinner thread spawned by `Commands::run` redraws the
         // "Thinking…" line every 80ms with MoveUp+Clear+print; if it kept
@@ -2155,6 +2152,7 @@ impl Commands {
             ConfigAction::Restore { file } => self.config_restore(file)?,
             ConfigAction::Export => self.config_export()?,
             ConfigAction::Import { file } => self.config_import(file)?,
+            ConfigAction::Migrate { yes, force } => self.config_migrate(*yes, *force)?,
         }
         Ok(())
     }
@@ -3062,10 +3060,68 @@ Instructions the agent follows when this skill is loaded.
         Ok(())
     }
 
+    // ── Config migrate ──────────────────────────────────────
+
+    /// Move legacy `~/.config/agentic` user state (config, sessions,
+    /// memory) to `~/.config/takka`. Interactive `y/N` confirmation
+    /// unless `--yes`; refuses an existing target config unless
+    /// `--force`. Idempotent: with nothing left at the legacy path it
+    /// reports there is nothing to migrate.
+    fn config_migrate(&self, yes: bool, force: bool) -> Result<()> {
+        let legacy = takka_core::config::legacy_config_dir();
+        let new = takka_core::config::config_dir();
+
+        let items = config_migrate::migration_items(&legacy, &new);
+        if items.is_empty() {
+            print_info(&format!(
+                "Nothing to migrate: no legacy data found at {}",
+                legacy.display()
+            ));
+            return Ok(());
+        }
+
+        config_migrate::target_conflict(&new, force).map_err(CommandError::Config)?;
+
+        println!(
+            "Moving legacy user data from {} to {}:",
+            legacy.display(),
+            new.display()
+        );
+        for item in &items {
+            println!(
+                "  {:<8} {} → {}",
+                item.label,
+                item.source.display(),
+                item.dest.display()
+            );
+        }
+
+        if !yes {
+            let confirm = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Continue?")
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !confirm {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+
+        config_migrate::apply_migration(&items).map_err(CommandError::Config)?;
+        print_success(&format!(
+            "Migration complete — your data now lives at {}",
+            new.display()
+        ));
+        Ok(())
+    }
+
     // ── Config backup ───────────────────────────────────────
 
     fn config_backup(&self) -> Result<()> {
-        let config_path = Config::config_path();
+        // Back up the config that would actually load: new location,
+        // or the legacy file for a pre-migration user.
+        let (config_path, _) = Config::effective_config_path();
 
         if !config_path.exists() {
             return Err(anyhow::anyhow!(
@@ -3940,6 +3996,116 @@ mod e2e_tests {
     }
 }
 
+/// Core helpers for `takka config migrate`: plan, guard, and execute
+/// the legacy `~/.config/agentic` → `~/.config/takka` user-state move.
+/// Split from the interactive [`Commands::config_migrate`] wrapper so
+/// the unit tests (`config_migrate_tests`) stay hermetic: explicit
+/// paths in, no HOME override, no interactivity.
+pub(crate) mod config_migrate {
+    use std::path::{Path, PathBuf};
+
+    /// One movable piece of legacy user state.
+    pub(crate) struct MigrateItem {
+        pub source: PathBuf,
+        pub dest: PathBuf,
+        pub label: &'static str,
+    }
+
+    /// Plan what would move from the legacy dir to the new one:
+    /// config.json, sessions/, memory.md — only pieces that exist.
+    /// An empty result means "nothing to migrate".
+    pub(crate) fn migration_items(legacy: &Path, new: &Path) -> Vec<MigrateItem> {
+        let mut items = Vec::new();
+        let config = legacy.join("config.json");
+        if config.is_file() {
+            items.push(MigrateItem {
+                source: config,
+                dest: new.join("config.json"),
+                label: "config",
+            });
+        }
+        let sessions = legacy.join("sessions");
+        if sessions.is_dir() {
+            items.push(MigrateItem {
+                source: sessions,
+                dest: new.join("sessions"),
+                label: "sessions",
+            });
+        }
+        let memory = legacy.join("memory.md");
+        if memory.is_file() {
+            items.push(MigrateItem {
+                source: memory,
+                dest: new.join("memory.md"),
+                label: "memory",
+            });
+        }
+        items
+    }
+
+    /// Refuse to run when the target config already exists (unless
+    /// `--force`); an existing-but-configless target directory is fine.
+    pub(crate) fn target_conflict(new: &Path, force: bool) -> Result<(), String> {
+        let target = new.join("config.json");
+        if target.exists() && !force {
+            return Err(format!(
+                "{} already exists; refusing to migrate over it (use --force to overwrite)",
+                target.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Execute the plan: move each item, creating target directories
+    /// as needed.
+    pub(crate) fn apply_migration(items: &[MigrateItem]) -> Result<(), String> {
+        for item in items {
+            move_path(&item.source, &item.dest)?;
+        }
+        Ok(())
+    }
+
+    /// Move a file or directory tree. Falls back to copy + remove when
+    /// a plain rename fails (e.g. across filesystems).
+    pub(crate) fn move_path(source: &Path, dest: &Path) -> Result<(), String> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        }
+        if std::fs::rename(source, dest).is_ok() {
+            return Ok(());
+        }
+        if source.is_dir() {
+            copy_dir_recursive(source, dest)
+                .map_err(|e| format!("failed to copy {}: {}", source.display(), e))?;
+            std::fs::remove_dir_all(source)
+                .map_err(|e| format!("failed to remove {}: {}", source.display(), e))
+        } else {
+            std::fs::copy(source, dest)
+                .map_err(|e| format!("failed to copy {}: {}", source.display(), e))?;
+            std::fs::remove_file(source)
+                .map_err(|e| format!("failed to remove {}: {}", source.display(), e))?;
+            Ok(())
+        }
+    }
+
+    /// Recursive directory copy used by the rename fallback.
+    pub(crate) fn copy_dir_recursive(source: &Path, dest: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let entry_type = entry.file_type()?;
+            let target = dest.join(entry.file_name());
+            if entry_type.is_dir() {
+                copy_dir_recursive(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── Daemon-mode e2e smoke (Fase 3a, unix only) ───────────
 //
 // The daemon mode of the `--runtime` matrix gets dedicated
@@ -3954,9 +4120,9 @@ mod e2e_tests {
 mod daemon_smoke_tests {
     use super::*;
     use crate::client::{AgentConnection, CLI_CAPABILITIES};
-    use takka_core::runtime::protocol::InitOverrides;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use takka_core::runtime::protocol::InitOverrides;
 
     /// Bound for every poll so a regression can never hang the suite.
     const POLL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3995,7 +4161,7 @@ mod daemon_smoke_tests {
                 .unwrap()
                 .as_nanos();
             let dir = std::env::temp_dir().join(format!(
-                "agentic-cli-daemon-{}-{}-{}",
+                "takka-cli-daemon-{}-{}-{}",
                 std::process::id(),
                 nanos,
                 tag
@@ -4005,7 +4171,13 @@ mod daemon_smoke_tests {
             std::fs::write(&config_path, HERMETIC_CONFIG).unwrap();
             let socket_path = dir.join("test.sock");
             let info_path = dir.join("daemon.json");
-            let binary = crate::client::runtime_binary().expect("runtime binary for daemon smoke");
+            let binary = {
+                // Same lock as client.rs's env-compat tests: a transient
+                // TAKKA_/AGENTIC_RUNTIME_BIN value must never leak into
+                // the runtime binary resolution here.
+                let _g = crate::client::daemon_info_tests::ENV_LOCK.lock().unwrap();
+                crate::client::runtime_binary().expect("runtime binary for daemon smoke")
+            };
             let child = tokio::process::Command::new(&binary)
                 .arg("--daemon")
                 .arg("--socket-path")
@@ -4224,7 +4396,7 @@ mod daemon_smoke_tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "agentic-cli-autospawn-{}-{}",
+            "takka-cli-autospawn-{}-{}",
             std::process::id(),
             nanos
         ));
@@ -4276,7 +4448,7 @@ mod daemon_smoke_tests {
     #[tokio::test]
     async fn attach_without_daemon_is_actionable() {
         let dir = std::env::temp_dir().join(format!(
-            "agentic-cli-nodaemon-{}-{}",
+            "takka-cli-nodaemon-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4380,7 +4552,7 @@ mod daemon_smoke_tests {
     #[tokio::test]
     async fn commands_attach_without_daemon_errors_actionable() {
         let dir = std::env::temp_dir().join(format!(
-            "agentic-cli-cmd-nodaemon-{}-{}",
+            "takka-cli-cmd-nodaemon-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4562,5 +4734,188 @@ mod render_tool_delta_tests {
     fn empty_delta_produces_no_lines() {
         let lines = render_tool_delta("run_command", "");
         assert!(lines.is_empty());
+    }
+}
+
+/// Unit tests for the legacy→takka config migration. The migration
+/// core is split into pure path-in/path-out helpers so these tests are
+/// hermetic (explicit tempdirs, no HOME override, no interactivity).
+#[cfg(test)]
+mod config_migrate_tests {
+    use super::config_migrate::{
+        apply_migration, copy_dir_recursive, migration_items, move_path, target_conflict,
+        MigrateItem,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn tempdir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("takka-migrate-test-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn seed_legacy_state(legacy: &Path) {
+        std::fs::create_dir_all(legacy.join("sessions")).unwrap();
+        std::fs::write(legacy.join("config.json"), r#"{"providers":[]}"#).unwrap();
+        std::fs::write(legacy.join("sessions").join("ses_1.json"), "{}").unwrap();
+        std::fs::write(legacy.join("memory.md"), "notes").unwrap();
+    }
+
+    #[test]
+    fn plan_lists_config_sessions_and_memory() {
+        let root = tempdir("plan_full");
+        let legacy = root.join("agentic");
+        let new = root.join("takka");
+        seed_legacy_state(&legacy);
+
+        let items = migration_items(&legacy, &new);
+        assert_eq!(items.len(), 3, "config + sessions + memory expected");
+        assert_eq!(items[0].source, legacy.join("config.json"));
+        assert_eq!(items[0].dest, new.join("config.json"));
+        assert_eq!(items[1].source, legacy.join("sessions"));
+        assert_eq!(items[1].dest, new.join("sessions"));
+        assert_eq!(items[2].source, legacy.join("memory.md"));
+        assert_eq!(items[2].dest, new.join("memory.md"));
+    }
+
+    #[test]
+    fn plan_is_empty_when_legacy_missing() {
+        let root = tempdir("plan_empty");
+        let items = migration_items(&root.join("agentic"), &root.join("takka"));
+        assert!(items.is_empty(), "nothing to migrate → empty plan");
+    }
+
+    #[test]
+    fn plan_skips_absent_pieces() {
+        let root = tempdir("plan_partial");
+        let legacy = root.join("agentic");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("memory.md"), "only memory").unwrap();
+
+        let items = migration_items(&legacy, &root.join("takka"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, legacy.join("memory.md"));
+    }
+
+    #[test]
+    fn target_conflict_refuses_existing_new_config_without_force() {
+        let root = tempdir("conflict");
+        let new = root.join("takka");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("config.json"), r#"{"providers":[]}"#).unwrap();
+
+        assert!(
+            target_conflict(&new, false).is_err(),
+            "must refuse pre-migration target"
+        );
+        assert!(
+            target_conflict(&new, true).is_ok(),
+            "--force must override the refusal"
+        );
+    }
+
+    #[test]
+    fn target_conflict_ok_for_fresh_or_empty_target() {
+        let root = tempdir("conflict_fresh");
+        let new = root.join("takka");
+        assert!(
+            target_conflict(&new, false).is_ok(),
+            "no new config yet → ok"
+        );
+        std::fs::create_dir_all(&new).unwrap();
+        assert!(
+            target_conflict(&new, false).is_ok(),
+            "existing-but-configless target dir → ok"
+        );
+    }
+
+    #[test]
+    fn apply_moves_files_and_directories() {
+        let root = tempdir("apply_full");
+        let legacy = root.join("agentic");
+        let new = root.join("takka");
+        seed_legacy_state(&legacy);
+
+        let items = migration_items(&legacy, &new);
+        apply_migration(&items).unwrap();
+
+        assert!(new.join("config.json").is_file());
+        assert!(new.join("sessions").join("ses_1.json").is_file());
+        assert!(new.join("memory.md").is_file());
+        assert!(
+            !legacy.join("config.json").exists(),
+            "source must be moved, not copied"
+        );
+        assert!(!legacy.join("sessions").exists());
+        assert!(!legacy.join("memory.md").exists());
+    }
+
+    #[test]
+    fn migration_is_idempotent_after_apply() {
+        let root = tempdir("idempotent");
+        let legacy = root.join("agentic");
+        let new = root.join("takka");
+        seed_legacy_state(&legacy);
+
+        apply_migration(&migration_items(&legacy, &new)).unwrap();
+        // Second run: nothing left on the legacy side → empty plan,
+        // i.e. `takka config migrate` twice is safe.
+        assert!(migration_items(&legacy, &new).is_empty());
+    }
+
+    #[test]
+    fn apply_creates_missing_target_directories() {
+        let root = tempdir("apply_deep");
+        let legacy = root.join("agentic");
+        let new = root.join("takka").join("nested");
+        std::fs::create_dir_all(legacy.join("sessions").join("nested-session")).unwrap();
+        std::fs::write(
+            legacy
+                .join("sessions")
+                .join("nested-session")
+                .join("a.json"),
+            "{}",
+        )
+        .unwrap();
+
+        let items = vec![MigrateItem {
+            source: legacy.join("sessions"),
+            dest: new.join("sessions"),
+            label: "sessions",
+        }];
+        apply_migration(&items).unwrap();
+        assert!(new
+            .join("sessions")
+            .join("nested-session")
+            .join("a.json")
+            .is_file());
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_tree() {
+        let root = tempdir("copy_tree");
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "A").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), "B").unwrap();
+
+        let dest = root.join("dest");
+        copy_dir_recursive(&src, &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "A");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("sub").join("b.txt")).unwrap(),
+            "B"
+        );
+    }
+
+    #[test]
+    fn move_path_survives_existing_parent() {
+        let root = tempdir("move_path");
+        std::fs::write(root.join("x.json"), "{}").unwrap();
+        move_path(&root.join("x.json"), &root.join("deep").join("y.json")).unwrap();
+        assert!(root.join("deep").join("y.json").is_file());
+        assert!(!root.join("x.json").exists());
     }
 }

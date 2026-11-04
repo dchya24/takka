@@ -1,8 +1,8 @@
 mod daemon;
 mod stdio_transport;
 
-use takka_core::runtime::engine::RuntimeEngine;
 use stdio_transport::StdioTransport;
+use takka_core::runtime::engine::RuntimeEngine;
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -53,17 +53,15 @@ fn run_daemon(args: &[String]) -> ! {
 #[cfg(unix)]
 fn daemon_config_dir() -> std::path::PathBuf {
     match std::env::var_os("HOME") {
-        Some(home) => std::path::PathBuf::from(home)
-            .join(".config")
-            .join("agentic"),
-        None => std::env::temp_dir().join("agentic-daemon"),
+        Some(home) => std::path::PathBuf::from(home).join(".config").join("takka"),
+        None => std::env::temp_dir().join("takka-daemon"),
     }
 }
 
 #[cfg(unix)]
 fn parse_daemon_flags(args: &[String]) -> Result<daemon::DaemonConfig, String> {
     let mut socket_path =
-        daemon_config_dir().join(format!("agentic-daemon-{}.sock", std::process::id()));
+        daemon_config_dir().join(format!("takka-daemon-{}.sock", std::process::id()));
     let mut info_path = daemon_config_dir().join("daemon.json");
 
     let mut index = 0;

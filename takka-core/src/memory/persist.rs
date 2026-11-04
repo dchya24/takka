@@ -1,8 +1,9 @@
 //! Disk persistence for `Memory` sessions.
 //!
-//! Sessions are stored as JSON under `~/.config/agentic/sessions/` by
-//! default; the directory can be overridden per-call (for tests) or
-//! globally via `MemoryConfig::persist_dir`.
+//! Sessions are stored as JSON under `~/.config/takka/sessions/` by
+//! default (legacy `~/.config/agentic/sessions/` still read until
+//! `takka config migrate` moves it); the directory can be overridden
+//! per-call (for tests) or globally via `MemoryConfig::persist_dir`.
 
 use std::fs;
 use std::io;
@@ -106,11 +107,5 @@ impl Memory {
 }
 
 fn default_persist_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home)
-        .join(".config")
-        .join("agentic")
-        .join("sessions")
+    crate::config::sessions_dir()
 }

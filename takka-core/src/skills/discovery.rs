@@ -498,6 +498,9 @@ description: Just enough
 
     #[test]
     fn expand_tilde_path() {
+        // HOME is process-global: other tests in this crate mutate it
+        // (memory_file/config fallback tests), so hold the shared guard.
+        let _guard = crate::test_env_lock::ENV_LOCK.lock().unwrap();
         let expanded = expand_path("~/something");
         // Must resolve to an absolute path under the user's home dir on
         // every platform (Windows uses `C:\Users\...` — no leading slash).

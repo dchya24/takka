@@ -307,29 +307,52 @@ impl Config {
         )
     }
 
+    /// Canonical config file path — the NEW location config writes go
+    /// to (`~/.config/takka/config.json`). Reads should go through
+    /// [`Self::effective_config_path`] so pre-migration users keep
+    /// working.
     pub fn config_path() -> PathBuf {
-        let home = if cfg!(windows) {
-            std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-        } else {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-        };
-
-        home.join(".config").join("agentic").join("config.json")
+        config_dir().join("config.json")
     }
 
-    /// Check if config file exists
+    /// The config file that would actually be loaded: the new location
+    /// when it exists, otherwise the legacy pre-rebrand file. The bool
+    /// flags legacy use so callers can point the user at
+    /// `takka config migrate`.
+    pub fn effective_config_path() -> (PathBuf, bool) {
+        let new = Self::config_path();
+        if new.exists() {
+            return (new, false);
+        }
+        let legacy = legacy_config_dir().join("config.json");
+        if legacy.exists() {
+            return (legacy, true);
+        }
+        (new, false)
+    }
+
+    /// Check if a config file exists (new OR legacy location, so the
+    /// `config validate` gate keeps working before a migrate).
     pub fn config_exists() -> bool {
-        Self::config_path().exists()
+        Self::config_path().exists() || legacy_config_dir().join("config.json").exists()
     }
 
-    /// Load config from default path
+    /// Load config from the default path: new location first, legacy
+    /// `~/.config/agentic` fallback with a one-line stderr warning
+    /// (printed once per process).
     pub fn load() -> Option<Self> {
-        Self::load_from(Self::config_path())
+        let (path, is_legacy) = Self::effective_config_path();
+        if is_legacy {
+            static LEGACY_CONFIG_PATH_WARNED: std::sync::Once = std::sync::Once::new();
+            LEGACY_CONFIG_PATH_WARNED.call_once(|| {
+                eprintln!(
+                    "takka: warning: using legacy config path {}; run 'takka config migrate' to move it to {}",
+                    legacy_config_dir().display(),
+                    config_dir().display()
+                );
+            });
+        }
+        Self::load_from(path)
     }
 
     /// Load config from custom path
@@ -553,6 +576,71 @@ impl Default for Config {
     }
 }
 
+/// Root of takka's user state: `~/.config/takka` (Windows: profile dir
+/// + `.config/takka`).
+///
+/// Mirrors the old `config_path()` HOME handling including the HOME-less
+/// `.` fallback.
+pub fn config_dir() -> PathBuf {
+    home_base().join(".config").join("takka")
+}
+
+/// Pre-rebrand root of user state: `~/.config/agentic`. Kept as a read
+/// fallback (config, sessions, memory) until `takka config migrate`
+/// moves the data to [`config_dir`].
+pub fn legacy_config_dir() -> PathBuf {
+    home_base().join(".config").join("agentic")
+}
+
+fn home_base() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+    }
+}
+
+/// Sessions directory with legacy fallback: prefer
+/// `~/.config/takka/sessions` when it exists; keep reading the legacy
+/// `~/.config/agentic/sessions` until `takka config migrate` moves it;
+/// fresh installs land in the new directory.
+pub fn sessions_dir() -> PathBuf {
+    let new = config_dir().join("sessions");
+    if new.is_dir() {
+        return new;
+    }
+    let legacy = legacy_config_dir().join("sessions");
+    if legacy.is_dir() {
+        legacy
+    } else {
+        new
+    }
+}
+
+/// `TAKKA_*` env var primary, pre-rebrand `AGENTIC_*` fallback. The
+/// bool flags legacy use so callers can emit a one-line stderr notice
+/// via [`legacy_env_warning`].
+pub fn resolve_env(new: &str, legacy: &str) -> (Option<String>, bool) {
+    if let Ok(value) = std::env::var(new) {
+        return (Some(value), false);
+    }
+    if let Ok(value) = std::env::var(legacy) {
+        return (Some(value), true);
+    }
+    (None, false)
+}
+
+/// One-line deprecation notice for a legacy env var read, e.g.
+/// `takka: warning: using legacy AGENTIC_RUNTIME_BIN; set TAKKA_RUNTIME_BIN instead`.
+pub fn legacy_env_warning(new: &str, legacy: &str) -> String {
+    format!("takka: warning: using legacy {legacy}; set {new} instead")
+}
+
 fn normalize_model_name(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {
@@ -685,5 +773,217 @@ mod tests {
         assert!(policy.is_allowed("https://api.github.com/x"));
         assert!(!policy.is_allowed("https://example.com/x"));
         assert!(!policy.is_allowed("http://192.168.1.1/x"));
+    }
+
+    // ── Config path + env compat (takka rebrand) ────────────
+
+    /// Helper (kept for documentation; tests use `HomeGuard::hold`).
+    #[allow(dead_code)]
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock::ENV_LOCK.lock().unwrap()
+    }
+
+    use std::path::Path;
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("takka_config_test_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn set_home(path: &Path) {
+        std::env::set_var("HOME", path);
+        #[cfg(windows)]
+        std::env::set_var("USERPROFILE", path);
+    }
+
+    /// Save HOME/USERPROFILE and restore them on drop. Every test that
+    /// mutates HOME must hold one of these (plus `env_guard`) so no test
+    /// leaks a HOME-less process state to the next test.
+    struct HomeGuard {
+        home: Option<std::ffi::OsString>,
+        #[cfg(windows)]
+        userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn hold() -> (Self, std::sync::MutexGuard<'static, ()>) {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                #[cfg(windows)]
+                userprofile: std::env::var_os("USERPROFILE"),
+            };
+            (guard, crate::test_env_lock::ENV_LOCK.lock().unwrap())
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            #[cfg(windows)]
+            match &self.userprofile {
+                Some(h) => std::env::set_var("USERPROFILE", h),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    fn clear_home() {
+        std::env::remove_var("HOME");
+        #[cfg(windows)]
+        std::env::remove_var("USERPROFILE");
+    }
+
+    fn write_provider_config(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"providers":[{{"name":"{name}","type":"openai-compatible","api_base":"https://{name}.example","api_key":"k","models":[{{"model":"m"}}]}}]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_dir_points_at_takka_under_home() {
+        let (_home, _g) = HomeGuard::hold();
+        let home = temp_home("dirs");
+        set_home(&home);
+        assert_eq!(
+            config_dir(),
+            home.join(".config").join("takka"),
+            "primary config dir must be ~/.config/takka"
+        );
+        assert_eq!(
+            legacy_config_dir(),
+            home.join(".config").join("agentic"),
+            "legacy config dir must stay ~/.config/agentic"
+        );
+        clear_home();
+        // HOME-less fallback mirrors the old config_path() behavior.
+        assert_eq!(
+            config_dir(),
+            PathBuf::from(".").join(".config").join("takka")
+        );
+    }
+
+    #[test]
+    fn load_falls_back_to_legacy_config() {
+        let (_home, _g) = HomeGuard::hold();
+        let home = temp_home("fallback");
+        let legacy = home.join(".config").join("agentic");
+        write_provider_config(&legacy, "legacy");
+        set_home(&home);
+
+        let (path, is_legacy) = Config::effective_config_path();
+        assert!(
+            is_legacy,
+            "legacy-only state must resolve to the legacy path"
+        );
+        assert_eq!(path, legacy.join("config.json"));
+
+        let cfg = Config::load().expect("legacy config must still load");
+        assert_eq!(cfg.providers[0].name, "legacy");
+
+        assert!(
+            Config::config_exists(),
+            "config_exists must cover the legacy location (validate gate)"
+        );
+    }
+
+    #[test]
+    fn load_prefers_new_config_over_legacy() {
+        let (_home, _g) = HomeGuard::hold();
+        let home = temp_home("prefer_new");
+        let new = home.join(".config").join("takka");
+        let legacy = home.join(".config").join("agentic");
+        write_provider_config(&new, "new");
+        write_provider_config(&legacy, "legacy");
+        set_home(&home);
+
+        let (path, is_legacy) = Config::effective_config_path();
+        assert!(!is_legacy, "new config must win when it exists");
+        assert_eq!(path, new.join("config.json"));
+        assert_eq!(Config::load().unwrap().providers[0].name, "new");
+    }
+
+    #[test]
+    fn effective_config_path_is_new_when_nothing_exists() {
+        let (_home, _g) = HomeGuard::hold();
+        let home = temp_home("fresh");
+        set_home(&home);
+        let (path, is_legacy) = Config::effective_config_path();
+        assert!(!is_legacy);
+        assert_eq!(path, home.join(".config").join("takka").join("config.json"));
+    }
+
+    #[test]
+    fn sessions_dir_falls_back_to_legacy_sessions() {
+        let (_home, _g) = HomeGuard::hold();
+        let home = temp_home("sessions");
+
+        // Neither exists → new dir is the answer (fresh layout).
+        set_home(&home);
+        assert_eq!(
+            sessions_dir(),
+            home.join(".config").join("takka").join("sessions")
+        );
+
+        // Legacy sessions exist → keep reading them until migrate.
+        let legacy_sessions = home.join(".config").join("agentic").join("sessions");
+        std::fs::create_dir_all(&legacy_sessions).unwrap();
+        assert_eq!(sessions_dir(), legacy_sessions);
+
+        // New sessions dir appears → wins over legacy.
+        let new_sessions = home.join(".config").join("takka").join("sessions");
+        std::fs::create_dir_all(&new_sessions).unwrap();
+        assert_eq!(sessions_dir(), new_sessions);
+    }
+
+    #[test]
+    fn resolve_env_prefers_new_name() {
+        let (_home, _g) = HomeGuard::hold();
+        std::env::set_var("TAKKA_TEST_PRIMARY", "new-value");
+        std::env::set_var("TAKKA_TEST_LEGACY", "legacy-value");
+        let (value, warned) = resolve_env("TAKKA_TEST_PRIMARY", "TAKKA_TEST_LEGACY");
+        assert_eq!(value.as_deref(), Some("new-value"));
+        assert!(!warned);
+        std::env::remove_var("TAKKA_TEST_PRIMARY");
+        std::env::remove_var("TAKKA_TEST_LEGACY");
+    }
+
+    #[test]
+    fn resolve_env_falls_back_to_legacy_with_warned_flag() {
+        let (_home, _g) = HomeGuard::hold();
+        std::env::remove_var("TAKKA_TEST_PRIMARY");
+        std::env::set_var("TAKKA_TEST_LEGACY", "legacy-value");
+        let (value, warned) = resolve_env("TAKKA_TEST_PRIMARY", "TAKKA_TEST_LEGACY");
+        assert_eq!(value.as_deref(), Some("legacy-value"));
+        assert!(warned, "legacy fallback must be flagged so callers warn");
+        std::env::remove_var("TAKKA_TEST_LEGACY");
+    }
+
+    #[test]
+    fn resolve_env_none_when_both_unset() {
+        let (_home, _g) = HomeGuard::hold();
+        std::env::remove_var("TAKKA_TEST_PRIMARY");
+        std::env::remove_var("TAKKA_TEST_LEGACY");
+        let (value, warned) = resolve_env("TAKKA_TEST_PRIMARY", "TAKKA_TEST_LEGACY");
+        assert_eq!(value, None);
+        assert!(!warned);
+    }
+
+    #[test]
+    fn legacy_env_warning_message_format() {
+        assert_eq!(
+            legacy_env_warning("TAKKA_RUNTIME_BIN", "AGENTIC_RUNTIME_BIN"),
+            "takka: warning: using legacy AGENTIC_RUNTIME_BIN; set TAKKA_RUNTIME_BIN instead"
+        );
     }
 }

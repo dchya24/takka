@@ -22,10 +22,10 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, ColorChoice, Command, ConfigAction};
 use commands::Commands;
-use takka_core::Config;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use takka_core::Config;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Shared cancel flag. The signal handler flips this on the first Ctrl+C;
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
 
         if matches!(
             action,
-            ConfigAction::Init { .. } | ConfigAction::Reset { .. }
+            ConfigAction::Init { .. } | ConfigAction::Reset { .. } | ConfigAction::Migrate { .. }
         ) {
             let fallback_config = Config::fallback();
             let commands = Commands::new(fallback_config)

@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
 use takka_core::runtime::engine::RuntimeEngine;
 use takka_core::runtime::protocol::{
     ConnectionCapabilities, InitOverrides, ProtocolEvent, ProtocolRequest, Request,
     PROTOCOL_VERSION,
 };
 use takka_core::runtime::transport::MemoryTransport;
-use serde::{Deserialize, Serialize};
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc as std_mpsc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -93,15 +93,16 @@ pub fn parse_daemon_info(path: &Path) -> Result<DaemonInfo> {
 
 /// Default discovery location — the same path (and HOME-less fallback)
 /// the runtime broker derives in `takka-runtime/src/main.rs`, so
-/// discovery and auto-spawn agree without configuration.
+/// discovery and auto-spawn agree without configuration. Moved to
+/// `~/.config/takka` during the rebrand, in lockstep with the broker.
 pub fn daemon_info_path() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home)
             .join(".config")
-            .join("agentic")
+            .join("takka")
             .join("daemon.json"),
         None => std::env::temp_dir()
-            .join("agentic-daemon")
+            .join("takka-daemon")
             .join("daemon.json"),
     }
 }
@@ -722,12 +723,18 @@ impl ConnectionIo for AgentConnection {
 }
 
 pub fn runtime_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("TAKKA_RUNTIME_BIN") {
-        return Ok(PathBuf::from(path));
+    let (value, warned) =
+        takka_core::config::resolve_env("TAKKA_RUNTIME_BIN", "AGENTIC_RUNTIME_BIN");
+    if warned {
+        static LEGACY_RUNTIME_BIN_WARNED: std::sync::Once = std::sync::Once::new();
+        LEGACY_RUNTIME_BIN_WARNED.call_once(|| {
+            eprintln!(
+                "{}",
+                takka_core::config::legacy_env_warning("TAKKA_RUNTIME_BIN", "AGENTIC_RUNTIME_BIN")
+            );
+        });
     }
-    // Legacy pre-rename env name is still honored (silently for now; the
-    // deprecation warning lands with the config-path migration task).
-    if let Some(path) = std::env::var_os("AGENTIC_RUNTIME_BIN") {
+    if let Some(path) = value {
         return Ok(PathBuf::from(path));
     }
     let current = std::env::current_exe()?;
@@ -773,7 +780,7 @@ fn spawn_daemon_process(info_path: &Path) -> Result<()> {
     let socket_path = info_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!("agentic-daemon-{}.sock", std::process::id()));
+        .join(format!("takka-daemon-{}.sock", std::process::id()));
     Command::new(&binary)
         .arg("--daemon")
         .arg("--socket-path")
@@ -1147,8 +1154,14 @@ mod in_process_tests {
 }
 
 #[cfg(test)]
-mod daemon_info_tests {
+pub(crate) mod daemon_info_tests {
     use super::*;
+
+    /// Serializes env mutation between the env-compat tests in this
+    /// module and the daemon-smoke fixtures in `commands.rs` (which
+    /// resolve `runtime_binary()` and must not observe a transient
+    /// env value).
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Wire-format pin for the discovery file the daemon broker writes
     /// (`takka-runtime/src/daemon.rs::write_info_file`): snake_case
@@ -1179,6 +1192,8 @@ mod daemon_info_tests {
     /// Default discovery location must agree with the runtime broker's
     /// own default (`daemon_config_dir()` in
     /// `takka-runtime/src/main.rs`), including the HOME-less fallback.
+    /// Both sides moved to `~/.config/takka` in lockstep during the
+    /// rebrand — this pin keeps them honest.
     #[test]
     fn daemon_info_path_matches_broker_default() {
         match std::env::var_os("HOME") {
@@ -1187,7 +1202,7 @@ mod daemon_info_tests {
                     daemon_info_path(),
                     PathBuf::from(home)
                         .join(".config")
-                        .join("agentic")
+                        .join("takka")
                         .join("daemon.json")
                 );
             }
@@ -1195,11 +1210,41 @@ mod daemon_info_tests {
                 assert_eq!(
                     daemon_info_path(),
                     std::env::temp_dir()
-                        .join("agentic-daemon")
+                        .join("takka-daemon")
                         .join("daemon.json")
                 );
             }
         }
+    }
+
+    /// Env-compat shim: `TAKKA_RUNTIME_BIN` is the primary name and
+    /// wins when both are set (the legacy name must never shadow it).
+    #[test]
+    fn runtime_binary_env_prefers_takka_name() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TAKKA_RUNTIME_BIN", "/tmp/takka-runtime-new");
+        std::env::set_var("AGENTIC_RUNTIME_BIN", "/tmp/takka-runtime-legacy");
+        assert_eq!(
+            runtime_binary().unwrap(),
+            PathBuf::from("/tmp/takka-runtime-new")
+        );
+        std::env::remove_var("TAKKA_RUNTIME_BIN");
+        std::env::remove_var("AGENTIC_RUNTIME_BIN");
+    }
+
+    /// The pre-rebrand `AGENTIC_RUNTIME_BIN` name still resolves so
+    /// existing setups keep working until they switch (with a stderr
+    /// warning emitted by `runtime_binary`).
+    #[test]
+    fn runtime_binary_env_falls_back_to_agentic_name() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("TAKKA_RUNTIME_BIN");
+        std::env::set_var("AGENTIC_RUNTIME_BIN", "/tmp/takka-runtime-legacy");
+        assert_eq!(
+            runtime_binary().unwrap(),
+            PathBuf::from("/tmp/takka-runtime-legacy")
+        );
+        std::env::remove_var("AGENTIC_RUNTIME_BIN");
     }
 
     /// Windows-level guard contract, compiled on every host (same

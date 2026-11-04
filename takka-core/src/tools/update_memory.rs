@@ -155,7 +155,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("notes.md");
-        std::env::set_var("AGENTIC_MEMORY_PATH", &target);
+        std::env::set_var("TAKKA_MEMORY_PATH", &target);
 
         let t = UpdateMemoryTool::new();
         let result = t
@@ -166,6 +166,6 @@ mod tests {
         let content = std::fs::read_to_string(&target).unwrap();
         assert!(content.contains("remember this"));
 
-        std::env::remove_var("AGENTIC_MEMORY_PATH");
+        std::env::remove_var("TAKKA_MEMORY_PATH");
     }
 }

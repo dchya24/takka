@@ -33,14 +33,6 @@ pub fn not_supported_error() -> &'static str {
 // ---------------------------------------------------------------------
 
 #[cfg(unix)]
-use takka_core::events::Event;
-#[cfg(unix)]
-use takka_core::runtime::engine::RuntimeEngine;
-#[cfg(unix)]
-use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
-#[cfg(unix)]
-use takka_core::runtime::transport::MemoryTransport;
-#[cfg(unix)]
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -54,6 +46,14 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use takka_core::events::Event;
+#[cfg(unix)]
+use takka_core::runtime::engine::RuntimeEngine;
+#[cfg(unix)]
+use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
+#[cfg(unix)]
+use takka_core::runtime::transport::MemoryTransport;
 
 /// Daemon endpoints, both explicit (the CLI resolves defaults before
 /// calling [`serve`]): the unix socket to listen on and the discovery
@@ -407,12 +407,12 @@ mod windows_guard_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use takka_core::events::Event;
-    use takka_core::runtime::protocol::ProtocolEvent;
     use std::io::{BufRead, BufReader, BufWriter, Write};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+    use takka_core::events::Event;
+    use takka_core::runtime::protocol::ProtocolEvent;
 
     /// Every poll/read in these tests is bounded by this deadline so a
     /// regression can never hang the suite.
@@ -430,7 +430,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "agentic-daemon-test-{}-{}-{}",
+            "takka-daemon-test-{}-{}-{}",
             std::process::id(),
             nanos,
             tag

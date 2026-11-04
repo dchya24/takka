@@ -341,7 +341,7 @@ pub enum ConfigAction {
     /// Create a timestamped backup of the config file
     #[command(long_about = "Create a backup of the current config file.\n\
         \n\
-        Backups are stored in ~/.config/agentic/backups/ with timestamps.")]
+        Backups are stored in ~/.config/takka/backups/ with timestamps.")]
     Backup,
 
     /// Restore configuration from a backup file
@@ -370,6 +370,33 @@ pub enum ConfigAction {
 
     /// Get configuration file path
     Path,
+
+    /// Migrate legacy agentic user data (~/.config/agentic) to takka (~/.config/takka)
+    #[command(
+        long_about = "Move legacy `agentic` user data to the new takka location.\n\
+        \n\
+        Moves config.json, sessions/, and memory.md from\
+         ~/.config/agentic/ to ~/.config/takka/, after an interactive\
+         y/N confirmation.\n\
+        \n\
+        Refuses to run when ~/.config/takka/config.json already exists\
+         (use --force to overwrite). Safe to run twice: with nothing left\
+         at the legacy path it reports there is nothing to migrate.\n\
+        \n\
+        Examples:\n  \
+          takka config migrate              # Confirm, then move\n  \
+          takka config migrate --yes        # Skip the confirmation\n  \
+          takka config migrate --force      # Overwrite an existing new config"
+    )]
+    Migrate {
+        /// Skip the interactive y/N confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Proceed even if ~/.config/takka/config.json already exists
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Reset configuration to defaults
     #[command(long_about = "Reset the configuration file to defaults.\n\

@@ -6,6 +6,16 @@
 #[cfg(test)]
 mod tests;
 
+/// Crate-wide lock for tests that mutate process-global env vars
+/// (`HOME`, `XDG_CONFIG_HOME`, `TAKKA_*`). Env vars are process state,
+/// so any two tests touching them concurrently would race — every
+/// env-sensitive test in this crate must hold this guard.
+#[cfg(test)]
+pub(crate) mod test_env_lock {
+    use std::sync::Mutex;
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+}
+
 pub mod agent;
 pub mod attachments;
 pub mod capabilities;

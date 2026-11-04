@@ -2,11 +2,11 @@
 //! integration tests.
 #![allow(dead_code)]
 
+use std::sync::Mutex;
 use takka_core::providers::{
     ChatChunk, ChatMessageResponse, ChatRequest, ChatResponse, LLMProvider, ProviderError,
     ProviderResult, StreamResult, ToolCallDelta, ToolCallFunction, ToolCallResponse,
 };
-use std::sync::Mutex;
 
 /// Provider that returns scripted `ChatResponse`s in order, one per
 /// `chat()` call. When the queue is empty, returns an error so a
@@ -385,10 +385,7 @@ impl takka_core::tool::Tool for SlowReadTool {
     fn schema(&self) -> takka_core::tool::ToolSchema {
         takka_core::tool::ToolSchema::new(self.name.clone(), "slow read-only test tool")
     }
-    fn execute(
-        &self,
-        _args: serde_json::Value,
-    ) -> takka_core::tool::ToolResult<serde_json::Value> {
+    fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
         std::thread::sleep(self.sleep);
         Ok(serde_json::json!({"ok": true, "name": self.name}))
     }
@@ -429,10 +426,7 @@ impl takka_core::tool::Tool for ConcurrentReadTool {
     fn schema(&self) -> takka_core::tool::ToolSchema {
         takka_core::tool::ToolSchema::new(self.name.clone(), "concurrency test")
     }
-    fn execute(
-        &self,
-        _args: serde_json::Value,
-    ) -> takka_core::tool::ToolResult<serde_json::Value> {
+    fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
         use std::sync::atomic::Ordering;
         let cur = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.max.fetch_max(cur, Ordering::SeqCst);

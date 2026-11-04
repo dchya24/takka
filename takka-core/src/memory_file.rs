@@ -3,8 +3,9 @@
 //! Provides a persistent notes file the agent can read and write across
 //! sessions. Two layers:
 //!
-//! - **User-global memory** at `~/.config/agentic/memory.md`
-//!   (or `$AGENTIC_MEMORY_PATH` if set).
+//! - **User-global memory** at `~/.config/takka/memory.md`
+//!   (or `$TAKKA_MEMORY_PATH`; legacy `$AGENTIC_MEMORY_PATH` and
+//!   `~/.config/agentic/memory.md` still honored until migration).
 //! - **Project-local memory** at `.agentic/memory.md` walking up from cwd.
 //!
 //! Both are loaded into the system prompt at startup. The agent can append
@@ -16,33 +17,73 @@ use std::path::{Path, PathBuf};
 /// Filename used for project-local memory.
 pub const PROJECT_MEMORY_FILE: &str = ".agentic/memory.md";
 
+/// Prefer the rebranded location; keep using the legacy file while it
+/// still exists so pre-`takka config migrate` users never lose notes.
+fn prefer_new_or_legacy(new: PathBuf, legacy: PathBuf) -> PathBuf {
+    if new.exists() || !legacy.exists() {
+        new
+    } else {
+        legacy
+    }
+}
+
 /// Resolve the path to the user-global memory file.
 ///
 /// Order of preference:
-/// 1. `$AGENTIC_MEMORY_PATH` (overrides everything; useful for tests).
-/// 2. `$XDG_CONFIG_HOME/agentic/memory.md`.
-/// 3. `$HOME/.config/agentic/memory.md`.
-/// 4. `./agentic/memory.md` (last-resort fallback).
+/// 1. `$TAKKA_MEMORY_PATH` (legacy `$AGENTIC_MEMORY_PATH` still
+///    honored, with a warning) — overrides everything; useful for tests.
+/// 2. `$XDG_CONFIG_HOME/takka/memory.md`.
+/// 3. `$HOME/.config/takka/memory.md`.
+/// 4. `./takka/memory.md` (last-resort fallback).
+///
+/// Layers 2–3 fall back to the pre-rebrand `agentic` file while it
+/// exists; once both exist the new one wins.
 pub fn user_memory_path() -> PathBuf {
-    if let Ok(p) = std::env::var("AGENTIC_MEMORY_PATH") {
+    if let (Some(p), warned) =
+        crate::config::resolve_env("TAKKA_MEMORY_PATH", "AGENTIC_MEMORY_PATH")
+    {
+        if warned {
+            static LEGACY_MEMORY_ENV_WARNED: std::sync::Once = std::sync::Once::new();
+            LEGACY_MEMORY_ENV_WARNED.call_once(|| {
+                eprintln!(
+                    "{}",
+                    crate::config::legacy_env_warning("TAKKA_MEMORY_PATH", "AGENTIC_MEMORY_PATH")
+                );
+            });
+        }
         return PathBuf::from(p);
     }
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(xdg).join("agentic").join("memory.md");
+        return prefer_new_or_legacy(
+            PathBuf::from(&xdg).join("takka").join("memory.md"),
+            PathBuf::from(xdg).join("agentic").join("memory.md"),
+        );
     }
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("agentic")
-            .join("memory.md");
+        return prefer_new_or_legacy(
+            PathBuf::from(&home)
+                .join(".config")
+                .join("takka")
+                .join("memory.md"),
+            PathBuf::from(&home)
+                .join(".config")
+                .join("agentic")
+                .join("memory.md"),
+        );
     }
     if let Ok(profile) = std::env::var("USERPROFILE") {
-        return PathBuf::from(profile)
-            .join(".config")
-            .join("agentic")
-            .join("memory.md");
+        return prefer_new_or_legacy(
+            PathBuf::from(&profile)
+                .join(".config")
+                .join("takka")
+                .join("memory.md"),
+            PathBuf::from(&profile)
+                .join(".config")
+                .join("agentic")
+                .join("memory.md"),
+        );
     }
-    PathBuf::from("agentic").join("memory.md")
+    PathBuf::from("takka").join("memory.md")
 }
 
 /// Find the project-local memory file by walking up from `cwd`.
@@ -146,11 +187,13 @@ pub fn assemble_memory_section(cwd: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// Tests in this module manipulate process-global env vars
-    /// (`AGENTIC_MEMORY_PATH`, `HOME`, etc), so they must run serially.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// (`TAKKA_MEMORY_PATH`, `HOME`, etc), so they hold the crate-wide
+    /// env lock to stay serialized against other env-sensitive tests.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock::ENV_LOCK.lock().unwrap()
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("memory_file_test_{}", name));
@@ -161,9 +204,20 @@ mod tests {
 
     #[test]
     fn user_memory_path_respects_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let dir = tmp_dir("override");
         let target = dir.join("custom.md");
+        std::env::set_var("TAKKA_MEMORY_PATH", &target);
+        assert_eq!(user_memory_path(), target);
+        std::env::remove_var("TAKKA_MEMORY_PATH");
+    }
+
+    #[test]
+    fn user_memory_path_falls_back_to_legacy_override_var() {
+        let _guard = env_guard();
+        let dir = tmp_dir("legacy_override");
+        let target = dir.join("custom-legacy.md");
+        std::env::remove_var("TAKKA_MEMORY_PATH");
         std::env::set_var("AGENTIC_MEMORY_PATH", &target);
         assert_eq!(user_memory_path(), target);
         std::env::remove_var("AGENTIC_MEMORY_PATH");
@@ -171,10 +225,10 @@ mod tests {
 
     #[test]
     fn append_user_memory_creates_file_and_adds_header() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let dir = tmp_dir("append_user");
         let target = dir.join("notes.md");
-        std::env::set_var("AGENTIC_MEMORY_PATH", &target);
+        std::env::set_var("TAKKA_MEMORY_PATH", &target);
 
         append_user_memory("first note").unwrap();
         append_user_memory("second note").unwrap();
@@ -185,7 +239,50 @@ mod tests {
         // Header lines start with "## " and contain "UTC".
         assert!(content.lines().filter(|l| l.starts_with("## ")).count() >= 2);
 
+        std::env::remove_var("TAKKA_MEMORY_PATH");
+    }
+
+    /// Fresh home: neither dir exists → memory lives at the new
+    /// `~/.config/takka/memory.md` (fresh users never touch the legacy
+    /// path).
+    #[test]
+    fn user_memory_path_prefers_takka_dir() {
+        let _guard = env_guard();
+        let home = tmp_dir("mem_home_new");
+        let new = home.join(".config").join("takka").join("memory.md");
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::env::remove_var("TAKKA_MEMORY_PATH");
         std::env::remove_var("AGENTIC_MEMORY_PATH");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        assert_eq!(user_memory_path(), new);
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// Pre-migration home: only the legacy memory file exists → keep
+    /// reading it so a user who has not run `takka config migrate` yet
+    /// does not silently lose their notes.
+    #[test]
+    fn user_memory_path_falls_back_to_legacy_file() {
+        let _guard = env_guard();
+        let home = tmp_dir("mem_home_legacy");
+        let legacy = home.join(".config").join("agentic").join("memory.md");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "old notes").unwrap();
+        std::env::remove_var("TAKKA_MEMORY_PATH");
+        std::env::remove_var("AGENTIC_MEMORY_PATH");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        assert_eq!(user_memory_path(), legacy);
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
@@ -213,21 +310,21 @@ mod tests {
 
     #[test]
     fn assemble_section_none_when_both_empty() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let dir = tmp_dir("empty");
-        std::env::set_var("AGENTIC_MEMORY_PATH", dir.join("nonexistent.md"));
+        std::env::set_var("TAKKA_MEMORY_PATH", dir.join("nonexistent.md"));
         assert!(assemble_memory_section(&dir).is_none());
-        std::env::remove_var("AGENTIC_MEMORY_PATH");
+        std::env::remove_var("TAKKA_MEMORY_PATH");
     }
 
     #[test]
     fn assemble_section_includes_both_when_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
         let dir = tmp_dir("both");
 
         let user_path = dir.join("user.md");
         fs::write(&user_path, "USER NOTES").unwrap();
-        std::env::set_var("AGENTIC_MEMORY_PATH", &user_path);
+        std::env::set_var("TAKKA_MEMORY_PATH", &user_path);
 
         let project_dir = dir.join("project");
         fs::create_dir_all(project_dir.join(".agentic")).unwrap();
@@ -237,6 +334,6 @@ mod tests {
         assert!(section.contains("USER NOTES"));
         assert!(section.contains("PROJECT NOTES"));
 
-        std::env::remove_var("AGENTIC_MEMORY_PATH");
+        std::env::remove_var("TAKKA_MEMORY_PATH");
     }
 }

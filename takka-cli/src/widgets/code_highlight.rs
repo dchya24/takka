@@ -884,7 +884,7 @@ mod tests {
 
     #[test]
     fn yaml_key_value() {
-        let spans = highlight_line("name: agentic-cli", "yaml");
+        let spans = highlight_line("name: takka-cli", "yaml");
         assert!(classify_words(&spans, "name").contains(&TokenKind::Function));
         assert!(spans.iter().any(|s| s.content.contains(":")));
     }
