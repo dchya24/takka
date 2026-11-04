@@ -11,7 +11,7 @@ fn event_serializes_flat_with_protocol_envelope() {
     let envelope = ProtocolEvent::new(Some("r2".into()), event);
     let value = serde_json::to_value(envelope).unwrap();
 
-    assert_eq!(value["v"], 1);
+    assert_eq!(value["v"], 2);
     assert_eq!(value["requestId"], "r2");
     assert_eq!(value["type"], "tool_started");
     assert_eq!(value["toolCallId"], "c1");
@@ -28,7 +28,7 @@ fn request_serializes_with_id_and_version() {
     );
     let value = serde_json::to_value(request).unwrap();
 
-    assert_eq!(value["v"], 1);
+    assert_eq!(value["v"], 2);
     assert_eq!(value["id"], "r1");
     assert_eq!(value["type"], "run");
     assert_eq!(value["task"], "fix bug");
@@ -36,9 +36,18 @@ fn request_serializes_with_id_and_version() {
 
 #[test]
 fn event_round_trips_from_json_line() {
-    let line = r#"{"v":1,"requestId":"r2","type":"assistant_delta","content":"Searching..."}"#;
+    let line = r#"{"v":2,"requestId":"r2","type":"assistant_delta","content":"Searching..."}"#;
     let event: ProtocolEvent = serde_json::from_str(line).unwrap();
 
     assert_eq!(event.request_id.as_deref(), Some("r2"));
     assert!(matches!(event.event, Event::AssistantDelta { content } if content == "Searching..."));
+}
+
+#[test]
+fn request_without_version_fails_deserialization() {
+    // `v` tidak punya `#[serde(default)]`: frame tanpa versi = gagal
+    // deserialisasi (jalur `protocol_error`), BUKAN silently v1.
+    let err =
+        serde_json::from_str::<ProtocolRequest>(r#"{"id":"x","type":"shutdown"}"#).unwrap_err();
+    assert!(err.to_string().contains("missing field `v`"), "got: {err}");
 }

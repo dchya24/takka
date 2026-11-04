@@ -83,6 +83,43 @@ fn runtime_emits_ready_delta_and_done_without_init() {
         .any(|event| matches!(&event.event, Event::Done { result } if result == "hello")));
 }
 
+/// Handshake gate: engine v2 menolak frame dengan `v` lama SEBELUM
+/// dispatch — pesan harus persis `unsupported protocol version: 1`.
+/// Shutdown v1 tidak boleh diterjemahkan (engine tetap hidup sampai
+/// channel ditutup).
+#[test]
+fn engine_rejects_frame_with_unsupported_protocol_version() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let transport = MemoryTransport::new(request_rx, event_tx);
+    let mut engine = RuntimeEngine::with_session(
+        transport,
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    // Frame v1 (versi wire lama, di-hardcode sebagai test fixture).
+    request_tx
+        .send(ProtocolRequest {
+            v: 1,
+            id: "legacy-1".into(),
+            request: Request::Shutdown,
+        })
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            Event::Error { message } if message == "unsupported protocol version: 1"
+        )),
+        "expected v1 rejection, got {events:?}"
+    );
+}
+
 #[test]
 fn question_request_waits_for_client_response() {
     let provider = support::StreamingScriptedProvider::new(vec![
@@ -596,8 +633,8 @@ mod sink_tests {
         sink.send(
             None,
             Event::Ready {
-                protocol: "agentic".into(),
-                version: 1,
+                protocol: "takka".into(),
+                version: 2,
             },
         );
 

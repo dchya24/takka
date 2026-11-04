@@ -185,8 +185,8 @@ mod unix_socket_tests {
                 .write_event(&ProtocolEvent::new(
                     None,
                     Event::Ready {
-                        protocol: "agentic".into(),
-                        version: 1,
+                        protocol: "takka".into(),
+                        version: 2,
                     },
                 ))
                 .unwrap();

@@ -619,7 +619,7 @@ mod tests {
 
     fn init_frame(id: &str, token: &str, config_path: &str) -> serde_json::Value {
         serde_json::json!({
-            "v": 1,
+            "v": 2,
             "id": id,
             "type": "init",
             "overrides": { "configPath": config_path },
@@ -628,15 +628,15 @@ mod tests {
     }
 
     fn run_frame(id: &str, task: &str) -> serde_json::Value {
-        serde_json::json!({ "v": 1, "id": id, "type": "run", "task": task })
+        serde_json::json!({ "v": 2, "id": id, "type": "run", "task": task })
     }
 
     fn shutdown_frame(id: &str) -> serde_json::Value {
-        serde_json::json!({ "v": 1, "id": id, "type": "shutdown" })
+        serde_json::json!({ "v": 2, "id": id, "type": "shutdown" })
     }
 
     fn list_tools_frame(id: &str) -> serde_json::Value {
-        serde_json::json!({ "v": 1, "id": id, "type": "list_tools" })
+        serde_json::json!({ "v": 2, "id": id, "type": "list_tools" })
     }
 
     fn spawn_daemon(

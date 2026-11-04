@@ -9,6 +9,11 @@
 //! penghapusan, atau perubahan semantik = bump versi. Frontend non-Rust
 //! memakai kontrak ini mentah-mentah — jangan menambah field "sementara".
 //!
+//! Riwayat versi:
+//! - v1: `PROTOCOL_NAME = "agentic"`.
+//! - v2: rebrand ke `PROTOCOL_NAME = "takka"` (wire-breaking; engine
+//!   menolak frame v1 dengan `unsupported protocol version`).
+//!
 //! # Internal
 //!
 //! Detail di luar kontrak wire (mis. helper dan modul #[cfg(test)]) tidak boleh
@@ -21,8 +26,8 @@ use crate::events::Event;
 use crate::safety::PermissionMode;
 use crate::tools::QuestionAnswer;
 
-pub const PROTOCOL_NAME: &str = "agentic";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_NAME: &str = "takka";
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolEvent {
@@ -199,7 +204,7 @@ mod tests {
     #[test]
     fn init_request_without_capabilities_field_defaults() {
         // Frame gaya lama (mis. protocol-demo.js): tidak membawa capabilities.
-        let frame = r#"{"v":1,"id":"i1","type":"init"}"#;
+        let frame = r#"{"v":2,"id":"i1","type":"init"}"#;
         let req: ProtocolRequest = serde_json::from_str(frame).unwrap();
         match req.request {
             Request::Init { capabilities, .. } => {
@@ -213,7 +218,7 @@ mod tests {
 
     #[test]
     fn init_request_with_capabilities_deserializes() {
-        let frame = r#"{"v":1,"id":"i2","type":"init","capabilities":{"experimentalApi":true,"optOutNotify":["thinking","todo_changed"]}}"#;
+        let frame = r#"{"v":2,"id":"i2","type":"init","capabilities":{"experimentalApi":true,"optOutNotify":["thinking","todo_changed"]}}"#;
         let req: ProtocolRequest = serde_json::from_str(frame).unwrap();
         match req.request {
             Request::Init { capabilities, .. } => {
@@ -232,13 +237,13 @@ mod tests {
     #[test]
     fn unknown_notification_name_fails_frame_deserialization() {
         // Allowlist tertutup: nama di luar enum tidak bisa lewat jalur wire.
-        let frame = r#"{"v":1,"id":"i3","type":"init","capabilities":{"experimentalApi":false,"optOutNotify":["done"]}}"#;
+        let frame = r#"{"v":2,"id":"i3","type":"init","capabilities":{"experimentalApi":false,"optOutNotify":["done"]}}"#;
         assert!(serde_json::from_str::<ProtocolRequest>(frame).is_err());
     }
 
     #[test]
     fn init_carries_daemon_token_and_defaults_absent() {
-        let frame = r#"{"v":1,"id":"i","type":"init","daemonToken":"tok-1"}"#;
+        let frame = r#"{"v":2,"id":"i","type":"init","daemonToken":"tok-1"}"#;
         let req: ProtocolRequest = serde_json::from_str(frame).unwrap();
         match req.request {
             Request::Init { daemon_token, .. } => {
