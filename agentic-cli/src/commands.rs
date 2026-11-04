@@ -503,6 +503,10 @@ pub struct Commands {
     connection: Option<crate::client::AgentConnection>,
     runtime_config_path: Option<String>,
     runtime_mode: crate::client::RuntimeMode,
+    /// Explicit daemon discovery file for `attach_daemon` (default:
+    /// [`crate::client::daemon_info_path`]). Test seam for hermetic e2e
+    /// smokes; production builds leave it `None`.
+    daemon_info_path_override: Option<std::path::PathBuf>,
     color_enabled: bool,
     debug_enabled: bool,
     permission_mode: core_agentic::PermissionMode,
@@ -561,6 +565,7 @@ impl Commands {
             connection: None,
             runtime_config_path: None,
             runtime_mode: crate::client::RuntimeMode::Embedded,
+            daemon_info_path_override: None,
             color_enabled: true,
             debug_enabled: false,
             permission_mode: core_agentic::PermissionMode::Default,
@@ -588,6 +593,72 @@ impl Commands {
     pub fn with_runtime_mode(mut self, mode: crate::client::RuntimeMode) -> Self {
         self.runtime_mode = mode;
         self
+    }
+
+    /// Point `attach_daemon` at an explicit discovery file (test seam for
+    /// hermetic daemon smokes).
+    #[cfg(test)]
+    pub(crate) fn with_daemon_info_path(mut self, path: std::path::PathBuf) -> Self {
+        self.daemon_info_path_override = Some(path);
+        self
+    }
+
+    /// `agentic attach` (Fase 3a): with `--shutdown`, ask the running
+    /// daemon to stop (no session handshake — see
+    /// [`crate::client::shutdown_daemon_at`]); otherwise connect to the
+    /// already-running daemon (never auto-spawn — an attach that starts
+    /// its own daemon would be a run in disguise) and keep the
+    /// connection for the regular REPL (main.rs calls `interactive::run`
+    /// with this same `Commands`, and `ensure_connection` reuses the
+    /// established connection).
+    pub async fn attach_daemon(&mut self, shutdown: bool) -> Result<()> {
+        if shutdown {
+            #[cfg(unix)]
+            {
+                let info_path = self
+                    .daemon_info_path_override
+                    .clone()
+                    .unwrap_or_else(crate::client::daemon_info_path);
+                crate::client::shutdown_daemon_at(&info_path).await?;
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(anyhow::anyhow!(crate::client::DAEMON_NOT_SUPPORTED_MESSAGE));
+            }
+            inline::print_blank();
+            inline::print_line(&components::success_badge("Daemon shutdown requested."));
+            inline::print_blank();
+            return Ok(());
+        }
+        if self.connection.is_some() {
+            return Ok(()); // already attached
+        }
+        let overrides = core_agentic::runtime::protocol::InitOverrides {
+            config_path: self.runtime_config_path.clone(),
+            permission_mode: Some(self.permission_mode),
+            model: self.config.active_model().map(|model| model.model.clone()),
+            system_prompt: self.config.system_prompt.clone(),
+        };
+        self.connection = Some(match &self.daemon_info_path_override {
+            Some(path) => {
+                crate::client::AgentConnection::connect_daemon_at(
+                    path,
+                    overrides,
+                    crate::client::CLI_CAPABILITIES,
+                    false,
+                )
+                .await?
+            }
+            None => {
+                crate::client::AgentConnection::connect_daemon(
+                    overrides,
+                    crate::client::CLI_CAPABILITIES,
+                    false,
+                )
+                .await?
+            }
+        });
+        Ok(())
     }
 
     async fn ensure_connection(&mut self) -> Result<()> {
@@ -3850,6 +3921,466 @@ mod e2e_tests {
     #[tokio::test]
     async fn smoke_interrupt_mode_does_not_queue_spawned() {
         smoke_interrupt_mode_does_not_queue(RuntimeMode::Spawn).await;
+    }
+}
+
+// ── Daemon-mode e2e smoke (Fase 3a, unix only) ───────────
+//
+// The daemon mode of the `--runtime` matrix gets dedicated
+// AgentConnection-level smokes instead of extending the Commands-level
+// mode matrix: the broker's discovery file lives at a process-default
+// path, and a Commands-driven smoke would either touch the developer's
+// real ~/.config/agentic or need a process-global HOME override (racy
+// under parallel cargo test). `AgentConnection::connect_daemon_at` is
+// the same discovery + spawn + token-handshake path the mode flag and
+// `attach` use, pointed at a tempdir fixture.
+#[cfg(all(test, unix))]
+mod daemon_smoke_tests {
+    use super::*;
+    use crate::client::{AgentConnection, CLI_CAPABILITIES};
+    use core_agentic::runtime::protocol::InitOverrides;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// Bound for every poll so a regression can never hang the suite.
+    const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Hermetic provider config (same shape as `hermetic_runtime_config`):
+    /// `127.0.0.1:9` fails fast and never leaves the machine.
+    const HERMETIC_CONFIG: &str = r#"{
+  "providers": [
+    {
+      "name": "hermetic-test",
+      "type": "openai-compatible",
+      "api_base": "http://127.0.0.1:9",
+      "api_key": "unused",
+      "models": [
+        { "model": "hermetic-model", "temperature": 0.0, "max_tokens": 64 }
+      ]
+    }
+  ]
+}"#;
+
+    struct DaemonFixture {
+        dir: PathBuf,
+        info_path: PathBuf,
+        socket_path: PathBuf,
+        config_path: PathBuf,
+        child: tokio::process::Child,
+    }
+
+    impl DaemonFixture {
+        /// Spawn the real `agentic-runtime --daemon` binary with explicit
+        /// endpoints under a fresh tempdir. The info file is written after
+        /// bind, so its existence means the listener is ready.
+        async fn spawn(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "agentic-cli-daemon-{}-{}-{}",
+                std::process::id(),
+                nanos,
+                tag
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let config_path = dir.join("config.json");
+            std::fs::write(&config_path, HERMETIC_CONFIG).unwrap();
+            let socket_path = dir.join("test.sock");
+            let info_path = dir.join("daemon.json");
+            let binary = crate::client::runtime_binary().expect("runtime binary for daemon smoke");
+            let child = tokio::process::Command::new(&binary)
+                .arg("--daemon")
+                .arg("--socket-path")
+                .arg(&socket_path)
+                .arg("--info-path")
+                .arg(&info_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true) // a panicking test must not leak the daemon
+                .spawn()
+                .expect("spawn agentic-runtime --daemon");
+            let deadline = Instant::now() + POLL_TIMEOUT;
+            while !info_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon info file did not appear within 10s"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Self {
+                dir,
+                info_path,
+                socket_path,
+                config_path,
+                child,
+            }
+        }
+
+        /// Init overrides pinning the spawned engine to the fixture's
+        /// hermetic provider (the engine reads config from the Init
+        /// frame, not from the ambient ~/.config).
+        fn init_overrides(&self) -> InitOverrides {
+            InitOverrides {
+                config_path: Some(self.config_path.to_string_lossy().into_owned()),
+                permission_mode: Some(core_agentic::PermissionMode::Yolo),
+                model: None,
+                system_prompt: None,
+            }
+        }
+
+        async fn connect(&self) -> AgentConnection {
+            AgentConnection::connect_daemon_at(
+                &self.info_path,
+                self.init_overrides(),
+                CLI_CAPABILITIES,
+                false,
+            )
+            .await
+            .expect("daemon attach failed")
+        }
+
+        /// Wait until the broker exited cleanly and unlinked its
+        /// endpoints (serve's shutdown cleanup).
+        async fn wait_clean_exit(&mut self) {
+            let status = tokio::time::timeout(POLL_TIMEOUT, self.child.wait())
+                .await
+                .expect("daemon did not exit within 10s after shutdown")
+                .expect("daemon wait failed");
+            assert_eq!(status.code(), Some(0), "daemon exited with {status}");
+            let deadline = Instant::now() + POLL_TIMEOUT;
+            while self.socket_path.exists() || self.info_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon endpoints were not unlinked within 10s"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for DaemonFixture {
+        fn drop(&mut self) {
+            // kill_on_drop(true) reaps the daemon (no-op after a clean
+            // exit); files are best-effort so a panicking test never
+            // leaks a tempdir.
+            let _ = std::fs::remove_file(&self.socket_path);
+            let _ = std::fs::remove_file(&self.info_path);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Full lifecycle: spawn daemon → discovery + token handshake →
+    /// run (frontend-issued) → SessionStarted + terminal event →
+    /// shutdown stops the broker and unlinks socket + info files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_lifecycle_smoke() {
+        let mut fx = DaemonFixture::spawn("lifecycle").await;
+        let mut conn = fx.connect().await;
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            conn.run(
+                "list files".to_string(),
+                Vec::new(),
+                |_| {},
+                move |evt| captured.lock().unwrap().push(format!("{evt:?}")),
+                |_| None,
+            ),
+        )
+        .await
+        .expect("daemon run hung: no terminal event within 60s");
+
+        // The pinned unreachable provider makes the session fail
+        // deterministically; only the streamed lifecycle is asserted
+        // (terminal value is Done-or-Error by design).
+        let _ = result;
+        let all = events.lock().unwrap().join(" ");
+        assert!(
+            all.contains("SessionStarted"),
+            "expected SessionStarted over the daemon socket, got: {all}"
+        );
+        assert!(
+            all.contains("SessionFailed"),
+            "expected SessionFailed after provider failure, got: {all}"
+        );
+
+        conn.shutdown().await.expect("daemon shutdown");
+        fx.wait_clean_exit().await;
+    }
+
+    /// While connection A is active, a second attach is refused with the
+    /// exact `"daemon in use"` error (surfaced through the shared
+    /// handshake), and A keeps working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_use_refusal_smoke() {
+        let mut fx = DaemonFixture::spawn("refusal").await;
+        let mut a = fx.connect().await;
+
+        let refused = AgentConnection::connect_daemon_at(
+            &fx.info_path,
+            fx.init_overrides(),
+            CLI_CAPABILITIES,
+            false,
+        )
+        .await;
+        match refused {
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("daemon in use"),
+                    "expected daemon-in-use refusal, got: {error}"
+                );
+            }
+            Ok(_) => panic!("second attach must be refused while A is active"),
+        }
+
+        // A is unaffected by B's refused attach.
+        let event = a
+            .send_and_wait(core_agentic::runtime::protocol::Request::ListTools)
+            .await
+            .expect("ListTools on the active connection");
+        assert!(
+            matches!(event.event, core_agentic::Event::ToolList { .. }),
+            "expected ToolList on A, got {:?}",
+            event.event
+        );
+
+        a.shutdown().await.expect("daemon shutdown");
+        fx.wait_clean_exit().await;
+    }
+
+    /// A attaches, detaches; B reattaches and the engine adopts the live
+    /// session: handshake InitOk followed by SessionAdopted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adopt_smoke() {
+        let mut fx = DaemonFixture::spawn("adopt").await;
+        let a = fx.connect().await;
+        drop(a); // detach — the broker's engine keeps running
+
+        // If A's reader thread has not noticed the EOF yet, the broker
+        // still holds the slot and refuses B — poll until adoption.
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        let mut b = loop {
+            match AgentConnection::connect_daemon_at(
+                &fx.info_path,
+                fx.init_overrides(),
+                CLI_CAPABILITIES,
+                false,
+            )
+            .await
+            {
+                Err(error) if error.to_string().contains("daemon in use") => {
+                    assert!(Instant::now() < deadline, "reattach window expired");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                other => break other.expect("reattach failed"),
+            }
+        };
+
+        // Handshake consumed InitOk (cli-1); the adoption replay is the
+        // very next frame, tagged with the same request id.
+        let event = tokio::time::timeout(POLL_TIMEOUT, b.next_event())
+            .await
+            .expect("timed out waiting for SessionAdopted")
+            .expect("event stream closed after reattach");
+        assert_eq!(event.request_id.as_deref(), Some("cli-1"));
+        assert!(
+            matches!(event.event, core_agentic::Event::SessionAdopted { .. }),
+            "expected SessionAdopted, got {:?}",
+            event.event
+        );
+
+        b.shutdown().await.expect("daemon shutdown");
+        fx.wait_clean_exit().await;
+    }
+
+    /// Auto-spawn: with no info file at all, connect_daemon_at launches
+    /// the runtime binary itself, discovers it, handshakes, and a
+    /// shutdown tears the daemon down (endpoints unlinked).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn autospawn_smoke() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "agentic-cli-autospawn-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        std::fs::write(&config_path, HERMETIC_CONFIG).unwrap();
+        let info_path = dir.join("daemon.json");
+
+        let mut conn = AgentConnection::connect_daemon_at(
+            &info_path,
+            InitOverrides {
+                config_path: Some(config_path.to_string_lossy().into_owned()),
+                permission_mode: Some(core_agentic::PermissionMode::Yolo),
+                model: None,
+                system_prompt: None,
+            },
+            CLI_CAPABILITIES,
+            true,
+        )
+        .await
+        .expect("auto-spawn + connect failed");
+
+        // Sanity: the spawned broker's engine answers on the wire.
+        let event = tokio::time::timeout(
+            Duration::from_secs(30),
+            conn.send_and_wait(core_agentic::runtime::protocol::Request::ListTools),
+        )
+        .await
+        .expect("ListTools timed out")
+        .expect("ListTools failed");
+        assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
+
+        conn.shutdown().await.expect("daemon shutdown");
+        // The spawned daemon is detached (not our child); its clean-exit
+        // signal is the endpoint cleanup.
+        let deadline = Instant::now() + POLL_TIMEOUT;
+        while info_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "auto-spawned daemon did not exit within 10s after shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Attach without a running daemon (`spawn_if_missing=false`) fails
+    /// with the exact actionable message.
+    #[tokio::test]
+    async fn attach_without_daemon_is_actionable() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentic-cli-nodaemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let info_path = dir.join("daemon.json");
+
+        let error = match AgentConnection::connect_daemon_at(
+            &info_path,
+            InitOverrides::default(),
+            CLI_CAPABILITIES,
+            false,
+        )
+        .await
+        {
+            Ok(_) => panic!("attach without daemon must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), crate::client::NO_DAEMON_MESSAGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Commands-level composition of `agentic attach --shutdown` against
+    /// a fixture daemon: connect (no auto-spawn) → fire-and-forget
+    /// shutdown → the broker exits and unlinks its endpoints.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commands_attach_shutdown_stops_daemon() {
+        let mut fx = DaemonFixture::spawn("attach-shutdown").await;
+        let mut commands = Commands::new(Config::fallback())
+            .with_daemon_info_path(fx.info_path.clone())
+            .with_runtime_config_path(Some(fx.config_path.to_string_lossy().into_owned()))
+            .with_permission_mode(core_agentic::PermissionMode::Yolo);
+
+        tokio::time::timeout(POLL_TIMEOUT, commands.attach_daemon(true))
+            .await
+            .expect("attach --shutdown hung")
+            .expect("attach --shutdown failed");
+        // Fire-and-forget: wait for the broker to exit and clean up,
+        // then attach must fail with the exact actionable message.
+        fx.wait_clean_exit().await;
+        let error = tokio::time::timeout(POLL_TIMEOUT, commands.attach_daemon(false))
+            .await
+            .expect("attach hung")
+            .expect_err("attach after shutdown must fail");
+        assert_eq!(error.to_string(), crate::client::NO_DAEMON_MESSAGE);
+    }
+
+    /// Shutdown delivery survives the slot race: A detaches and the
+    /// shutdown fires immediately — if the broker's reader has not
+    /// processed A's EOF yet, the request is refused ("daemon in use")
+    /// and must be retried, not silently lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_retries_through_busy_slot() {
+        let mut fx = DaemonFixture::spawn("shutdown-retry").await;
+        let a = fx.connect().await;
+        drop(a); // EOF races our shutdown attempt below
+
+        let mut commands =
+            Commands::new(Config::fallback()).with_daemon_info_path(fx.info_path.clone());
+        tokio::time::timeout(POLL_TIMEOUT, commands.attach_daemon(true))
+            .await
+            .expect("attach --shutdown hung")
+            .expect("shutdown through busy slot failed");
+        fx.wait_clean_exit().await;
+    }
+
+    /// A shutdown while another client HOLDS the connection is refused
+    /// until the retry deadline, then surfaces a busy error (the active
+    /// client is never touched).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_busy_daemon_errors_after_deadline() {
+        let mut fx = DaemonFixture::spawn("shutdown-busy").await;
+        let mut a = fx.connect().await; // stays attached
+
+        let mut commands =
+            Commands::new(Config::fallback()).with_daemon_info_path(fx.info_path.clone());
+        let error = tokio::time::timeout(POLL_TIMEOUT, commands.attach_daemon(true))
+            .await
+            .expect("attach --shutdown hung")
+            .expect_err("shutdown of a busy daemon must fail after the deadline");
+        assert!(
+            error.to_string().contains("daemon busy"),
+            "expected busy error, got: {error}"
+        );
+
+        // The active client is unaffected by the refused shutdown.
+        let event = a
+            .send_and_wait(core_agentic::runtime::protocol::Request::ListTools)
+            .await
+            .expect("ListTools on the active connection");
+        assert!(matches!(event.event, core_agentic::Event::ToolList { .. }));
+
+        a.shutdown().await.expect("daemon shutdown");
+        fx.wait_clean_exit().await;
+    }
+
+    /// Commands-level no-daemon path: attach without a running daemon
+    /// surfaces the actionable message (never spawns).
+    #[tokio::test]
+    async fn commands_attach_without_daemon_errors_actionable() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentic-cli-cmd-nodaemon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let info_path = dir.join("daemon.json");
+
+        let mut commands = Commands::new(Config::fallback()).with_daemon_info_path(info_path);
+        let error = tokio::time::timeout(POLL_TIMEOUT, commands.attach_daemon(false))
+            .await
+            .expect("attach hung")
+            .expect_err("attach without daemon must fail");
+        assert_eq!(error.to_string(), crate::client::NO_DAEMON_MESSAGE);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

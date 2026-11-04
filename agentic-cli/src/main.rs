@@ -271,6 +271,18 @@ async fn main() -> Result<()> {
             commands = commands.with_interactive_mode(true);
             interactive::run(commands).await?;
         }
+        Some(Command::Attach { shutdown }) => {
+            if *shutdown {
+                commands.attach_daemon(true).await?;
+            } else {
+                // Attach reuses the regular REPL over the daemon
+                // connection (attach_daemon establishes it up front so
+                // the REPL's ensure_connection never spawns anything).
+                commands = commands.with_interactive_mode(true);
+                commands.attach_daemon(false).await?;
+                interactive::run(commands).await?;
+            }
+        }
         Some(Command::Tui) => {
             commands = commands.with_interactive_mode(true);
             tui::run_tui(std::sync::Arc::new(tokio::sync::Mutex::new(commands))).await?;

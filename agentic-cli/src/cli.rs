@@ -69,6 +69,8 @@ pub struct Cli {
     ///   agentic-runtime binary needed)
     /// - spawn:    spawn the agentic-runtime daemon subprocess (JSONL over
     ///   stdio; honors AGENTIC_RUNTIME_BIN)
+    /// - daemon:   attach to a running `agentic-runtime --daemon` broker
+    ///   over its unix socket; auto-spawns one when none is running
     #[arg(long, global = true, value_name = "MODE", default_value = "embedded")]
     pub runtime: RuntimeModeArg,
 
@@ -122,6 +124,9 @@ pub enum RuntimeModeArg {
     Embedded,
     /// Spawn the agentic-runtime daemon subprocess
     Spawn,
+    /// Attach to a running agentic-runtime --daemon broker (unix socket;
+    /// auto-spawns one when none is running)
+    Daemon,
 }
 
 impl From<RuntimeModeArg> for crate::client::RuntimeMode {
@@ -129,6 +134,7 @@ impl From<RuntimeModeArg> for crate::client::RuntimeMode {
         match arg {
             RuntimeModeArg::Embedded => crate::client::RuntimeMode::Embedded,
             RuntimeModeArg::Spawn => crate::client::RuntimeMode::Spawn,
+            RuntimeModeArg::Daemon => crate::client::RuntimeMode::Daemon,
         }
     }
 }
@@ -196,6 +202,24 @@ pub enum Command {
         \n\
         Keybindings: /help, Ctrl+C to cancel, Ctrl+D to quit")]
     Tui,
+
+    /// Attach to a running agentic daemon (Fase 3a)
+    #[command(long_about = "Attach this CLI to an already-running agentic daemon\n\
+        (agentic-runtime --daemon) over its unix socket.\n\
+        \n\
+        Without --shutdown this drops into the regular interactive REPL,\n\
+        routed through the daemon's engine — the daemon keeps the session\n\
+        alive across attach/detach cycles, so a detached run survives and\n\
+        reattaching adopts it.\n\
+        \n\
+        Examples:\n  \
+          agentic attach                # Attach to the running daemon\n  \
+          agentic attach --shutdown     # Ask the daemon to shut down")]
+    Attach {
+        /// Ask the daemon to shut down instead of attaching
+        #[arg(long)]
+        shutdown: bool,
+    },
 
     /// Show current status (provider, model, connection)
     #[command(long_about = "Show current agent status.\n\

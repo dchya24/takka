@@ -5,12 +5,42 @@ use core_agentic::runtime::protocol::{
     PROTOCOL_VERSION,
 };
 use core_agentic::runtime::transport::MemoryTransport;
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc as tokio_mpsc;
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+/// Single clearinghouse message for the unsupported-platform guard of
+/// [`AgentConnection::connect_daemon`] (Windows: named pipes are a
+/// documented TODO). Kept platform-unconditional so the guard branch
+/// and its test compile — and run — on every CI host (same pattern as
+/// `agentic-runtime`'s `not_supported_error`).
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) const DAEMON_NOT_SUPPORTED_MESSAGE: &str =
+    "daemon mode not supported on Windows yet — use --runtime embedded|spawn";
+
+/// Actionable error when discovery finds no usable daemon and spawning
+/// is not allowed (the `attach` path). Asserted verbatim by a unit test.
+pub(crate) const NO_DAEMON_MESSAGE: &str =
+    "no daemon running — start it with 'agentic-runtime --daemon' or use --runtime embedded";
+
+/// Upper bound for waiting until a freshly spawned daemon publishes its
+/// discovery file (the broker writes it after bind, so its existence
+/// means the listener is ready).
+#[cfg(unix)]
+const DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound for the shutdown retry loop against a busy broker (the
+/// previous connection's slot clears within milliseconds of its EOF;
+/// the bound only covers pathological cases).
+#[cfg(unix)]
+const DAEMON_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Transport-agnostic IO surface shared by both connection modes, so the
 /// handshake and the run loop exist in exactly one place (codex lesson:
@@ -27,21 +57,79 @@ pub const CLI_CAPABILITIES: ConnectionCapabilities = ConnectionCapabilities {
     opt_out_notify: Vec::new(),
 };
 
-/// Identical handshake for both modes: wait `Ready`, send `Init`, wait
-/// `InitOk` (or an `Error` explaining why initialization failed).
+/// Discovery record the daemon broker publishes next to its socket
+/// (`daemon.json`). Field names are pinned to the broker's writer
+/// (`agentic-runtime/src/daemon.rs::write_info_file`): snake_case keys,
+/// no serde renaming — a silent mismatch here would break `RuntimeMode
+/// ::Daemon` discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    /// Broker process id (liveness guard bookkeeping; the authoritative
+    /// staleness signal is the socket connect result).
+    pub pid: u32,
+    /// Unix socket the broker listens on.
+    pub socket_path: String,
+    /// Shared secret required by the engine's Init gate.
+    pub token: String,
+    /// Runtime version that wrote the file (informational).
+    pub version: String,
+}
+
+/// Parse a [`DaemonInfo`] from raw JSON (the exact schema the broker
+/// writes). Exposed for tests pinning the wire format.
+pub(crate) fn parse_daemon_info_str(json: &str) -> Result<DaemonInfo> {
+    serde_json::from_str(json).context("invalid daemon info json")
+}
+
+/// Read + parse the discovery file at `path`. Fails on missing, unread
+/// -able, or corrupt files — callers treat any error as "no usable info
+/// file".
+pub fn parse_daemon_info(path: &Path) -> Result<DaemonInfo> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read daemon info {}", path.display()))?;
+    parse_daemon_info_str(&content)
+        .with_context(|| format!("invalid daemon info in {}", path.display()))
+}
+
+/// Default discovery location — the same path (and HOME-less fallback)
+/// the runtime broker derives in `agentic-runtime/src/main.rs`, so
+/// discovery and auto-spawn agree without configuration.
+pub fn daemon_info_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home)
+            .join(".config")
+            .join("agentic")
+            .join("daemon.json"),
+        None => std::env::temp_dir()
+            .join("agentic-daemon")
+            .join("daemon.json"),
+    }
+}
+
+/// Identical handshake for every mode: send `Init`, wait `InitOk` (or an
+/// `Error` explaining why initialization failed). Stdio/in-process
+/// engines announce `Ready` before the first request, so those callers
+/// (`daemon_token: None`) wait for it first; the daemon broker never
+/// replays the engine's startup `Ready` (it is emitted before any client
+/// attaches and the broker's drain loop discards detached events), so
+/// daemon callers (`daemon_token: Some(..)`) go straight to `Init` with
+/// the discovery file's shared secret.
 pub(crate) async fn perform_handshake(
     io: &mut impl ConnectionIo,
     overrides: InitOverrides,
     caps: ConnectionCapabilities,
+    daemon_token: Option<String>,
 ) -> Result<()> {
-    let ready = io.raw_next_event().await?;
-    if !matches!(ready.event, core_agentic::Event::Ready { .. }) {
-        return Err(anyhow!("runtime did not emit ready"));
+    if daemon_token.is_none() {
+        let ready = io.raw_next_event().await?;
+        if !matches!(ready.event, core_agentic::Event::Ready { .. }) {
+            return Err(anyhow!("runtime did not emit ready"));
+        }
     }
     io.raw_send(Request::Init {
         overrides,
         capabilities: caps,
-        daemon_token: None,
+        daemon_token,
     })
     .await?;
     let initialized = io.raw_next_event().await?;
@@ -137,7 +225,7 @@ impl RuntimeClient {
             lines: BufReader::new(stdout).lines(),
             sequence: 0,
         };
-        perform_handshake(&mut client, overrides, caps).await?;
+        perform_handshake(&mut client, overrides, caps, None).await?;
         Ok(client)
     }
 
@@ -292,7 +380,7 @@ impl InProcessClient {
             engine_thread: Some(engine_thread),
             sequence: 0,
         };
-        perform_handshake(&mut client, overrides, caps).await?;
+        perform_handshake(&mut client, overrides, caps, None).await?;
         Ok(client)
     }
 
@@ -357,6 +445,85 @@ impl ConnectionIo for InProcessClient {
     }
 }
 
+/// Async-native unix-socket connection to the daemon broker (Fase 3a).
+/// Same line framing and protocol-version check as the spawned-mode
+/// stdio client, but over the split halves of a `tokio::net::UnixStream`
+/// (the broker's one-JSON-per-line framing, see its `write_frame` /
+/// `pump_requests`).
+#[cfg(unix)]
+pub struct DaemonConnection {
+    lines: Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+    sequence: u64,
+}
+
+#[cfg(unix)]
+impl DaemonConnection {
+    /// Wrap an already-connected socket. Handshake is done by the caller
+    /// (so [`AgentConnection::connect_daemon_at`] can reuse its
+    /// liveness-probe stream instead of reconnecting).
+    fn from_stream(stream: UnixStream) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        Self {
+            lines: BufReader::new(read_half).lines(),
+            writer: write_half,
+            sequence: 0,
+        }
+    }
+
+    pub async fn send(&mut self, request: Request) -> Result<String> {
+        self.sequence += 1;
+        let id = format!("cli-{}", self.sequence);
+        let envelope = ProtocolRequest::new(id.clone(), request);
+        let mut bytes = serde_json::to_vec(&envelope)?;
+        bytes.push(b'\n');
+        self.writer.write_all(&bytes).await?;
+        self.writer.flush().await?;
+        Ok(id)
+    }
+
+    pub async fn next_event(&mut self) -> Result<ProtocolEvent> {
+        let line = self
+            .lines
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow!("daemon closed the connection"))?;
+        let event: ProtocolEvent = serde_json::from_str(&line)
+            .with_context(|| format!("invalid runtime event: {line}"))?;
+        if event.v != PROTOCOL_VERSION {
+            return Err(anyhow!("unsupported runtime protocol version: {}", event.v));
+        }
+        Ok(event)
+    }
+
+    pub async fn send_and_wait(&mut self, request: Request) -> Result<ProtocolEvent> {
+        send_and_wait_io(self, request).await
+    }
+
+    /// Ask the broker's engine to shut down, then close our end. The
+    /// engine breaks its dispatch loop without acking Shutdown (see
+    /// `RuntimeEngine::run`'s `Request::Shutdown => break`), so this is
+    /// deliberately fire-and-forget — waiting for a reply would hang
+    /// forever. The broker notices EOF and its `serve` cleanup unlinks
+    /// the socket + info files.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        let _ = self.send(Request::Shutdown).await?;
+        self.writer.shutdown().await?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl ConnectionIo for DaemonConnection {
+    fn raw_send(&mut self, request: Request) -> impl Future<Output = Result<String>> + Send {
+        self.send(request)
+    }
+
+    fn raw_next_event(&mut self) -> impl Future<Output = Result<ProtocolEvent>> + Send {
+        self.next_event()
+    }
+}
+
 /// Which connection mode the CLI uses to reach the agent engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RuntimeMode {
@@ -366,6 +533,10 @@ pub enum RuntimeMode {
     Embedded,
     /// Spawn the `agentic-runtime` daemon subprocess (JSONL over stdio).
     Spawn,
+    /// Attach to an external `agentic-runtime --daemon` broker over its
+    /// unix socket (discovery via `daemon.json`, auto-spawn on miss).
+    /// Unix only — other hosts get [`DAEMON_NOT_SUPPORTED_MESSAGE`].
+    Daemon,
 }
 
 /// One connection abstraction over both transports (codex's
@@ -374,6 +545,11 @@ pub enum RuntimeMode {
 pub enum AgentConnection {
     Spawned(Box<RuntimeClient>),
     InProcess(InProcessClient),
+    /// Attached to the external daemon broker over its unix socket
+    /// (unix only; Windows named pipes are a documented TODO —
+    /// [`AgentConnection::connect_daemon`] guards that path).
+    #[cfg(unix)]
+    Daemon(DaemonConnection),
 }
 
 impl AgentConnection {
@@ -389,13 +565,100 @@ impl AgentConnection {
             RuntimeMode::Spawn => Ok(Self::Spawned(Box::new(
                 RuntimeClient::spawn(overrides, caps).await?,
             ))),
+            // Auto-spawn is the default for the mode flag: `--runtime
+            // daemon` on a machine without a live daemon should just work.
+            RuntimeMode::Daemon => Self::connect_daemon(overrides, caps, true).await,
         }
+    }
+
+    /// Attach to the external daemon broker ([`RuntimeMode::Daemon`] and
+    /// the `attach` command). `spawn_if_missing` auto-launches the
+    /// runtime binary as a daemon when discovery finds no live one — the
+    /// attach command passes `false` (an attach that starts its own
+    /// daemon would be a run in disguise). Unix-only: on other hosts this
+    /// returns [`DAEMON_NOT_SUPPORTED_MESSAGE`], the single actionable
+    /// guard asserted verbatim by a platform-independent unit test.
+    pub async fn connect_daemon(
+        overrides: InitOverrides,
+        caps: ConnectionCapabilities,
+        spawn_if_missing: bool,
+    ) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::connect_daemon_at(&daemon_info_path(), overrides, caps, spawn_if_missing).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (overrides, caps, spawn_if_missing);
+            Err(anyhow!(DAEMON_NOT_SUPPORTED_MESSAGE))
+        }
+    }
+
+    /// [`Self::connect_daemon`] against an explicit discovery file — the
+    /// seam that keeps the daemon path hermetically testable (end-to-end
+    /// smokes point it at a tempdir fixture) and lets `attach` honor a
+    /// per-Commands override.
+    #[cfg(unix)]
+    pub(crate) async fn connect_daemon_at(
+        info_path: &Path,
+        overrides: InitOverrides,
+        caps: ConnectionCapabilities,
+        spawn_if_missing: bool,
+    ) -> Result<Self> {
+        // 1) Discovery: read the broker's info file (missing / corrupt
+        //    / unreadable all collapse to "no usable info").
+        let mut info = parse_daemon_info(info_path).ok();
+
+        // 2) Nothing usable && auto-spawn: launch the runtime binary as
+        //    a background daemon, then poll for the info file (the
+        //    broker writes it after bind — existence means listening).
+        if info.is_none() && spawn_if_missing {
+            spawn_daemon_process(info_path)?;
+            info = Some(wait_for_daemon_info(info_path).await?);
+        }
+
+        // 3) Still nothing → single actionable error (the attach path
+        //    runs with spawn_if_missing=false and lands here directly).
+        let mut info = info.ok_or_else(|| anyhow!(NO_DAEMON_MESSAGE))?;
+
+        // 4) Liveness: the info file can outlive its daemon, so a failed
+        //    socket connect is the stale signal (portable, race-free;
+        //    stale → unlink and respawn once when allowed).
+        let stream = match UnixStream::connect(&info.socket_path).await {
+            Ok(stream) => stream,
+            Err(_) if spawn_if_missing => {
+                let _ = std::fs::remove_file(info_path); // stale info (best-effort)
+                spawn_daemon_process(info_path)?;
+                info = wait_for_daemon_info(info_path).await?;
+                UnixStream::connect(&info.socket_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "daemon socket {} did not come up after respawn",
+                            info.socket_path
+                        )
+                    })?
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(info_path); // stale info (best-effort)
+                return Err(anyhow!(NO_DAEMON_MESSAGE));
+            }
+        };
+
+        // 5) Token handshake: Init carries the info file's shared
+        //    secret; the engine rejects mismatches with `unauthorized`
+        //    before touching any session state.
+        let mut connection = DaemonConnection::from_stream(stream);
+        perform_handshake(&mut connection, overrides, caps, Some(info.token)).await?;
+        Ok(Self::Daemon(connection))
     }
 
     pub async fn send(&mut self, request: Request) -> Result<String> {
         match self {
             Self::Spawned(client) => client.send(request).await,
             Self::InProcess(client) => client.send(request).await,
+            #[cfg(unix)]
+            Self::Daemon(client) => client.send(request).await,
         }
     }
 
@@ -403,6 +666,8 @@ impl AgentConnection {
         match self {
             Self::Spawned(client) => client.next_event().await,
             Self::InProcess(client) => client.next_event().await,
+            #[cfg(unix)]
+            Self::Daemon(client) => client.next_event().await,
         }
     }
 
@@ -436,6 +701,8 @@ impl AgentConnection {
         match self {
             Self::Spawned(client) => client.shutdown().await,
             Self::InProcess(client) => client.shutdown().await,
+            #[cfg(unix)]
+            Self::Daemon(client) => client.shutdown().await,
         }
     }
 }
@@ -480,6 +747,127 @@ pub fn runtime_binary() -> Result<PathBuf> {
         "agentic-runtime not found next to {}; set AGENTIC_RUNTIME_BIN",
         current.display()
     ))
+}
+
+/// Spawn the `agentic-runtime` binary as a background daemon publishing
+/// its discovery info to `info_path`. Both endpoints are passed
+/// explicitly (re-derived from the discovery file's directory) because
+/// this runs BEFORE the info file exists, so the socket path cannot be
+/// read from it. The socket name carries OUR pid — unique among
+/// concurrently running CLI processes; nothing downstream depends on the
+/// guess anyway, since the broker records the real path in the info
+/// file. The child is deliberately detached: the daemon must outlive
+/// this process (tokio's orphan reaper collects it).
+#[cfg(unix)]
+fn spawn_daemon_process(info_path: &Path) -> Result<()> {
+    let binary = runtime_binary()?;
+    let socket_path = info_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("agentic-daemon-{}.sock", std::process::id()));
+    Command::new(&binary)
+        .arg("--daemon")
+        .arg("--socket-path")
+        .arg(&socket_path)
+        .arg("--info-path")
+        .arg(info_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(false) // daemon outlives the CLI process
+        .spawn()
+        .with_context(|| format!("failed to spawn daemon from {}", binary.display()))?;
+    Ok(())
+}
+
+/// Poll for the discovery file of a freshly spawned daemon. The broker
+/// writes it after binding the listener, so a parsed info file means the
+/// socket is ready to accept. Bounded by [`DAEMON_SPAWN_TIMEOUT`].
+#[cfg(unix)]
+async fn wait_for_daemon_info(info_path: &Path) -> Result<DaemonInfo> {
+    let deadline = tokio::time::Instant::now() + DAEMON_SPAWN_TIMEOUT;
+    loop {
+        if let Ok(info) = parse_daemon_info(info_path) {
+            return Ok(info);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "spawned daemon did not publish {} within 10s",
+                info_path.display()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Ask the daemon broker recorded in `info_path` to shut down. No
+/// session handshake: `Request::Shutdown` needs no init (the engine
+/// breaks its dispatch loop on receipt — see `RuntimeEngine::run` — and
+/// the broker's cleanup unlinks socket + info files), so stopping a
+/// daemon never requires matching its config.
+///
+/// The request is delivery-confirmed, not fire-and-forget: a busy broker
+/// answers an attach with a single `"daemon in use"` error frame and
+/// closes WITHOUT reading anything (no reader pump is spawned for a
+/// refused connection), so a blind write would silently lose the
+/// request. We detect that frame and retry until the previous
+/// connection's slot clears (bounded by [`DAEMON_SHUTDOWN_TIMEOUT`]).
+#[cfg(unix)]
+pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
+    let info = match parse_daemon_info(info_path) {
+        Ok(info) => info,
+        Err(_) => {
+            return Err(anyhow!(
+                "{} (no readable discovery file at {})",
+                NO_DAEMON_MESSAGE,
+                info_path.display()
+            ))
+        }
+    };
+    let deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_TIMEOUT;
+    loop {
+        let stream = match UnixStream::connect(&info.socket_path).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                return Err(anyhow!(
+                    "{} (stale discovery file at {} — its daemon is gone)",
+                    NO_DAEMON_MESSAGE,
+                    info_path.display()
+                ))
+            }
+        };
+        let mut connection = DaemonConnection::from_stream(stream);
+        connection.send(Request::Shutdown).await?;
+
+        /// Only the refusal case loses the request: the refusing broker
+        /// never reads it. Any other outcome means a live reader holds
+        /// our (buffered) frame or the daemon is already gone.
+        const REFUSAL_CHECK: std::time::Duration = std::time::Duration::from_millis(500);
+        match tokio::time::timeout(REFUSAL_CHECK, connection.next_event()).await {
+            // Refused: slot still held by another client — retry.
+            Ok(Ok(event)) => match event.event {
+                core_agentic::Event::Error { message } if message.trim() == "daemon in use" => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "daemon busy: another client is attached; detach it and retry shutdown"
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                core_agentic::Event::Error { message } => {
+                    return Err(anyhow!("daemon refused shutdown: {message}"));
+                }
+                // Any other frame proves a live reader accepted us; the
+                // buffered shutdown request will be consumed.
+                _ => return Ok(()),
+            },
+            // EOF/closed without a frame (daemon exited or consumed the
+            // buffered request), or no frame within the check window —
+            // in both cases the request sits in the socket buffer ahead
+            // of our FIN and a live reader will read it.
+            Ok(Err(_)) | Err(_) => return Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -734,5 +1122,86 @@ mod in_process_tests {
             other => panic!("expected Error event after panic, got {other:?}"),
         }
         drop(request_tx);
+    }
+}
+
+#[cfg(test)]
+mod daemon_info_tests {
+    use super::*;
+
+    /// Wire-format pin for the discovery file the daemon broker writes
+    /// (`agentic-runtime/src/daemon.rs::write_info_file`): snake_case
+    /// keys, no renaming — a mismatch silently breaks `RuntimeMode::
+    /// Daemon` discovery.
+    #[test]
+    fn daemon_info_parses_fields() {
+        let json =
+            r#"{"pid":4242,"socket_path":"/tmp/x.sock","token":"tok","version":"0.0.0-test"}"#;
+        let info = parse_daemon_info_str(json).unwrap();
+        assert_eq!(info.pid, 4242);
+        assert_eq!(info.socket_path, "/tmp/x.sock");
+        assert_eq!(info.token, "tok");
+        assert_eq!(info.version, "0.0.0-test");
+    }
+
+    #[test]
+    fn daemon_info_rejects_corrupt_or_incomplete_json() {
+        assert!(parse_daemon_info_str("not json at all").is_err());
+        // Missing the token (the shared secret) → unusable for attach.
+        let no_token = r#"{"pid":1,"socket_path":"/tmp/x.sock","version":"0"}"#;
+        assert!(parse_daemon_info_str(no_token).is_err());
+        // pid must be a number.
+        let bad_pid = r#"{"pid":"4242","socket_path":"/tmp/x.sock","token":"t","version":"0"}"#;
+        assert!(parse_daemon_info_str(bad_pid).is_err());
+    }
+
+    /// Default discovery location must agree with the runtime broker's
+    /// own default (`daemon_config_dir()` in
+    /// `agentic-runtime/src/main.rs`), including the HOME-less fallback.
+    #[test]
+    fn daemon_info_path_matches_broker_default() {
+        match std::env::var_os("HOME") {
+            Some(home) => {
+                assert_eq!(
+                    daemon_info_path(),
+                    PathBuf::from(home)
+                        .join(".config")
+                        .join("agentic")
+                        .join("daemon.json")
+                );
+            }
+            None => {
+                assert_eq!(
+                    daemon_info_path(),
+                    std::env::temp_dir()
+                        .join("agentic-daemon")
+                        .join("daemon.json")
+                );
+            }
+        }
+    }
+
+    /// Windows-level guard contract, compiled on every host (same
+    /// pattern as `agentic-runtime`'s `not_supported_error` test): the
+    /// message `connect` produces on a non-unix host is exactly one
+    /// actionable line pointing at the modes that DO work.
+    #[test]
+    fn daemon_mode_windows_guard_message_is_actionable() {
+        assert_eq!(
+            DAEMON_NOT_SUPPORTED_MESSAGE,
+            "daemon mode not supported on Windows yet — use --runtime embedded|spawn"
+        );
+        assert!(!DAEMON_NOT_SUPPORTED_MESSAGE.contains('\n'));
+    }
+
+    /// The no-daemon attach error must tell the user how to get a
+    /// daemon (or pick a mode that does not need one).
+    #[test]
+    fn no_daemon_message_is_actionable() {
+        assert_eq!(
+            NO_DAEMON_MESSAGE,
+            "no daemon running — start it with 'agentic-runtime --daemon' or use --runtime embedded"
+        );
+        assert!(!NO_DAEMON_MESSAGE.contains('\n'));
     }
 }

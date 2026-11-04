@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod unit_tests {
-    use crate::cli::{Cli, Command, QueueModeArg};
+    use crate::cli::{Cli, Command, QueueModeArg, RuntimeModeArg};
     use clap::Parser;
 
     #[test]
@@ -43,6 +43,33 @@ mod unit_tests {
             Some(Command::Version) => {}
             _ => panic!("Expected Version command"),
         }
+    }
+
+    #[test]
+    fn test_cli_attach_command_parsing() {
+        let cli = Cli::try_parse_from(["agentic", "attach"]).unwrap();
+        match cli.command {
+            Some(Command::Attach { shutdown }) => assert!(!shutdown),
+            _ => panic!("Expected Attach command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_attach_shutdown_flag_parsing() {
+        let cli = Cli::try_parse_from(["agentic", "attach", "--shutdown"]).unwrap();
+        match cli.command {
+            Some(Command::Attach { shutdown }) => assert!(shutdown),
+            _ => panic!("Expected Attach command with --shutdown"),
+        }
+    }
+
+    #[test]
+    fn runtime_mode_flag_accepts_daemon() {
+        let cli = Cli::try_parse_from(["agentic", "--runtime", "daemon", "run", "task"]).unwrap();
+        assert_eq!(cli.runtime, RuntimeModeArg::Daemon);
+        // Global flag also works after the subcommand (clap global args).
+        let cli = Cli::try_parse_from(["agentic", "run", "task", "--runtime", "daemon"]).unwrap();
+        assert_eq!(cli.runtime, RuntimeModeArg::Daemon);
     }
 
     #[test]
