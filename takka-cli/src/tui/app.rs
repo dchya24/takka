@@ -60,6 +60,8 @@ pub enum AppMessage {
     Thought(String),
     /// Live output delta from a streaming tool.
     ToolDelta { name: String, delta: String },
+    /// Provider-reported token usage for one model call.
+    Usage { input: u32, output: u32 },
     /// Plan progress update from the planner agent.
     PlanProgress {
         goal: String,
@@ -933,6 +935,16 @@ impl App {
                         takka_core::Event::Error { message } => {
                             let _ = event_tx.send(AppMessage::Error(message));
                         }
+                        takka_core::Event::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            ..
+                        } => {
+                            let _ = event_tx.send(AppMessage::Usage {
+                                input: prompt_tokens,
+                                output: completion_tokens,
+                            });
+                        }
                         takka_core::Event::Thinking { .. } => {
                             // Skip — text was already streamed via on_chunk.
                             // A separate Thought message would duplicate content.
@@ -1469,6 +1481,16 @@ impl App {
                         takka_core::Event::Error { message } => {
                             let _ = event_tx.send(AppMessage::Error(message));
                         }
+                        takka_core::Event::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            ..
+                        } => {
+                            let _ = event_tx.send(AppMessage::Usage {
+                                input: prompt_tokens,
+                                output: completion_tokens,
+                            });
+                        }
                         takka_core::Event::Thinking { .. } => {
                             // Skip — text was already streamed via on_chunk.
                             // A separate Thought message would duplicate content.
@@ -1867,6 +1889,12 @@ impl App {
                     } => {
                         self.progress
                             .set_message(format!("Plan: {} — {}", current_step, step_status,));
+                    }
+                    AppMessage::Usage { input, output } => {
+                        // Real provider numbers — the status bar used to sit at
+                        // 0/0 because nothing ever incremented these.
+                        self.stats.tokens_input = self.stats.tokens_input.saturating_add(input);
+                        self.stats.tokens_output = self.stats.tokens_output.saturating_add(output);
                     }
                 }
             }

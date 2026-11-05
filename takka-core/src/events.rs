@@ -93,6 +93,23 @@ pub enum Event {
         matches: Vec<MemorySearchMatch>,
     },
 
+    /// Token usage reported by the provider for one model call.
+    ///
+    /// Surfaced so frontends can show real numbers instead of estimating from
+    /// character counts. Providers only report it on the final stream chunk
+    /// (or in the non-streaming response), and some providers report nothing
+    /// at all — frontends should treat the totals as "measured minus unknown".
+    #[serde(rename = "usage")]
+    #[serde(rename_all = "camelCase")]
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read_input_tokens: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_creation_input_tokens: Option<u32>,
+    },
+
     /// Reply to `Request::ListTools`: the daemon's registered tool set
     /// (name + description), for `/tools` in daemon-driven frontends.
     #[serde(rename = "tool_list")]
@@ -302,6 +319,7 @@ pub enum EventType {
     SessionStarted,
     ModelRequest,
     ModelChunk,
+    Usage,
     SkillActivated,
     PlanCreated,
     StepStarted,
@@ -345,6 +363,7 @@ impl Event {
             Event::PlanReplanned { .. } => EventType::PlanReplanned,
             Event::SessionStarted => EventType::SessionStarted,
             Event::ModelRequest { .. } => EventType::ModelRequest,
+            Event::Usage { .. } => EventType::Usage,
             Event::ModelChunk { .. } => EventType::ModelChunk,
             Event::SkillActivated { .. } => EventType::SkillActivated,
             Event::PlanCreated { .. } => EventType::PlanCreated,

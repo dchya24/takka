@@ -175,6 +175,14 @@ impl Orchestrator {
                 response.usage.as_ref(),
                 response.finish_reason.as_deref(),
             );
+            if let Some(usage) = &response.usage {
+                self.events.emit(crate::events::Event::Usage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                });
+            }
 
             // Forced finalization: accept whatever text the model returns
             // as the final answer and terminate. (Tools were stripped, so
@@ -407,6 +415,9 @@ impl Orchestrator {
 
             let mut content_buf = String::new();
             let mut tool_calls_map: HashMap<u32, (String, String, String)> = HashMap::new();
+            // Providers report usage on the final chunk only (and not all of
+            // them do) — remember the last non-empty report of this call.
+            let mut stream_usage: Option<crate::providers::ChatUsage> = None;
 
             match self.provider.chat_stream(request) {
                 Ok(mut stream) => {
@@ -419,6 +430,9 @@ impl Orchestrator {
                                         delta: chunk.delta.clone(),
                                     });
                                     content_buf.push_str(&chunk.delta);
+                                }
+                                if chunk.usage.is_some() {
+                                    stream_usage = chunk.usage.clone();
                                 }
                                 for tc in chunk.tool_calls {
                                     let entry =
@@ -465,6 +479,14 @@ impl Orchestrator {
                 &content_buf,
                 &accumulated_tool_calls,
             );
+            if let Some(usage) = stream_usage {
+                self.events.emit(crate::events::Event::Usage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                });
+            }
 
             // Forced finalization: accept whatever text the model returns
             // as the final answer and terminate. (Tools were stripped, so

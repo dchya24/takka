@@ -28,14 +28,132 @@ use super::components::{notification, panel, BoxStyle};
 // Used by inline/interactive mode. The full panel rendering (TUI mode)
 // remains in render_call() / render_result() below.
 
-/// Maximum total width for the compact tool call line.
-const COMPACT_MAX_WIDTH: usize = 80;
+// ── Inline timeline rendering (interactive mode) ───────────
+//
+// One row per finished tool call, laid out as a timeline so a long run reads
+// as a sequence of steps instead of three loose lines per tool:
+//
+//   ├ ✓ read_file  src/main.rs              12 lines · 120ms
+//   ├ ✗ run_command  cargo build                    1.2s
+//   │   error[E0425]: cannot find value `x` in this scope
+//   ├ ✓ edit_file  src/main.rs              +4 −2 · 60ms
+//
+// Nested detail (streamed output, errors, diffs) hangs off the `│` guide.
 
-/// Render a compact single-line tool call.
+/// Branch prefix for a finished tool row.
+pub const TIMELINE_BRANCH: &str = "  \u{251c} ";
+/// Guide prefix for lines that belong to the row above.
+pub const TIMELINE_DETAIL: &str = "  \u{2502}   ";
+
+/// Widest the timeline rows are allowed to get (keeps the duration column
+/// from drifting to the far right of a very wide terminal).
+const TIMELINE_MAX_WIDTH: usize = 96;
+
+/// Arguments worth showing before the tool name: the first one present wins.
+/// Ordered by how much it tells the reader about *what the tool touched*.
+const HEADLINE_ARGS: &[&str] = &[
+    "path",
+    "file_path",
+    "command",
+    "pattern",
+    "query",
+    "url",
+    "name",
+    "task",
+    "goal",
+    "prompt",
+];
+
+/// Render one finished tool call as a timeline row.
 ///
-/// Format: ` ⚙ tool_name(path="src/main.rs", limit=100)`
-/// Truncates args if the total line exceeds COMPACT_MAX_WIDTH.
-pub fn render_call_compact(tool_name: &str, arguments: &Value) -> Line<'static> {
+/// `summary` is an optional short result note (`12 lines`, `+4 \u{2212}2`);
+/// `duration_ms` is right-aligned as the timing column.
+pub fn render_timeline_row(
+    tool_name: &str,
+    arguments: Option<&Value>,
+    success: bool,
+    summary: Option<&str>,
+    diff_counts: Option<(u32, u32)>,
+    duration_ms: u64,
+    truncated: bool,
+) -> Line<'static> {
+    let icon_style = if success {
+        Style::default()
+            .fg(Color::Rgb(46, 204, 113))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Rgb(231, 76, 60))
+            .add_modifier(Modifier::BOLD)
+    };
+    let name_style = Style::default()
+        .fg(Color::Rgb(52, 152, 219))
+        .add_modifier(Modifier::BOLD);
+    let dim_style = Style::default()
+        .fg(Color::Rgb(160, 160, 180))
+        .add_modifier(Modifier::DIM);
+
+    let target_width = super::inline::terminal_width()
+        .saturating_sub(2)
+        .clamp(40, TIMELINE_MAX_WIDTH);
+
+    let icon = if success { "\u{2713}" } else { "\u{2717}" };
+    let branch = format!("{}{} ", TIMELINE_BRANCH, icon);
+    let headline = arguments.map(arg_headline).unwrap_or_default();
+
+    let left_width = branch.chars().count()
+        + tool_name.chars().count()
+        + if headline.is_empty() {
+            0
+        } else {
+            headline.chars().count() + 2
+        };
+
+    // Right column: result note, diff counts, truncation marker, duration.
+    let mut right_bits: Vec<String> = Vec::new();
+    if let Some(summary) = summary {
+        if !summary.is_empty() {
+            right_bits.push(summary.to_string());
+        }
+    }
+    if let Some((added, removed)) = diff_counts {
+        if added + removed > 0 {
+            right_bits.push(format!("+{} \u{2212}{}", added, removed));
+        }
+    }
+    if truncated {
+        right_bits.push("truncated".to_string());
+    }
+    // `0ms` means the runtime didn't measure the call — better to omit the
+    // column than to claim the tool was instant.
+    if duration_ms > 0 {
+        right_bits.push(format_duration(duration_ms));
+    }
+    let right = right_bits.join(" \u{b7} ");
+
+    let pad = target_width
+        .saturating_sub(left_width + right.chars().count())
+        .max(1);
+
+    let mut spans = vec![
+        Span::styled(branch, icon_style),
+        Span::styled(tool_name.to_string(), name_style),
+    ];
+    if !headline.is_empty() {
+        spans.push(Span::styled(format!("  {}", headline), dim_style));
+    }
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(right, dim_style));
+
+    Line::from(spans)
+}
+
+/// Row for a tool that is still running and streaming output.
+///
+/// Printed on the first `ToolDelta` so the streamed lines have a parent row to
+/// hang from; the outcome arrives later as a nested detail line (see
+/// [`render_outcome_detail`]).
+pub fn render_running_row(tool_name: &str, arguments: Option<&Value>) -> Line<'static> {
     let icon_style = Style::default()
         .fg(Color::Rgb(241, 196, 15))
         .add_modifier(Modifier::BOLD);
@@ -43,111 +161,169 @@ pub fn render_call_compact(tool_name: &str, arguments: &Value) -> Line<'static> 
         .fg(Color::Rgb(52, 152, 219))
         .add_modifier(Modifier::BOLD);
     let dim_style = Style::default()
-        .fg(Color::Rgb(180, 180, 200))
+        .fg(Color::Rgb(160, 160, 180))
         .add_modifier(Modifier::DIM);
 
-    let args_str = compact_args(arguments);
-
-    // Truncate args if total line would be too wide
-    let truncated_args = if tool_name.len() + args_str.len() + 6 > COMPACT_MAX_WIDTH {
-        let available = COMPACT_MAX_WIDTH
-            .saturating_sub(tool_name.len() + 6) // " ⚙ name(" ... ")"
-            .saturating_sub(1); // "…" char
-        if available > 0 && available < args_str.len() {
-            // Find a safe truncation point (don't split multi-byte)
-            let end = args_str
-                .char_indices()
-                .take_while(|(i, _)| *i < available)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
-            format!("{}…", &args_str[..end])
-        } else {
-            args_str
-        }
-    } else {
-        args_str
-    };
-
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled("\u{2699}", icon_style),
-        Span::raw(" "),
+    let mut spans = vec![
+        Span::styled(format!("{}\u{27f3} ", TIMELINE_BRANCH), icon_style),
         Span::styled(tool_name.to_string(), name_style),
-        Span::styled("(", dim_style),
-        Span::styled(truncated_args, dim_style),
-        Span::styled(")", dim_style),
-    ])
-}
-
-/// Render a compact result line.
-///
-/// Format: `   → ✓ 142 lines` or `   → ✗ error: permission denied`
-pub fn render_result_compact(output: &Value, is_error: bool) -> Line<'static> {
-    if is_error {
-        let body = match output {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        let msg = if body.len() > 60 {
-            format!("{}\u{2026}", &body[..57])
-        } else {
-            body
-        };
-        return Line::from(vec![
-            Span::raw("   "),
-            Span::styled(
-                "\u{2192}",
-                Style::default()
-                    .fg(Color::Rgb(180, 180, 200))
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                "\u{2717}",
-                Style::default()
-                    .fg(Color::Rgb(231, 76, 60))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(msg, Style::default().fg(Color::Rgb(231, 76, 60))),
-        ]);
-    }
-
-    let summary = result_summary(output);
-    Line::from(vec![
-        Span::raw("   "),
-        Span::styled(
-            "\u{2192}",
-            Style::default()
-                .fg(Color::Rgb(180, 180, 200))
-                .add_modifier(Modifier::DIM),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            "\u{2713}",
-            Style::default()
-                .fg(Color::Rgb(46, 204, 113))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(summary, Style::default().fg(Color::Rgb(46, 204, 113))),
-    ])
-}
-
-/// Format arguments as a compact inline string.
-/// e.g. `path="src/main.rs", limit=100`
-fn compact_args(arguments: &Value) -> String {
-    match arguments {
-        Value::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, value_inline(v)))
-                .collect();
-            parts.join(", ")
+    ];
+    if let Some(args) = arguments {
+        let headline = arg_headline(args);
+        if !headline.is_empty() {
+            spans.push(Span::styled(format!("  {}", headline), dim_style));
         }
-        Value::Null => String::new(),
-        other => value_inline(other),
+    }
+    spans.push(Span::styled("  running\u{2026}", dim_style));
+    Line::from(spans)
+}
+
+/// Nested outcome line for a streamed tool: `✓ 6 lines \u{b7} 2ms`.
+pub fn render_outcome_detail(
+    success: bool,
+    summary: Option<&str>,
+    duration_ms: u64,
+) -> Line<'static> {
+    let (icon, color) = if success {
+        ("\u{2713}", Color::Rgb(46, 204, 113))
+    } else {
+        ("\u{2717}", Color::Rgb(231, 76, 60))
+    };
+    let mut bits: Vec<String> = Vec::new();
+    if let Some(summary) = summary {
+        if !summary.is_empty() {
+            bits.push(summary.to_string());
+        }
+    }
+    if duration_ms > 0 {
+        bits.push(format_duration(duration_ms));
+    }
+    let detail = if bits.is_empty() {
+        icon.to_string()
+    } else {
+        format!("{} {}", icon, bits.join(" \u{b7} "))
+    };
+    timeline_detail(&Line::from(Span::styled(
+        detail,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// Wrap a nested detail line in the timeline guide, keeping its content.
+pub fn timeline_detail(line: &Line<'_>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        TIMELINE_DETAIL.to_string(),
+        Style::default()
+            .fg(Color::Rgb(90, 90, 110))
+            .add_modifier(Modifier::DIM),
+    )];
+    spans.extend(
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style)),
+    );
+    Line::from(spans)
+}
+
+/// Detail lines for an error result: message body, capped at `max_lines`.
+pub fn error_detail_lines(message: &str, max_lines: usize) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::Rgb(231, 76, 60))
+        .add_modifier(Modifier::DIM);
+    let mut lines: Vec<Line<'static>> = message
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .take(max_lines)
+        .map(|l| timeline_detail(&Line::from(Span::styled(l.to_string(), style))))
+        .collect();
+    let total = message.lines().filter(|l| !l.trim().is_empty()).count();
+    if total > max_lines {
+        lines.push(timeline_detail(&Line::from(Span::styled(
+            format!("\u{2026} {} more line(s)", total - max_lines),
+            Style::default()
+                .fg(Color::Rgb(120, 120, 140))
+                .add_modifier(Modifier::DIM),
+        ))));
+    }
+    lines
+}
+
+/// Short result note for a timeline row (`12 lines`, `3 items`, `ok`).
+pub fn timeline_summary(output: &Value) -> Option<String> {
+    match output {
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) => {
+            let lines = s.lines().count();
+            Some(if lines > 1 {
+                format!("{} lines", lines)
+            } else {
+                format!("{} chars", s.chars().count())
+            })
+        }
+        Value::Array(a) if a.is_empty() => None,
+        Value::Array(a) => Some(format!(
+            "{} item{}",
+            a.len(),
+            if a.len() == 1 { "" } else { "s" }
+        )),
+        Value::Object(o) if o.is_empty() => None,
+        Value::Object(o) => Some(format!(
+            "{} field{}",
+            o.len(),
+            if o.len() == 1 { "" } else { "s" }
+        )),
+        Value::Null => None,
+        other => Some(value_inline(other)),
+    }
+}
+
+/// The most telling argument, rendered without the `key=` prefix.
+pub fn arg_headline(arguments: &Value) -> String {
+    let Value::Object(map) = arguments else {
+        return truncate_inline(&value_inline(arguments), 40);
+    };
+    for key in HEADLINE_ARGS {
+        if let Some(value) = map.get(*key) {
+            let rendered = match value {
+                Value::String(s) => s.clone(),
+                other => value_inline(other),
+            };
+            if !rendered.trim().is_empty() {
+                return truncate_inline(&rendered, 40);
+            }
+        }
+    }
+    // No headline argument: fall back to the first two key=value pairs.
+    let fallback: Vec<String> = map
+        .iter()
+        .take(2)
+        .map(|(k, v)| format!("{}={}", k, value_inline(v)))
+        .collect();
+    truncate_inline(&fallback.join(", "), 40)
+}
+
+fn truncate_inline(s: &str, max_chars: usize) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max_chars {
+        return one_line;
+    }
+    let end = one_line
+        .char_indices()
+        .take_while(|(i, _)| *i < max_chars.saturating_sub(1))
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}\u{2026}", &one_line[..end])
+}
+
+/// `120ms`, `1.2s`, `12s`, `1m 05s`.
+pub fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
+    } else {
+        format!("{}m {:02}s", ms / 60_000, (ms % 60_000) / 1000)
     }
 }
 
@@ -396,53 +572,153 @@ mod tests {
             .any(|l| l.contains("permission denied")));
     }
 
-    #[test]
-    fn render_call_compact_single_line() {
-        let line = render_call_compact("read_file", &json!({"path": "src/main.rs", "limit": 100}));
-        let text = flatten(&line);
-        assert!(text.contains("\u{2699}"), "should contain gear icon");
-        assert!(text.contains("read_file"));
-        assert!(text.contains("path"));
-        assert!(text.contains("src/main.rs"));
-    }
+    // ── timeline rows ──────────────────────────────────────
 
     #[test]
-    fn render_call_compact_no_args() {
-        let line = render_call_compact("status", &Value::Null);
+    fn timeline_row_carries_name_headline_summary_and_duration() {
+        let line = render_timeline_row(
+            "read_file",
+            Some(&json!({"path": "src/main.rs", "limit": 100})),
+            true,
+            Some("12 lines"),
+            None,
+            120,
+            false,
+        );
         let text = flatten(&line);
-        assert!(text.contains("status"));
-        assert!(text.contains("("));
-        assert!(text.contains(")"));
-    }
-
-    #[test]
-    fn render_call_compact_truncates_long_args() {
-        let long_path = "x".repeat(200);
-        let line = render_call_compact("read_file", &json!({"path": long_path}));
-        let text = flatten(&line);
-        // Should be truncated — not the full 200-char string
-        assert!(text.len() < 200);
+        assert!(text.contains("\u{251c}"), "missing timeline branch: {text}");
+        assert!(text.contains("\u{2713}"), "missing success icon: {text}");
+        assert!(text.contains("read_file"), "{text}");
+        // The headline argument, without the `path=` noise.
+        assert!(text.contains("src/main.rs"), "{text}");
         assert!(
-            text.contains("\u{2026}") || text.len() < 100,
-            "should truncate with ellipsis"
+            !text.contains("path="),
+            "headline should drop the key: {text}"
+        );
+        assert!(text.contains("12 lines"), "{text}");
+        assert!(text.contains("120ms"), "{text}");
+    }
+
+    #[test]
+    fn timeline_row_error_uses_cross_and_diff_counts() {
+        let line = render_timeline_row(
+            "edit_file",
+            Some(&json!({"path": "src/lib.rs"})),
+            false,
+            None,
+            Some((4, 2)),
+            1_250,
+            true,
+        );
+        let text = flatten(&line);
+        assert!(text.contains("\u{2717}"), "{text}");
+        assert!(text.contains("+4 \u{2212}2"), "diff counts missing: {text}");
+        assert!(text.contains("truncated"), "{text}");
+        assert!(text.contains("1.2s"), "{text}");
+    }
+
+    #[test]
+    fn timeline_row_stays_within_the_terminal_width() {
+        let long = "x".repeat(200);
+        let line = render_timeline_row(
+            "run_command",
+            Some(&json!({"command": long})),
+            true,
+            Some("3 lines"),
+            None,
+            90_000,
+            false,
+        );
+        let width = line.width();
+        assert!(width <= 96, "row overflowed: {width}");
+        assert!(
+            flatten(&line).contains("\u{2026}"),
+            "long argument should be elided"
         );
     }
 
     #[test]
-    fn render_result_compact_success() {
-        let line = render_result_compact(&Value::String("hello\nworld".into()), false);
+    fn timeline_row_without_arguments_or_summary_is_just_the_name() {
+        let line = render_timeline_row("todowrite", None, true, None, None, 5, false);
         let text = flatten(&line);
-        assert!(text.contains("\u{2713}"), "should contain checkmark");
-        assert!(text.contains("2 lines"));
+        assert!(text.contains("todowrite"), "{text}");
+        assert!(text.contains("5ms"), "{text}");
+    }
+
+    /// An unmeasured call reports `duration_ms = 0`; printing `0ms` reads as
+    /// "instant" instead of "unknown", so the column is dropped.
+    #[test]
+    fn timeline_row_omits_unknown_duration() {
+        let line = render_timeline_row(
+            "read_file",
+            Some(&json!({"path": "a.rs"})),
+            true,
+            None,
+            None,
+            0,
+            false,
+        );
+        let text = flatten(&line).trim_end().to_string();
+        assert!(!text.contains("0ms"), "{text}");
+        assert!(text.ends_with("a.rs"), "{text}");
     }
 
     #[test]
-    fn render_result_compact_error() {
-        let line =
-            render_result_compact(&Value::String("Tool error: permission denied".into()), true);
+    fn arg_headline_prefers_the_most_telling_argument() {
+        assert_eq!(
+            arg_headline(&json!({"limit": 10, "path": "a/b.rs"})),
+            "a/b.rs"
+        );
+        assert_eq!(
+            arg_headline(&json!({"tool": "x", "command": "cargo test"})),
+            "cargo test"
+        );
+        // Unknown shape falls back to key=value pairs.
+        assert!(arg_headline(&json!({"foo": "bar"})).contains("foo=\"bar\""));
+        // Multi-line arguments collapse to one row.
+        assert_eq!(arg_headline(&json!({"command": "a\nb"})), "a b");
+    }
+
+    #[test]
+    fn timeline_summary_describes_the_result_shape() {
+        assert_eq!(
+            timeline_summary(&Value::String("a\nb".into())).as_deref(),
+            Some("2 lines")
+        );
+        assert_eq!(
+            timeline_summary(&json!([1, 2, 3])).as_deref(),
+            Some("3 items")
+        );
+        assert_eq!(timeline_summary(&json!({})), None);
+        assert_eq!(timeline_summary(&Value::String("  ".into())), None);
+    }
+
+    #[test]
+    fn error_detail_lines_are_capped_and_guided() {
+        let message: String = (1..=8)
+            .map(|i| format!("error line {i}\n"))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        let lines = error_detail_lines(&message, 4);
+        assert_eq!(lines.len(), 5, "4 lines + elision notice");
+        assert!(flatten(&lines[0]).starts_with(TIMELINE_DETAIL));
+        assert!(flatten(&lines[4]).contains("4 more line(s)"));
+    }
+
+    #[test]
+    fn timeline_detail_keeps_the_guide_and_the_original_content() {
+        let line = timeline_detail(&Line::from(Span::raw("nested output")));
         let text = flatten(&line);
-        assert!(text.contains("\u{2717}"), "should contain X mark");
-        assert!(text.contains("permission denied"));
+        assert!(text.starts_with(TIMELINE_DETAIL), "{text}");
+        assert!(text.contains("nested output"), "{text}");
+    }
+
+    #[test]
+    fn format_duration_scales_with_magnitude() {
+        assert_eq!(format_duration(120), "120ms");
+        assert_eq!(format_duration(1_250), "1.2s");
+        assert_eq!(format_duration(65_000), "1m 05s");
     }
 
     #[test]

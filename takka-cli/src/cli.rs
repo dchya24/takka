@@ -65,6 +65,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_log_file: bool,
 
+    /// Hide the model's pre-tool reasoning ("thinking" blocks) from the
+    /// inline output. Overrides `output.show_thoughts` in the config.
+    #[arg(long, global = true)]
+    pub no_thoughts: bool,
+
     /// Runtime connection mode
     ///
     /// - embedded: run the agent engine in-process (default; no separate

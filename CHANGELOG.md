@@ -21,6 +21,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgraded together.
 
 ### Added
+- Runtime/core: providers' **real token usage** now reaches frontends as an
+  `Event::Usage` notification, emitted after every model call from both the
+  streaming (final chunk) and non-streaming paths. Additive to protocol v2;
+  frontends that never receive it keep their estimate.
+- CLI: the REPL's end-of-run summary uses those measured numbers
+  (`✓ done · 2.6s · 2 tools · ↑3.7k ↓963`) and only marks them with `~` when the
+  provider reported nothing and the ~4-chars/token estimate is in play.
+  Prompt-cache reads/writes are folded into the session counters too.
+- CLI/TUI: the TUI status bar's token counters were never incremented (always
+  `0 ↑ / 0 ↓`); they now accumulate the provider-reported usage.
+- CLI: the inline status line shows the **running tool's own clock**
+  (`⠴ run_command · 1.2s`) instead of the whole run's, so a stuck tool is
+  obvious; re-marking the same tool does not restart its clock.
+- CLI: `/timeline` sets the tool timeline detail — `detailed` (default: rows
+  plus nested output, errors, diffs) or `compact` (one row per tool). Bare
+  `/timeline` prints the current mode.
+- CLI: the model's pre-tool reasoning is now rendered inline as a DIM
+  `thinking...` block, wired to the long-documented `output.show_thoughts`
+  config key (previously read by nothing). Blocks are capped at 12 lines with
+  an `… N line(s) hidden` notice. `--no-thoughts` disables it for a session
+  and `/thoughts` (alias `/thinking`) toggles it live in the REPL.
 - CLI: **embedded runtime mode** (default) — the agent engine now runs as
   a thread inside the `takka` process over in-memory channels, removing
   the need for a separate `takka-runtime` binary on PATH. The spawned
@@ -54,6 +75,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daemon mode and named-pipe transport are planned (TODO).
 
 ### Changed
+- CLI: tool activity renders as a **timeline** instead of three loose lines per
+  call — one branch row per finished tool with its most telling argument,
+  result note and duration (`├ ✓ read_file  src/main.rs   12 lines · 120ms`),
+  with streamed output, errors and diffs nested under a `│` guide. Tools that
+  stream output (`run_command`, `run_script`) get a live `⟳ … running…` row
+  first and close with a nested outcome line. Durations the runtime did not
+  measure are omitted instead of printing `0ms`.
+- CLI: the inline REPL's transient `Thinking…` line is now a live status
+  line — phase (`thinking` / `streaming` / `<tool name>` / `waiting for
+  approval`), elapsed time, a live output-token estimate, and a
+  `ctrl+c to cancel` hint on wide terminals. The old indeterminate
+  bouncing bar carried no information and is gone from inline mode.
+- CLI: the end-of-run line now summarizes the run in one place
+  (`✓ done · 9.1s · 3 tools · ↑1.2k ↓342`) instead of `✓ Done (9.1s)`
+  followed by a separate session badge; the session line below it is
+  labeled `📊 session` and no longer repeats the "done" outcome.
+- CLI: interactive sessions (`takka`, `interactive`, `attach`, `tui`) keep
+  console logging at `warn` even when `RUST_LOG=info` is exported, so log
+  lines can't interleave with the REPL UI. `-v`/`--debug` opt back in; the
+  file log always keeps full detail.
 - Tests: the two CLI e2e smoke tests now spawn the real `takka-runtime`
   daemon against a pinned unreachable provider endpoint, making them
   hermetic — they no longer read the ambient user config (`~/.config/takka/config.json`)
@@ -69,6 +110,21 @@ Patch release: inline REPL completion-dropdown fixes and a daemon-binary
 lookup fix.
 
 ### Fixed
+- CLI: tool confirmations in the inline REPL now use the shared confirmation
+  panel (risk level, action, diff preview, `[y]es/[n]o/[a]lways/[q]uit`)
+  instead of a bare `dialoguer` prompt that the status line redraw used to
+  overwrite; the panel also parks the renderer and restores the status line
+  afterwards.
+- Core: the confirmation prompt describes the pending action in a readable
+  form (`run_command(command="cat nope.txt")`) instead of Rust's `Debug`
+  output (`Object {"command": String("cat nope.txt")}`).
+- CLI: console log lines (config load, transport warnings) no longer land on
+  the transient status line and strand it on screen after the response — the
+  renderer now installs a line-buffered writer hook that erases the status
+  line, prints the log line, and repaints.
+- CLI: output tokens were never accumulated, so the session counter always
+  showed `↓0` (e.g. `📊 ↑1.1k / 3↓`); the REPL now adds this run's estimated
+  input/output tokens and tool-call count to the session stats.
 - CLI: the skill / model completion dropdown now disappears immediately when
   an item is accepted, and the render cycle that follows no longer erases
   the command output printed below it (e.g. the skill "📖 Preview" section

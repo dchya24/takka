@@ -11,6 +11,37 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const PROGRESS_FILLED: &str = "█";
 const PROGRESS_EMPTY: &str = "░";
 
+/// What the agent is doing right now. Drives the live status line shown
+/// while a run is in flight (see `spinner::status_line`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Opening / reusing the runtime connection. Not used by the inline
+    /// renderer today (the connection is established before its status line
+    /// appears); kept for surfaces that can show it, e.g. the daemon path.
+    Connecting,
+    /// Request sent, waiting for the first token.
+    Thinking,
+    /// Tokens are arriving.
+    Streaming,
+    /// A tool is executing (name carried by `ProgressState::tool_name`).
+    Tool,
+    /// Parked on a confirmation / question prompt owned by the user.
+    WaitingApproval,
+}
+
+impl Phase {
+    /// Human label for phases that don't carry their own name.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Phase::Connecting => "connecting…",
+            Phase::Thinking => "thinking",
+            Phase::Streaming => "streaming",
+            Phase::Tool => "working",
+            Phase::WaitingApproval => "waiting for approval",
+        }
+    }
+}
+
 /// Progress state for animations
 #[derive(Clone, Debug)]
 pub struct ProgressState {
@@ -24,6 +55,16 @@ pub struct ProgressState {
     pub start_time: Option<Instant>,
     /// Progress percentage (0-100) for determinate progress
     pub percentage: Option<u8>,
+    /// Current activity, shown by the inline status line.
+    pub phase: Phase,
+    /// Name of the tool currently running (only meaningful for `Phase::Tool`).
+    pub tool_name: Option<String>,
+    /// When the running tool started — drives the per-tool clock in the status
+    /// line, so a stuck tool is obvious without watching the whole run's timer.
+    pub tool_started: Option<Instant>,
+    /// Characters streamed by the model this run — token counts are estimated
+    /// from this (see [`ProgressState::estimated_output_tokens`]).
+    pub stream_chars: usize,
 }
 
 impl ProgressState {
@@ -34,7 +75,49 @@ impl ProgressState {
             message: String::new(),
             start_time: None,
             percentage: None,
+            phase: Phase::Thinking,
+            tool_name: None,
+            tool_started: None,
+            stream_chars: 0,
         }
+    }
+
+    /// Mark the activity the status line should show.
+    pub fn set_phase(&mut self, phase: Phase) {
+        if phase != Phase::Tool {
+            // Leaving the tool phase stops its clock.
+            self.tool_started = None;
+        }
+        self.phase = phase;
+    }
+
+    /// Mark the tool that is currently executing and start its clock.
+    ///
+    /// Re-marking the same tool keeps the original start time so the clock
+    /// doesn't reset on repeated `ToolCall`/`ToolStarted` events.
+    pub fn set_tool(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if self.phase != Phase::Tool || self.tool_name.as_deref() != Some(name.as_str()) {
+            self.tool_started = Some(Instant::now());
+        }
+        self.phase = Phase::Tool;
+        self.tool_name = Some(name);
+    }
+
+    /// How long the current tool has been running, if one is.
+    pub fn tool_elapsed_precise_str(&self) -> Option<String> {
+        let started = self.tool_started?;
+        Some(format_elapsed(started.elapsed()))
+    }
+
+    /// Count streamed characters (drives the live token estimate).
+    pub fn add_stream_chars(&mut self, chars: usize) {
+        self.stream_chars += chars;
+    }
+
+    /// Rough output-token estimate: ~4 characters per token.
+    pub fn estimated_output_tokens(&self) -> u32 {
+        (self.stream_chars / 4).min(u32::MAX as usize) as u32
     }
 
     /// Start progress animation
@@ -73,6 +156,25 @@ impl ProgressState {
     /// Get current spinner character
     pub fn spinner(&self) -> &'static str {
         SPINNER_FRAMES[self.frame]
+    }
+
+    /// Format tokens compactly: `842`, `1.2k`, `3.4m`.
+    pub fn format_count(n: u32) -> String {
+        if n >= 1_000_000 {
+            format!("{:.1}m", n as f64 / 1_000_000.0)
+        } else if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            format!("{}", n)
+        }
+    }
+
+    /// Elapsed time with tenths of a second: `4.2s`, `1m 07s`.
+    pub fn elapsed_precise_str(&self) -> String {
+        match self.start_time {
+            Some(start) => format_elapsed(start.elapsed()),
+            None => "0.0s".to_string(),
+        }
     }
 
     /// Get elapsed time string
@@ -145,6 +247,16 @@ impl ProgressState {
         } else {
             format!("{} {} ({})", spinner, msg, elapsed)
         }
+    }
+}
+
+/// `4.2s` under a minute, `1m 07s` above it.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{}.{}s", secs, elapsed.subsec_millis() / 100)
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
     }
 }
 

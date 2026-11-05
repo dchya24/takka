@@ -86,7 +86,12 @@ CLI output preferences:
 
 * `color` → Enable colored output (default: `true`)
 * `stream` → Enable streaming responses (default: `true`)
-* `show_thoughts` → Show model reasoning/thoughts (default: `true`)
+* `show_thoughts` → Show the model's pre-tool reasoning as a DIM
+  "thinking" block above the tool activity (default: `true`). Long blocks are
+  capped at 12 lines. Override per session with `--no-thoughts`, or toggle
+  live in the REPL with `/thoughts`
+* `/timeline` (REPL) → `detailed` (default) or `compact` tool-timeline detail;
+  `compact` prints one row per tool with no nested output, errors or diffs
 * `show_tool_calls` → Show tool call details (default: `true`)
 
 ---

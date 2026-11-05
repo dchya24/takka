@@ -299,18 +299,18 @@ pub(crate) fn consume_spinner_line() {
     let _ = stdout.execute(Clear(ClearType::FromCursorDown));
 }
 
-/// Print a fresh "Thinking…" line under the current cursor. Used by the
-/// question handler to restore the renderer's "spinner is the last line"
-/// invariant after a prompt; the renderer replaces it with the real
-/// progress line on its next tick.
+/// Print a fresh status line under the current cursor. Used by the question
+/// handler to restore the renderer's "status line is the last line" invariant
+/// after a prompt; the renderer replaces it with the live status on its next
+/// tick.
 pub(crate) fn commit_spinner_placeholder() {
     if !inline::is_stdout_tty() {
         return;
     }
     let mut p = crate::widgets::progress::ProgressState::new();
     p.start();
-    p.set_message("Thinking…".to_string());
-    inline::print_line(&crate::widgets::spinner::compact_progress_line(&p, 18));
+    p.set_phase(crate::widgets::progress::Phase::Thinking);
+    inline::print_line(&crate::widgets::spinner::status_line(&p, false));
 }
 
 /// Renders todo list changes inline. Fires after every `todowrite` call.
@@ -539,6 +539,15 @@ pub struct Commands {
     /// Current nesting depth of `drain_follow_ups` (drained runs drain
     /// again on completion; capped at [`MAX_FOLLOW_UP_DRAIN_DEPTH`]).
     drain_depth: usize,
+    /// Session override for `output.show_thoughts` (`--no-thoughts`,
+    /// `/thoughts`). `None` means "use the config".
+    show_thoughts_override: Option<bool>,
+    /// Detail level for the inline tool timeline (`/timeline`).
+    timeline_style: TimelineStyle,
+    /// Figures from the most recent `run()` — the REPL's end-of-run summary
+    /// reads these (elapsed time is measured by the caller, tokens are
+    /// estimated from the character counts here).
+    last_run: RunStats,
     /// Test-only taps (cfg(test)): e2e tests prove the client-issued drain
     /// contract (runs == queue items + 1; the drained run emits its own
     /// SessionStarted) by counting client-issued Runs and capturing the
@@ -578,6 +587,9 @@ impl Commands {
             queue_mode: QueueMode::default(),
             pending_follow_ups: std::collections::VecDeque::new(),
             drain_depth: 0,
+            show_thoughts_override: None,
+            timeline_style: TimelineStyle::Detailed,
+            last_run: RunStats::default(),
             #[cfg(test)]
             test_runs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -871,6 +883,39 @@ impl Commands {
     /// project-local) was loaded into the system prompt.
     pub fn memory_md_loaded(&self) -> bool {
         self.memory_md_loaded
+    }
+
+    /// Override `output.show_thoughts` for this session (`--no-thoughts`).
+    pub fn with_show_thoughts(mut self, value: Option<bool>) -> Self {
+        self.show_thoughts_override = value;
+        self
+    }
+
+    /// Whether inline runs print the model's pre-tool reasoning.
+    pub fn show_thoughts(&self) -> bool {
+        self.show_thoughts_override
+            .unwrap_or(self.config.output.show_thoughts)
+    }
+
+    /// Toggle reasoning output from the REPL (`/thoughts`).
+    pub fn set_show_thoughts(&mut self, enabled: bool) {
+        self.show_thoughts_override = Some(enabled);
+    }
+
+    /// Detail level of the inline tool timeline.
+    pub fn timeline_style(&self) -> TimelineStyle {
+        self.timeline_style
+    }
+
+    /// Choose the timeline detail level (`/timeline`).
+    pub fn set_timeline_style(&mut self, style: TimelineStyle) {
+        self.timeline_style = style;
+    }
+
+    /// Figures from the most recent [`Commands::run`]: elapsed time is the
+    /// caller's, tokens are estimated from the character counts recorded here.
+    pub fn last_run_stats(&self) -> RunStats {
+        self.last_run
     }
 
     /// Resolve the active model's capabilities (vision / tools /
@@ -1638,7 +1683,7 @@ impl Commands {
     // ── Run task ────────────────────────────────────────────
 
     pub async fn run(&mut self, task: &str) -> Result<()> {
-        use crate::widgets::{components, inline, markdown as md_widget, progress, spinner};
+        use crate::widgets::{components, inline, markdown as md_widget, progress};
 
         // When --mode plan is active, route through the planner agent
         // instead of the regular orchestrator loop. This creates a real
@@ -1681,6 +1726,14 @@ impl Commands {
 
         // Runtime events are forwarded to the existing single-writer renderer.
         let show_tool_calls = self.config.output.show_tool_calls;
+        // The model's pre-tool reasoning is rendered as a DIM "thinking" block
+        // when enabled (config `output.show_thoughts`, `--no-thoughts`,
+        // `/thoughts`). The full text still reaches the renderer either way to
+        // drive the status line's phase.
+        let show_thoughts = self.show_thoughts();
+        // `/timeline compact` keeps one row per tool: no streamed output, no
+        // error bodies, no diff hunks.
+        let timeline_detailed = self.timeline_style() == TimelineStyle::Detailed;
         let (event_tx, event_rx) = std::sync::mpsc::channel::<takka_core::Event>();
 
         // ── Live rendering strategy (single writer) ───────────
@@ -1720,7 +1773,9 @@ impl Commands {
         let progress = std::sync::Arc::new(std::sync::Mutex::new({
             let mut p = progress::ProgressState::new();
             p.start();
-            p.set_message("Thinking…".to_string());
+            // The connection is already established by `ensure_connection`;
+            // what remains is waiting on the model.
+            p.set_phase(progress::Phase::Thinking);
             p
         }));
         let stop_flag = std::sync::Arc::new(AtomicBool::new(false));
@@ -1750,46 +1805,58 @@ impl Commands {
         let renderer = std::thread::Builder::new()
             .name("takka-renderer".into())
             .spawn(move || {
-                use crossterm::cursor::{MoveToColumn, MoveUp};
-                use crossterm::terminal::{Clear, ClearType};
-                use crossterm::ExecutableCommand;
-
                 let block_text = std::sync::Mutex::new(String::new());
 
-                // ── spinner cursor helpers ─────────────────────────────
-                let commit_spinner = || {
-                    let line = {
-                        let mut p = r_progress.lock().unwrap();
-                        p.tick();
-                        spinner::compact_progress_line(&p, 18)
-                    };
-                    inline::print_line(&line);
+                // ── status line painter ────────────────────────────────
+                // Shared with the console-log hook below, which repaints the
+                // status line after printing a log line.
+                let painter = std::sync::Arc::new(std::sync::Mutex::new(StatusPainter::new()));
+                let commit_spinner = {
+                    let painter = painter.clone();
+                    let r_progress = r_progress.clone();
+                    move || painter.lock().unwrap().commit(&r_progress)
                 };
-                let redraw_spinner = || {
-                    let line = {
-                        let mut p = r_progress.lock().unwrap();
-                        p.tick();
-                        spinner::compact_progress_line(&p, 18)
-                    };
-                    // Overwrite in place (the line is fixed-width) instead
-                    // of Clear(CurrentLine) + repaint. The erase-then-draw
-                    // cycle makes the line blink on Windows conhost (the
-                    // "dim lamp flicker") — a plain overwrite of the same
-                    // width is seamless everywhere.
-                    let mut s = std::io::stdout();
-                    let _ = s.execute(MoveUp(1));
-                    let _ = s.execute(MoveToColumn(0));
-                    inline::print_line(&line);
+                let redraw_spinner = {
+                    let painter = painter.clone();
+                    let r_progress = r_progress.clone();
+                    move || painter.lock().unwrap().redraw(&r_progress)
                 };
-                let consume_spinner = || {
-                    let mut s = std::io::stdout();
-                    let _ = s.execute(MoveUp(1));
-                    let _ = s.execute(MoveToColumn(0));
-                    let _ = s.execute(Clear(ClearType::FromCursorDown));
+                let consume_spinner = {
+                    let painter = painter.clone();
+                    move || painter.lock().unwrap().erase()
                 };
 
                 // Print the initial spinner.
                 commit_spinner();
+
+                // Route console logs around the spinner line: while this hook
+                // is installed, every stderr log line erases the spinner,
+                // prints itself, and re-arms the spinner, so the renderer's
+                // "spinner is the last line" invariant survives log output
+                // from other threads (config load, transport warnings, ...).
+                let _log_hook_guard;
+                {
+                    let hook_painter = painter.clone();
+                    let hook_progress = r_progress.clone();
+                    let hook: crate::widgets::log_writer::SpinnerHook =
+                        std::sync::Arc::new(move |bytes: &[u8]| {
+                            // try_lock: the gate may already be held by us (a
+                            // widget that logs) or by an interactive prompt.
+                            // Blocking there would deadlock; fall back to a
+                            // plain write instead.
+                            let gate = RENDER_GATE.try_lock();
+                            if gate.is_err() {
+                                crate::widgets::log_writer::write_line_to_stderr(bytes);
+                                return;
+                            }
+
+                            let mut painter = hook_painter.lock().unwrap();
+                            painter.erase();
+                            crate::widgets::log_writer::write_line_to_stderr(bytes);
+                            painter.commit(&hook_progress);
+                        });
+                    _log_hook_guard = crate::widgets::log_writer::SpinnerHookGuard::install(hook);
+                }
 
                 // Wrap the receivers in a Mutex so we can share them
                 // (they are !Sync but we only access from this thread).
@@ -1797,6 +1864,8 @@ impl Commands {
                 let event_rx = std::sync::Mutex::new(event_rx);
                 let mut chunks_done = false;
                 let mut events_done = false;
+                // Tool call arguments keyed by call id, for the timeline rows.
+                let mut timeline = ToolTimeline::default();
 
                 loop {
                     if chunks_done && events_done {
@@ -1840,9 +1909,19 @@ impl Commands {
                         loop {
                             match event_rx.lock().unwrap().try_recv() {
                                 Ok(event) => {
+                                    // Erase the status line first: the row
+                                    // (or a thinking block) must land where
+                                    // the spinner was, and `commit_spinner`
+                                    // re-arms it afterwards.
                                     consume_spinner();
-                                    if render_panels {
-                                        render_event(&event);
+                                    // Tool rows follow `show_tool_calls`; the
+                                    // reasoning block follows `show_thoughts`
+                                    // (which gates what the client receives)
+                                    // and is therefore independent of it.
+                                    if render_panels
+                                        || matches!(event, takka_core::Event::Thinking { .. })
+                                    {
+                                        render_event(&event, &mut timeline, timeline_detailed);
                                     }
                                     commit_spinner();
                                 }
@@ -1856,6 +1935,11 @@ impl Commands {
                     }
                 }
 
+                // The spinner cleanup in `run` owns the terminal from here on.
+                // Drop the hook first so a late log line can't re-arm a
+                // spinner after we are gone.
+                drop(_log_hook_guard);
+
                 RenderFinal {
                     block_text: block_text.into_inner().unwrap(),
                 }
@@ -1866,12 +1950,24 @@ impl Commands {
             .connection
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Runtime not initialized"))?;
+        // Live phase tracking for the status line. Both callbacks run on
+        // runtime threads, so they only touch the shared `ProgressState`
+        // (never the terminal — the renderer owns that).
+        let phase_progress = progress.clone();
+        let run_tools = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let run_usage = std::sync::Arc::new(std::sync::Mutex::new(UsageTotals::default()));
+
         let result = runtime
             .run(
                 task.to_string(),
                 attachments,
                 |chunk| {
                     if !chunk.is_empty() {
+                        {
+                            let mut p = phase_progress.lock().unwrap();
+                            p.set_phase(progress::Phase::Streaming);
+                            p.add_stream_chars(chunk.chars().count());
+                        }
                         let _ = chunk_tx.send(chunk.to_string());
                     }
                 },
@@ -1884,21 +1980,86 @@ impl Commands {
                     // original sender; forward through a clone instead so
                     // `drop(event_tx)` below still releases the renderer.
                     let event_tx = event_tx.clone();
+                    let e_progress = progress.clone();
+                    let e_tools = run_tools.clone();
+                    let e_usage = run_usage.clone();
                     move |event| {
+                        if let Ok(mut p) = e_progress.lock() {
+                            match &event {
+                                takka_core::Event::ToolCall { tool_name, .. } => {
+                                    p.set_tool(tool_name.clone());
+                                }
+                                takka_core::Event::ToolStarted { tool_name, .. } => {
+                                    p.set_tool(tool_name.clone());
+                                    e_tools.fetch_add(1, Ordering::Relaxed);
+                                }
+                                takka_core::Event::ToolOutput { .. } => {
+                                    p.set_phase(progress::Phase::Thinking);
+                                }
+                                takka_core::Event::ConfirmationRequest { .. }
+                                | takka_core::Event::QuestionRequest { .. } => {
+                                    p.set_phase(progress::Phase::WaitingApproval);
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Real provider usage: accumulate for the end-of-run
+                        // summary. It is not forwarded to the renderer — the
+                        // numbers are shown once, not floated mid-run.
+                        if let takka_core::Event::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens,
+                        } = &event
+                        {
+                            e_usage.lock().unwrap().add(
+                                *prompt_tokens,
+                                *completion_tokens,
+                                cache_read_input_tokens.unwrap_or(0),
+                                cache_creation_input_tokens.unwrap_or(0),
+                            );
+                        }
                         #[cfg(test)]
                         test_events.lock().unwrap().push(format!("{event:?}"));
-                        if !matches!(event, takka_core::Event::Thinking { .. }) {
+                        let is_usage = matches!(event, takka_core::Event::Usage { .. });
+                        if !is_usage
+                            && (show_thoughts
+                                || !matches!(event, takka_core::Event::Thinking { .. }))
+                        {
                             let _ = event_tx.send(event);
                         }
                     }
                 },
                 |event| match &event.event {
-                    takka_core::Event::ConfirmationRequest { description, .. } => {
-                        let approved = Confirm::with_theme(&ColorfulTheme::default())
-                            .with_prompt(description)
-                            .default(false)
-                            .interact()
-                            .unwrap_or(false);
+                    takka_core::Event::ConfirmationRequest {
+                        action,
+                        description,
+                        risk_level,
+                    } => {
+                        // Use the shared confirmation panel (risk badge, diff
+                        // preview, y/n/a/q). It also parks the renderer and
+                        // consumes the status line for the duration of the
+                        // prompt — a bare dialoguer prompt here let the spinner
+                        // redraw over the question in REPL mode.
+                        let request = takka_core::ConfirmationRequest {
+                            action: action.clone(),
+                            description: description.clone(),
+                            risk_level: match risk_level.as_str() {
+                                "low" => takka_core::RiskLevel::Low,
+                                "high" => takka_core::RiskLevel::High,
+                                "critical" => takka_core::RiskLevel::Critical,
+                                _ => takka_core::RiskLevel::Medium,
+                            },
+                            risk_score: 0.5,
+                            reason: description.clone(),
+                            timestamp: chrono::Utc::now(),
+                            preview_diff: None,
+                        };
+                        let approved = matches!(
+                            prompt_confirmation(&request),
+                            Some(ConfirmationResponse::Yes | ConfirmationResponse::Always)
+                        );
                         Some(takka_core::runtime::protocol::Request::ConfirmResponse {
                             request_id: event.request_id.clone(),
                             approved,
@@ -1945,6 +2106,27 @@ impl Commands {
         // reordered with the terminal-control sequences written above.
         let _ = std::io::Write::flush(&mut s);
 
+        let usage = {
+            let totals = run_usage.lock().unwrap();
+            (
+                totals.measured,
+                totals.prompt,
+                totals.completion,
+                totals.cache_read,
+                totals.cache_creation,
+            )
+        };
+        let (measured, prompt_tokens, completion_tokens, cache_read, cache_creation) = usage;
+        self.last_run = RunStats {
+            input_chars: task.len(),
+            output_chars: 0,
+            tool_calls: run_tools.load(Ordering::Relaxed),
+            prompt_tokens: measured.then_some(prompt_tokens),
+            completion_tokens: measured.then_some(completion_tokens),
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
+        };
+
         match result {
             Ok(final_result) => {
                 let source = if final_result.is_empty() {
@@ -1952,6 +2134,7 @@ impl Commands {
                 } else {
                     &final_result
                 };
+                self.last_run.output_chars = source.chars().count();
                 if !source.is_empty() {
                     let parsed = md_widget::MarkdownContent::parse(source);
                     inline::print_lines(&parsed.lines);
@@ -3277,131 +3460,341 @@ Instructions the agent follows when this skill is loaded.
 
 /// Render a two-line transient area:
 ///   Line 1: spinner progress
-fn render_event(event: &takka_core::Event) {
+// ── Transient status line ───────────────���───────────────────
+
+/// Per-run figures the REPL shows in its end-of-run summary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunStats {
+    /// Prompt characters sent for this run (fallback token estimate).
+    pub input_chars: usize,
+    /// Response characters streamed back for this run (fallback estimate).
+    pub output_chars: usize,
+    /// Tools executed during this run.
+    pub tool_calls: u32,
+    /// Prompt tokens the provider reported (`None` when it reported nothing).
+    pub prompt_tokens: Option<u32>,
+    /// Completion tokens the provider reported.
+    pub completion_tokens: Option<u32>,
+    /// Prompt-cache reads / writes the provider reported.
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
+}
+
+impl RunStats {
+    /// Input/output tokens for this run, preferring the provider's report and
+    /// falling back to the ~4-chars-per-token estimate.
+    pub fn tokens(&self) -> (u32, u32) {
+        let estimate = |chars: usize| (chars / 4).min(u32::MAX as usize) as u32;
+        (
+            self.prompt_tokens
+                .unwrap_or_else(|| estimate(self.input_chars)),
+            self.completion_tokens
+                .unwrap_or_else(|| estimate(self.output_chars)),
+        )
+    }
+
+    /// `true` when the numbers came from the provider rather than an estimate.
+    pub fn tokens_are_measured(&self) -> bool {
+        self.prompt_tokens.is_some() || self.completion_tokens.is_some()
+    }
+}
+
+/// How much detail the inline tool timeline prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineStyle {
+    /// Branch row per tool plus nested output, errors and diffs (default).
+    Detailed,
+    /// One row per tool — no streamed output, error bodies or diff hunks.
+    Compact,
+}
+
+impl TimelineStyle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TimelineStyle::Detailed => "detailed",
+            TimelineStyle::Compact => "compact",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            TimelineStyle::Detailed => "rows plus nested output, errors and diffs",
+            TimelineStyle::Compact => "one row per tool, no nested detail",
+        }
+    }
+}
+
+/// Token totals reported by the runtime during one `run()` call.
+#[derive(Debug, Default)]
+struct UsageTotals {
+    prompt: u32,
+    completion: u32,
+    cache_read: u32,
+    cache_creation: u32,
+    measured: bool,
+}
+
+impl UsageTotals {
+    fn add(&mut self, prompt: u32, completion: u32, cache_read: u32, cache_creation: u32) {
+        self.prompt = self.prompt.saturating_add(prompt);
+        self.completion = self.completion.saturating_add(completion);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
+        self.cache_creation = self.cache_creation.saturating_add(cache_creation);
+        self.measured = true;
+    }
+}
+
+/// Paints the transient activity line that sits at the bottom of the inline
+/// output during a run.
+///
+/// The line is overwritten in place (`MoveUp` + repaint) instead of being
+/// erased and redrawn — the erase/draw cycle blinks on Windows conhost. Since
+/// its width now varies with the phase label, elapsed time and token counter,
+/// every frame is padded to the widest frame seen so a shorter one can never
+/// leave stale characters behind.
+struct StatusPainter {
+    frame_width: usize,
+    /// `ctrl+c to cancel` is only worth the columns when the terminal is wide
+    /// enough to hold the status line plus the hint.
+    show_cancel_hint: bool,
+}
+
+impl StatusPainter {
+    fn new() -> Self {
+        Self {
+            frame_width: 0,
+            show_cancel_hint: inline::is_stdout_tty() && inline::terminal_width() >= 60,
+        }
+    }
+
+    /// Build the next frame, padded to the widest one painted so far.
+    fn next_line(
+        &mut self,
+        state: &std::sync::Mutex<crate::widgets::progress::ProgressState>,
+    ) -> RLine<'static> {
+        let mut line = {
+            let mut progress = state.lock().unwrap();
+            progress.tick();
+            crate::widgets::spinner::status_line(&progress, self.show_cancel_hint)
+        };
+        let width = line.width();
+        if width < self.frame_width {
+            line.spans
+                .push(RSpan::raw(" ".repeat(self.frame_width - width)));
+        } else {
+            self.frame_width = width;
+        }
+        line
+    }
+
+    /// Paint a fresh status line below the cursor.
+    fn commit(&mut self, state: &std::sync::Mutex<crate::widgets::progress::ProgressState>) {
+        let line = self.next_line(state);
+        inline::print_line(&line);
+    }
+
+    /// Overwrite the status line in place.
+    fn redraw(&mut self, state: &std::sync::Mutex<crate::widgets::progress::ProgressState>) {
+        use crossterm::cursor::{MoveToColumn, MoveUp};
+        use crossterm::ExecutableCommand;
+
+        let line = self.next_line(state);
+        let mut stdout = std::io::stdout();
+        let _ = stdout.execute(MoveUp(1));
+        let _ = stdout.execute(MoveToColumn(0));
+        inline::print_line(&line);
+    }
+
+    /// Remove the status line and anything printed after it.
+    fn erase(&self) {
+        use crossterm::cursor::{MoveToColumn, MoveUp};
+        use crossterm::terminal::{Clear, ClearType};
+        use crossterm::ExecutableCommand;
+
+        let mut stdout = std::io::stdout();
+        let _ = stdout.execute(MoveUp(1));
+        let _ = stdout.execute(MoveToColumn(0));
+        let _ = stdout.execute(Clear(ClearType::FromCursorDown));
+    }
+}
+
+fn render_event(event: &takka_core::Event, timeline: &mut ToolTimeline, detailed: bool) {
     use crate::widgets::{components, diff as diff_widget, inline, tool_call};
 
-    // Compact rendering by default: success notifications show only the
-    // headline (tool name + numeric summary). Errors always include their
-    // message body so users can debug without flipping a flag. The full
-    // raw output is still in memory for the model.
+    // Tools render as a timeline: one row per finished call (icon, name, the
+    // argument that says what it touched, timing), with streamed output,
+    // errors and diffs hanging off a `│` guide beneath it. While a tool is
+    // running nothing is printed — the transient status line already names it
+    // and ticks its own clock, so a finished row replaces that noise.
     //
     // Special case: edit_file / write_file results carry a `diff` field
     // (unified-diff string) and `lines_added` / `lines_removed` counts.
     // We render those through `widgets::diff` so the user sees a real
     // colored diff inline instead of the raw JSON blob.
     const MAX_TOOL_OUTPUT_LINES: usize = 12;
+    const MAX_ERROR_LINES: usize = 4;
     match event {
         takka_core::Event::ToolCall {
             tool_name,
             arguments,
         } => {
-            inline::print_line(&tool_call::render_call_compact(tool_name, arguments));
+            timeline.on_call(tool_name, arguments);
         }
         takka_core::Event::ToolStarted {
-            tool_name, arguments, ..
+            tool_call_id,
+            tool_name,
+            arguments,
+            ..
         } => {
-            // Running header: "  ⟳ run_command" — live progress begins.
-            let line = RLine::from(vec![RSpan::raw("  "), RSpan::styled(
-                format!("\u{27F3} {}", tool_name),
-                RStyle::default().fg(RColor::Indexed(247)).add_modifier(RModifier::BOLD),
-            )]);
-            inline::print_line(&line);
-            let _ = arguments;
+            timeline.on_started(tool_call_id, tool_name, arguments);
         }
         takka_core::Event::ToolDelta {
-            delta, tool_name, ..
+            delta,
+            tool_name,
+            tool_call_id,
+            ..
         } => {
-            let lines = render_tool_delta(tool_name, delta);
-            for line in lines {
-                inline::print_line(&line);
+            if !detailed {
+                // Compact: the completion row alone represents the tool.
+                return;
+            }
+            // First delta: give the streamed lines a parent row to hang from.
+            if timeline.mark_live(tool_call_id) {
+                let arguments = timeline.peek_arguments(tool_call_id);
+                inline::print_line(&tool_call::render_running_row(
+                    tool_name,
+                    arguments.as_ref(),
+                ));
+            }
+            for line in render_tool_delta(tool_name, delta) {
+                inline::print_line(&tool_call::timeline_detail(&line));
             }
         }
         takka_core::Event::ToolOutput {
             tool_name,
             output,
+            tool_call_id,
             duration_ms,
+            success,
             truncated,
             ..
         } => {
-            // Heuristic: orchestrator records denied/skipped/error outcomes
-            // as plain string output with these prefixes. We render those
-            // with the red error accent.
+            // Heuristic: the orchestrator records denied/skipped outcomes as
+            // plain string output with these prefixes, in which case `success`
+            // is still true but the run did not do what was asked.
             let body = match output {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let is_error = body.starts_with("Tool error")
-                || body.starts_with("Blocked:")
-                || body.starts_with("Skipped:");
+            let denied = body.starts_with("Blocked:") || body.starts_with("Skipped:");
+            let is_error = !*success || denied || body.starts_with("Tool error");
 
-            // Try to extract a unified diff from the embedded JSON. The
-            // orchestrator wraps tool results as Value::String containing
-            // pretty-printed JSON; we parse it back to look for our
-            // structured fields. If we find a non-empty diff, render it
-            // through the diff widget; the headline notification still
-            // appears so the user gets the summary line.
-            let parsed: Option<serde_json::Value> = if !is_error {
-                serde_json::from_str(&body).ok()
-            } else {
+            // Structured fields ride along as JSON in the string body.
+            let parsed = if is_error {
                 None
+            } else {
+                serde_json::from_str::<serde_json::Value>(&body).ok()
             };
-
             let diff_text = parsed
                 .as_ref()
                 .and_then(|v| v.get("diff"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
+            let diff_counts = parsed.as_ref().and_then(|v| {
+                let added = v.get("lines_added")?.as_u64()? as u32;
+                let removed = v.get("lines_removed")?.as_u64()? as u32;
+                Some((added, removed))
+            });
 
-            // Compact result line: → ✓ summary  or  → ✗ error
-            inline::print_line(&tool_call::render_result_compact(output, is_error));
+            let arguments = timeline.arguments_for(tool_call_id, tool_name);
+            let summary = if is_error {
+                None
+            } else {
+                tool_call::timeline_summary(output)
+            };
 
-            // Enriched metadata: duration + truncation notice.
-            if *duration_ms > 0 {
-                inline::print_line(&RLine::from(RSpan::styled(
-                    format!("   ({:.1}s)", *duration_ms as f64 / 1000.0),
-                    RStyle::default().add_modifier(RModifier::DIM),
-                )));
+            if !detailed {
+                inline::print_line(&tool_call::render_timeline_row(
+                    tool_name,
+                    arguments.as_ref(),
+                    !is_error,
+                    summary.as_deref(),
+                    diff_counts,
+                    *duration_ms,
+                    *truncated,
+                ));
+                // Drop the live marker too: a later `ToolDelta` for the same
+                // call must not reopen a row in compact mode.
+                timeline.take_live(tool_call_id);
+                return;
             }
-            if *truncated {
-                inline::print_line(&RLine::from(RSpan::styled(
-                    "   \u{2026} output dipotong (hasil penuh tersimpan di konteks model)",
-                    RStyle::default().add_modifier(RModifier::DIM),
-                )));
+
+            if timeline.take_live(tool_call_id) {
+                // The running row is already on screen with the streamed
+                // output beneath it — just close it out.
+                let mut outcome = tool_call::timeline_summary(output);
+                if *truncated {
+                    let note = "truncated".to_string();
+                    outcome = Some(match outcome {
+                        Some(existing) => format!("{existing} \u{b7} {note}"),
+                        None => note,
+                    });
+                }
+                inline::print_line(&tool_call::render_outcome_detail(
+                    !is_error,
+                    outcome.as_deref(),
+                    *duration_ms,
+                ));
+            } else {
+                inline::print_line(&tool_call::render_timeline_row(
+                    tool_name,
+                    arguments.as_ref(),
+                    !is_error,
+                    summary.as_deref(),
+                    diff_counts,
+                    *duration_ms,
+                    *truncated,
+                ));
             }
 
-            // If there's a diff, render it inline without borders.
-            if let Some(diff) = diff_text {
-                inline::print_line(&diff_widget::summary_line(diff));
-                let diff_lines = diff_widget::render(diff);
-                let max_diff_lines = 20;
-                if diff_lines.len() > max_diff_lines {
-                    inline::print_lines(&diff_lines[..max_diff_lines]);
-                    let remaining = diff_lines.len() - max_diff_lines;
-                    inline::print_line(&ratatui::text::Line::from(ratatui::text::Span::styled(
-                        format!("    … {} more diff line(s) hidden", remaining),
-                        ratatui::style::Style::default()
-                            .add_modifier(ratatui::style::Modifier::DIM),
-                    )));
-                } else {
-                    inline::print_lines(&diff_lines);
+            // Errors always show their message — the user must be able to act
+            // on them without flipping a flag.
+            if is_error {
+                for line in tool_call::error_detail_lines(&body, MAX_ERROR_LINES) {
+                    inline::print_line(&line);
                 }
             }
-            let _ = tool_name;
+
+            // Diffs render inline (no border) beneath the row.
+            if let Some(diff) = diff_text {
+                inline::print_line(&tool_call::timeline_detail(&diff_widget::summary_line(
+                    diff,
+                )));
+                let diff_lines = diff_widget::render(diff);
+                let shown = diff_lines.len().min(MAX_TOOL_OUTPUT_LINES);
+                for line in &diff_lines[..shown] {
+                    inline::print_line(&tool_call::timeline_detail(line));
+                }
+                if diff_lines.len() > shown {
+                    inline::print_line(&tool_call::error_detail_lines(
+                        &format!(
+                            "\u{2026} {} more diff line(s) hidden",
+                            diff_lines.len() - shown
+                        ),
+                        1,
+                    )
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default());
+                }
+            }
         }
         takka_core::Event::Thinking { content }
             // Display the LLM's thinking/reasoning before tool execution
             // with DIM styling so it's visually distinct from the final response.
-            if !content.is_empty() => {
+            if !content.trim().is_empty() => {
                 inline::print_line(&components::thinking_header(true));
-                // Print thinking content with DIM style
-                for line in content.lines() {
-                    inline::print_line(&RLine::from(RSpan::styled(
-                        format!("  {}", line),
-                        RStyle::default()
-                            .fg(RColor::Indexed(242))
-                            .add_modifier(RModifier::DIM),
-                    )));
-                }
+                inline::print_lines(&thinking_block_lines(content, THINKING_PREVIEW_LINES));
                 inline::print_line(&components::thinking_header(false));
             }
         takka_core::Event::Error { message } => {
@@ -3416,6 +3809,106 @@ fn render_event(event: &takka_core::Event) {
     }
 }
 
+/// Per-run state for the inline tool timeline (see [`render_event`]).
+///
+/// `ToolOutput` carries no arguments, so the arguments seen at
+/// `ToolStarted` (keyed by call id) or `ToolCall` are remembered here — that
+/// is what lets a finished row say *what* the tool touched, not just its name.
+#[derive(Default)]
+struct ToolTimeline {
+    calls: std::collections::HashMap<String, serde_json::Value>,
+    /// Calls whose streamed row has already been printed, so the completion
+    /// prints a nested outcome under it instead of a second branch row.
+    live: std::collections::HashSet<String>,
+    /// `ToolCall` has no id; remember it for outputs that arrive without a
+    /// matching `ToolStarted`.
+    last_call: Option<(String, serde_json::Value)>,
+}
+
+impl ToolTimeline {
+    fn on_call(&mut self, tool_name: &str, arguments: &serde_json::Value) {
+        self.last_call = Some((tool_name.to_string(), arguments.clone()));
+    }
+
+    fn on_started(&mut self, call_id: &str, tool_name: &str, arguments: &serde_json::Value) {
+        self.calls.insert(call_id.to_string(), arguments.clone());
+        self.last_call = Some((tool_name.to_string(), arguments.clone()));
+    }
+
+    /// Mark a call as having a live (streaming) row. Returns `true` the first
+    /// time, i.e. when the caller should print the running row.
+    fn mark_live(&mut self, call_id: &str) -> bool {
+        self.live.insert(call_id.to_string())
+    }
+
+    /// `true` when this call already owns a live row that the outcome should
+    /// hang beneath; the marker is consumed.
+    fn take_live(&mut self, call_id: &str) -> bool {
+        self.live.remove(call_id)
+    }
+
+    /// Arguments for a call without consuming them.
+    fn peek_arguments(&mut self, call_id: &str) -> Option<serde_json::Value> {
+        self.calls.get(call_id).cloned()
+    }
+
+    /// Arguments for a call that just finished; the entry is consumed so a
+    /// long run does not accumulate state.
+    fn arguments_for(&mut self, call_id: &str, tool_name: &str) -> Option<serde_json::Value> {
+        if let Some(arguments) = self.calls.remove(call_id) {
+            return Some(arguments);
+        }
+        match &self.last_call {
+            Some((name, arguments)) if name == tool_name => Some(arguments.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Longest reasoning block the inline renderer prints before eliding the
+/// rest — the model's pre-tool reasoning can run to paragraphs, and the real
+/// answer must not be pushed off screen.
+const THINKING_PREVIEW_LINES: usize = 12;
+
+/// Format a `Thinking` event body as indented DIM preview lines, capped at
+/// `max_lines` (with an `… N more line(s)` notice). Pure — no terminal access,
+/// so the output can be unit-tested.
+fn thinking_block_lines(content: &str, max_lines: usize) -> Vec<RLine<'static>> {
+    let style = RStyle::default()
+        .fg(RColor::Indexed(242))
+        .add_modifier(RModifier::DIM);
+    let hidden_style = RStyle::default()
+        .fg(RColor::Indexed(240))
+        .add_modifier(RModifier::DIM | RModifier::ITALIC);
+
+    let body: Vec<&str> = content
+        .lines()
+        .map(str::trim_end)
+        .skip_while(|l| l.trim().is_empty())
+        .collect();
+    // A trailing blank line in the model's block shouldn't cost a preview row.
+    let body_len = body
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let mut lines: Vec<RLine<'static>> = body
+        .iter()
+        .take(body_len.min(max_lines))
+        .map(|line| RLine::from(RSpan::styled(format!("  {}", line), style)))
+        .collect();
+
+    if body_len > max_lines {
+        lines.push(RLine::from(RSpan::styled(
+            format!("  … {} more line(s) hidden", body_len - max_lines),
+            hidden_style,
+        )));
+    }
+
+    lines
+}
+
 /// Render a live tool-output delta as indented DIM lines. Pure — no
 /// terminal access — so it can be unit-tested without capturing stdout.
 fn render_tool_delta(_tool_name: &str, delta: &str) -> Vec<RLine<'static>> {
@@ -3424,8 +3917,9 @@ fn render_tool_delta(_tool_name: &str, delta: &str) -> Vec<RLine<'static>> {
         if line.trim().is_empty() {
             continue;
         }
+        // No extra indent: the caller prefixes these with the timeline guide.
         lines.push(RLine::from(RSpan::styled(
-            format!("    {}", line),
+            line.to_string(),
             RStyle::default()
                 .fg(RColor::Indexed(244))
                 .add_modifier(RModifier::DIM),
@@ -3569,6 +4063,96 @@ fn find_or_create_dir(start: &std::path::Path, target: &str) -> std::path::PathB
     let fallback = start.join(target);
     let _ = std::fs::create_dir_all(&fallback);
     fallback
+}
+
+#[cfg(test)]
+mod thinking_preview_tests {
+    use super::*;
+
+    fn text(line: &RLine<'_>) -> String {
+        line.spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn short_blocks_are_printed_whole() {
+        let lines = thinking_block_lines("Plan:\n1. read main.rs\n2. fix bug", 12);
+        assert_eq!(lines.len(), 3);
+        assert!(text(&lines[0]).contains("Plan:"));
+        assert!(text(&lines[2]).contains("fix bug"));
+    }
+
+    #[test]
+    fn long_blocks_are_capped_with_a_notice() {
+        let content: String = (1..=20)
+            .map(|i| format!("step {i}\n"))
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        let lines = thinking_block_lines(&content, 12);
+        assert_eq!(lines.len(), 13, "12 preview lines + notice");
+        let notice = text(lines.last().unwrap());
+        assert!(notice.contains("8 more line(s) hidden"), "{notice}");
+    }
+
+    #[test]
+    fn leading_and_trailing_blank_lines_do_not_cost_preview_rows() {
+        let lines = thinking_block_lines("\n\n  actual thought  \n\n", 12);
+        assert_eq!(lines.len(), 1, "blank padding must be trimmed");
+        assert!(text(&lines[0]).contains("actual thought"));
+    }
+
+    #[test]
+    fn empty_or_whitespace_only_content_renders_nothing() {
+        assert!(thinking_block_lines("", 12).is_empty());
+        assert!(thinking_block_lines("   \n\t\n", 12).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod status_painter_tests {
+    use super::*;
+    use crate::widgets::progress::{Phase, ProgressState};
+
+    fn state() -> std::sync::Mutex<ProgressState> {
+        let mut p = ProgressState::new();
+        p.start();
+        std::sync::Mutex::new(p)
+    }
+
+    /// The redraw overwrites in place without `Clear`, so a frame narrower
+    /// than the previous one must be padded or stale glyphs stay on screen.
+    #[test]
+    fn narrower_frames_are_padded_to_the_widest() {
+        let state = state();
+        let mut painter = StatusPainter::new();
+        painter.show_cancel_hint = true;
+
+        state
+            .lock()
+            .unwrap()
+            .set_tool("a_very_long_tool_name_indeed");
+        let wide = painter.next_line(&state).width();
+
+        state.lock().unwrap().set_phase(Phase::Thinking);
+        let narrow = painter.next_line(&state).width();
+
+        assert_eq!(narrow, wide, "narrow frame must be padded");
+    }
+
+    #[test]
+    fn status_line_grows_with_the_token_counter() {
+        let state = state();
+        let mut painter = StatusPainter::new();
+
+        state.lock().unwrap().set_phase(Phase::Streaming);
+        state.lock().unwrap().add_stream_chars(40);
+        let small = painter.next_line(&state).width();
+
+        state.lock().unwrap().add_stream_chars(400_000);
+        let big = painter.next_line(&state).width();
+
+        assert!(big > small, "token counter should widen the line");
+    }
 }
 
 #[cfg(test)]
@@ -4722,11 +5306,16 @@ mod render_tool_delta_tests {
     }
 
     #[test]
-    fn indents_every_line() {
+    fn leaves_indentation_to_the_caller() {
+        // The renderer wraps these in `tool_call::timeline_detail`, which adds
+        // the guide prefix — a local indent here would double up.
         let lines = render_tool_delta("run_command", "cargo: compiling\ncargo: done");
         assert_eq!(lines.len(), 2);
         for l in &lines {
-            assert!(l.to_string().contains("    "), "expected 4-space indent");
+            assert!(
+                !l.to_string().starts_with(' '),
+                "delta lines must not self-indent"
+            );
         }
     }
 

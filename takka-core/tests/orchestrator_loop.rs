@@ -1109,3 +1109,143 @@ fn runs_without_store_are_untracked() {
     assert_eq!(answer, "ok");
     assert!(orch.session_id().is_none());
 }
+
+/// Provider-reported token usage must reach the frontend as a `Usage` event —
+/// that is what lets the CLI show real numbers instead of estimating from
+/// character counts. Covers the non-streaming path.
+#[test]
+fn run_emits_usage_event_from_provider_report() {
+    let mut response = support::text_response("done");
+    response.usage = Some(takka_core::providers::ChatUsage {
+        prompt_tokens: 1234,
+        completion_tokens: 567,
+        total_tokens: 1801,
+        cache_read_input_tokens: Some(900),
+        cache_creation_input_tokens: None,
+    });
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![response]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    orch.run("count some tokens").expect("run should succeed");
+
+    let captured = events.lock().unwrap();
+    let usage = captured
+        .iter()
+        .find_map(|e| match e {
+            Event::Usage {
+                prompt_tokens,
+                completion_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            } => Some((
+                *prompt_tokens,
+                *completion_tokens,
+                *cache_read_input_tokens,
+                *cache_creation_input_tokens,
+            )),
+            _ => None,
+        })
+        .expect("expected a Usage event");
+
+    assert_eq!(usage.0, 1234);
+    assert_eq!(usage.1, 567);
+    assert_eq!(usage.2, Some(900));
+    assert_eq!(usage.3, None);
+}
+
+/// No provider report → no `Usage` event, so frontends keep their estimate
+/// instead of showing a bogus zero.
+#[test]
+fn run_emits_no_usage_event_without_provider_report() {
+    let provider: Arc<dyn LLMProvider> =
+        Arc::new(ScriptedProvider::new(vec![support::text_response("done")]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    orch.run("no usage here").expect("run should succeed");
+
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::Usage { .. })),
+        "no provider report means no Usage event"
+    );
+}
+
+/// Streaming path: usage arrives on a stream chunk (typically the last one) and
+/// must surface as the same `Usage` event.
+#[tokio::test]
+async fn streaming_run_emits_usage_event_from_final_chunk() {
+    let mut response = support::text_response("streamed answer");
+    response.usage = Some(takka_core::providers::ChatUsage {
+        prompt_tokens: 42,
+        completion_tokens: 7,
+        total_tokens: 49,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: Some(11),
+    });
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(StreamingScriptedProvider::new(vec![response]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    orch.run_stream("stream some tokens", |_| {})
+        .await
+        .expect("run should succeed");
+
+    let captured = events.lock().unwrap();
+    let usage = captured
+        .iter()
+        .find_map(|e| match e {
+            Event::Usage {
+                prompt_tokens,
+                completion_tokens,
+                cache_creation_input_tokens,
+                ..
+            } => Some((
+                *prompt_tokens,
+                *completion_tokens,
+                *cache_creation_input_tokens,
+            )),
+            _ => None,
+        })
+        .expect("expected a Usage event from the streamed chunk");
+
+    assert_eq!(usage.0, 42);
+    assert_eq!(usage.1, 7);
+    assert_eq!(usage.2, Some(11));
+}

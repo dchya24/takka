@@ -10,6 +10,7 @@ pub mod code_highlight;
 pub mod components;
 pub mod diff;
 pub mod inline;
+pub mod log_writer;
 pub mod markdown;
 pub mod progress;
 pub mod spinner;

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cli::SkillAction;
-use crate::commands::{Commands, QueueMode};
+use crate::commands::{Commands, QueueMode, TimelineStyle};
 use crate::input_buffer::InputBuffer;
 use crate::input_renderer::{self, PromptMetadata};
 use crate::tui::dropdown::{Dropdown, DropdownType};
@@ -75,16 +75,16 @@ impl SessionStats {
         self.total_cache_creation_tokens.store(0, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
-    fn increment_tool_calls(&self) {
-        self.tool_calls.fetch_add(1, Ordering::Relaxed);
+    fn add_tool_calls(&self, n: u32) {
+        if n > 0 {
+            self.tool_calls.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     fn add_input_tokens(&self, n: u32) {
         self.total_input_tokens.fetch_add(n, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
     fn add_output_tokens(&self, n: u32) {
         self.total_output_tokens.fetch_add(n, Ordering::Relaxed);
     }
@@ -175,6 +175,12 @@ const SLASH_COMMANDS: &[(&str, &[&str], &str)] = &[
     ("search", &["find"], "Search conversation memory"),
     ("image", &["img"], "Attach an image for the next turn"),
     ("stats", &[], "Show session statistics"),
+    ("thoughts", &["thinking"], "Toggle inline model reasoning"),
+    (
+        "timeline",
+        &[],
+        "Set tool timeline detail (detailed | compact)",
+    ),
     ("quit", &["q", "exit"], "Exit interactive mode"),
 ];
 
@@ -921,6 +927,9 @@ enum ReplAction {
     Image(String),
     QueueShow,
     QueueSet(QueueMode),
+    ThoughtsToggle,
+    TimelineShow,
+    TimelineSet(TimelineStyle),
 }
 
 fn handle_slash_command(input: &str) -> Option<ReplAction> {
@@ -995,6 +1004,22 @@ fn handle_slash_command(input: &str) -> Option<ReplAction> {
             }
         },
         "/queue" => Some(ReplAction::QueueShow),
+        "/thoughts" | "/thinking" => Some(ReplAction::ThoughtsToggle),
+        "/timeline" if !arg.is_empty() => match arg.as_str() {
+            "detail" | "detailed" | "full" => {
+                Some(ReplAction::TimelineSet(TimelineStyle::Detailed))
+            }
+            "compact" | "short" | "min" => Some(ReplAction::TimelineSet(TimelineStyle::Compact)),
+            _ => {
+                inline::print_blank();
+                inline::print_line(&components::warning_badge(
+                    "Usage: /timeline [detailed | compact]",
+                ));
+                inline::print_blank();
+                None
+            }
+        },
+        "/timeline" => Some(ReplAction::TimelineShow),
         _ => {
             inline::print_blank();
             inline::print_line(&components::error_badge(&format!(
@@ -1340,9 +1365,57 @@ async fn handle_repl_action(
             )));
             show_queue_status(commands);
         }
+
+        ReplAction::TimelineShow => {
+            show_timeline_status(commands);
+        }
+
+        ReplAction::TimelineSet(style) => {
+            commands.set_timeline_style(*style);
+            inline::print_blank();
+            inline::print_line(&components::success_badge(&format!(
+                "Timeline set to {} — {}",
+                style.as_str(),
+                style.description()
+            )));
+            inline::print_blank();
+        }
+
+        ReplAction::ThoughtsToggle => {
+            let enabled = !commands.show_thoughts();
+            commands.set_show_thoughts(enabled);
+            inline::print_blank();
+            inline::print_line(&components::success_badge(if enabled {
+                "Reasoning shown — the model's pre-tool thinking is printed DIM."
+            } else {
+                "Reasoning hidden — only answers and tool activity are shown."
+            }));
+            inline::print_blank();
+        }
     }
 
     false
+}
+
+/// `/timeline` display: current detail level and what it means.
+fn show_timeline_status(commands: &Commands) {
+    let style = commands.timeline_style();
+    inline::print_blank();
+    inline::print_line(&Line::from(vec![
+        RSpan::raw("Tool timeline: "),
+        RSpan::styled(
+            style.as_str(),
+            RStyle::default()
+                .fg(Color::Rgb(64, 224, 208))
+                .add_modifier(Modifier::BOLD),
+        ),
+        RSpan::styled(format!(" — {}", style.description()), RStyle::default()),
+    ]));
+    inline::print_line(&Line::from(RSpan::styled(
+        "  /timeline compact  one row per tool   ·   /timeline detailed  rows + nested detail",
+        RStyle::default().add_modifier(Modifier::DIM),
+    )));
+    inline::print_blank();
 }
 
 /// `/queue` display: active mode + pending follow-up queue (index +
@@ -1424,8 +1497,16 @@ async fn process_message(
         inline::print_blank();
     } else {
         let elapsed = start.elapsed();
-        let estimated_input = (input.len() as f32 / 4.0) as u32;
-        stats.add_input_tokens(estimated_input);
+        // Real provider usage when the runtime reported it, otherwise the
+        // ~4-chars-per-token estimate.
+        let run = commands.last_run_stats();
+        let measured = run.tokens_are_measured();
+        let (input_tokens, output_tokens) = run.tokens();
+        stats.add_input_tokens(input_tokens);
+        stats.add_output_tokens(output_tokens);
+        stats.add_cache_read_tokens(run.cache_read_tokens);
+        stats.add_cache_creation_tokens(run.cache_creation_tokens);
+        stats.add_tool_calls(run.tool_calls);
 
         conversation.push(ConversationEntry {
             role: "assistant".into(),
@@ -1440,8 +1521,14 @@ async fn process_message(
         );
         let _ = crate::session::save(current_session);
 
-        // Show completion message with elapsed time
-        let done_line = spinner::done_line(elapsed.as_millis());
+        // One-line run summary: outcome, wall time, tools, this run's tokens.
+        let done_line = spinner::run_summary_line(
+            elapsed.as_millis(),
+            input_tokens,
+            output_tokens,
+            run.tool_calls,
+            measured,
+        );
         inline::print_line(&done_line);
         inline::print_blank();
 
@@ -1491,18 +1578,19 @@ fn print_banner(model_info: &ModelInfo, stats: &SessionStats) {
 
     inline::print_blank();
 
-    let title = components::banner_title(
-        "  █▀▀█ █▀▀ █▀▀█ █▀█ ▀█▀ █ █▀▀   ▇ ▅ ▃",
-        Color::Rgb(255, 105, 180),
-        Color::Rgb(64, 224, 208),
-    );
-    inline::print_line(&title);
-    let subtitle = components::banner_title(
-        "  █▒░█ █▀▀ █▀▀█ █ █  █  █ █   ▉ ▅ ▁",
-        Color::Rgb(255, 105, 180),
-        Color::Rgb(64, 224, 208),
-    );
-    inline::print_line(&subtitle);
+    // TAKKA wordmark, drawn with block glyphs. Each row gets its own
+    // left-to-right gradient so the block reads as a diagonal sweep.
+    const LOGO_ROWS: [&str; 3] = [
+        "  █████  ▄▀▀▄  █  █  █  █  ▄▀▀▄",
+        "    █    █▄▄█  ███   ███   █▄▄█",
+        "    █    █  █  █  █  █  █  █  █",
+    ];
+    let logo_from = Color::Rgb(255, 105, 180);
+    let logo_to = Color::Rgb(64, 224, 208);
+    for row in LOGO_ROWS.iter() {
+        let title = components::banner_title(row, logo_from, logo_to);
+        inline::print_line(&title);
+    }
     inline::print_blank();
 
     let info_lines = vec![
@@ -1796,18 +1884,14 @@ fn print_response_summary(stats: &SessionStats) {
 
     let sep = RSpan::styled(" │ ", RStyle::default().fg(Color::Rgb(60, 60, 80)));
 
+    // The per-run summary above already carries the "done" outcome; this line
+    // is the running session total (tokens are estimates, ~4 chars/token).
     inline::print_line(&Line::from(vec![
         RSpan::raw("  "),
-        RSpan::styled(
-            " ✓ done ",
-            RStyle::default()
-                .fg(Color::Rgb(255, 255, 255))
-                .bg(Color::Rgb(39, 174, 96))
-                .add_modifier(Modifier::BOLD),
-        ),
+        RSpan::styled("📊 session", RStyle::default().add_modifier(Modifier::DIM)),
         sep.clone(),
         RSpan::styled(
-            format!("📊 {}↑/{}↓", in_tok, out_tok),
+            format!("↑{} ↓{}", in_tok, out_tok),
             RStyle::default().fg(Color::Rgb(186, 85, 211)),
         ),
     ]));
@@ -1824,6 +1908,8 @@ fn print_help() {
 - `/history`           Show conversation history
 - `/tools`             List available tools
 - `/stats`             Show session statistics
+- `/thoughts`          Toggle inline model reasoning (thinking blocks)
+- `/timeline`          Show/set tool timeline detail (`detailed` | `compact`)
 - `/mcp`               Show MCP server status
 - `/skills`            List all indexed skills
 - `/skills <name>`     Load and display a skill
@@ -2264,6 +2350,53 @@ fn show_sessions() {
 #[cfg(test)]
 mod slash_queue_tests {
     use super::*;
+
+    #[test]
+    fn thoughts_toggles_reasoning_output() {
+        assert!(matches!(
+            handle_slash_command("/thoughts"),
+            Some(ReplAction::ThoughtsToggle)
+        ));
+        // Alias kept discoverable for people who type "thinking".
+        assert!(matches!(
+            handle_slash_command("/thinking"),
+            Some(ReplAction::ThoughtsToggle)
+        ));
+    }
+
+    #[test]
+    fn set_show_thoughts_overrides_config_for_the_session() {
+        let mut commands = Commands::new(takka_core::Config::fallback());
+        let config_default = commands.show_thoughts();
+        commands.set_show_thoughts(!config_default);
+        assert_eq!(commands.show_thoughts(), !config_default);
+    }
+
+    #[test]
+    fn timeline_command_sets_and_shows_the_style() {
+        assert!(matches!(
+            handle_slash_command("/timeline"),
+            Some(ReplAction::TimelineShow)
+        ));
+        assert!(matches!(
+            handle_slash_command("/timeline compact"),
+            Some(ReplAction::TimelineSet(TimelineStyle::Compact))
+        ));
+        assert!(matches!(
+            handle_slash_command("/timeline detailed"),
+            Some(ReplAction::TimelineSet(TimelineStyle::Detailed))
+        ));
+        // Unknown argument prints usage instead of switching modes.
+        assert!(handle_slash_command("/timeline nope").is_none());
+    }
+
+    #[test]
+    fn timeline_style_defaults_to_detailed_and_is_settable() {
+        let mut commands = Commands::new(takka_core::Config::fallback());
+        assert_eq!(commands.timeline_style(), TimelineStyle::Detailed);
+        commands.set_timeline_style(TimelineStyle::Compact);
+        assert_eq!(commands.timeline_style(), TimelineStyle::Compact);
+    }
 
     #[test]
     fn queue_without_arg_maps_to_show() {

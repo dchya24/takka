@@ -55,8 +55,19 @@ async fn main() -> Result<()> {
         2 => "debug",
         _ => "trace",
     };
+    // The REPL/TUI/attach sessions own the terminal: a transient inline
+    // spinner is redrawn in place, so INFO/DEBUG lines on stderr land on the
+    // spinner row and leave it corrupted. Console logging therefore starts at
+    // warnings there regardless of `RUST_LOG`; `-v`/`-vv` or `--debug` opt back
+    // in explicitly. The file log keeps full detail either way.
+    let interactive_session = matches!(
+        &cli.command,
+        None | Some(Command::Interactive) | Some(Command::Attach { .. }) | Some(Command::Tui)
+    );
     let console_filter = if cli.debug {
         EnvFilter::new("debug")
+    } else if interactive_session && cli.verbose == 0 {
+        EnvFilter::new("warn")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(console_level))
     };
@@ -83,6 +94,7 @@ async fn main() -> Result<()> {
 
     let console_layer = fmt::layer()
         .with_target(cli.debug)
+        .with_writer(|| widgets::log_writer::ConsoleLogWriter::new())
         .with_filter(console_filter);
 
     let file_layer = match &log_file_path {
@@ -255,6 +267,7 @@ async fn main() -> Result<()> {
         .with_color(color_enabled)
         .with_debug(cli.debug)
         .with_permission_mode(cli.mode.into())
+        .with_show_thoughts(if cli.no_thoughts { Some(false) } else { None })
         .with_queue_mode(cli.queue_mode.into())
         .with_runtime_mode(cli.runtime.into());
 

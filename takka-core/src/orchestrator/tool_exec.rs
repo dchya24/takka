@@ -176,7 +176,9 @@ impl Orchestrator {
             }
 
             if policy.confirmation_required {
-                let mut request = self.safety.create_request(tc_name, &format!("{:?}", args));
+                let mut request = self
+                    .safety
+                    .create_request(tc_name, &confirmation_description(tc_name, &args));
                 request.preview_diff = preview_diff_for_tool(tc_name, &args);
                 self.set_state(OrchestratorState::WaitingForUser);
                 self.events.emit(crate::events::Event::WaitingForUser);
@@ -422,7 +424,9 @@ impl Orchestrator {
             }
 
             if policy.confirmation_required {
-                let mut request = self.safety.create_request(tc_name, &format!("{:?}", args));
+                let mut request = self
+                    .safety
+                    .create_request(tc_name, &confirmation_description(tc_name, &args));
                 request.preview_diff = preview_diff_for_tool(tc_name, &args);
                 self.set_state(OrchestratorState::WaitingForUser);
                 self.events.emit(crate::events::Event::WaitingForUser);
@@ -690,6 +694,52 @@ impl Orchestrator {
 ///   return on execution).
 /// - `apply_patch`: returns the patch text directly (it's already a
 ///   unified diff).
+/// One-line, human-readable description of a tool call for the confirmation
+/// prompt: `run_command(command="cat nope.txt")`.
+///
+/// The confirmation panel used to be fed `format!("{:?}", args)`, which showed
+/// Rust's `Debug` output (`Object {"command": String("cat nope.txt")}`) — noisy
+/// and hard to read when approving a risky action.
+fn confirmation_description(tool_name: &str, args: &serde_json::Value) -> String {
+    let mut preview = match args {
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<String> = map
+                .iter()
+                .take(2)
+                .map(|(key, value)| format!("{}={}", key, compact_value(value)))
+                .collect();
+            pairs.join(", ")
+        }
+        serde_json::Value::Null => String::new(),
+        other => compact_value(other),
+    };
+    if preview.chars().count() > 120 {
+        let truncated: String = preview.chars().take(117).collect();
+        preview = format!("{truncated}\u{2026}");
+    }
+    if preview.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name}({preview})")
+    }
+}
+
+/// Compact rendering of a JSON value for prompts: strings are flattened to one
+/// line and quoted, everything else renders as compact JSON.
+fn compact_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => {
+            let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            if flat.is_empty() {
+                "\"\"".to_string()
+            } else {
+                format!("\"{flat}\"")
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
 pub(super) fn preview_diff_for_tool(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     let obj = args.as_object()?;
     match tool_name {
@@ -747,7 +797,7 @@ pub(super) fn preview_diff_for_tool(tool_name: &str, args: &serde_json::Value) -
 
 #[cfg(test)]
 mod preview_diff_tests {
-    use super::preview_diff_for_tool;
+    use super::{confirmation_description, preview_diff_for_tool};
     use std::io::Write;
 
     fn temp_file(name: &str, content: &str) -> std::path::PathBuf {
@@ -860,5 +910,38 @@ mod preview_diff_tests {
     fn apply_patch_returns_none_for_empty() {
         let args = serde_json::json!({"patch": "   "});
         assert!(preview_diff_for_tool("apply_patch", &args).is_none());
+    }
+    #[test]
+    fn confirmation_description_is_human_readable() {
+        let args = serde_json::json!({"command": "cat nope.txt"});
+        assert_eq!(
+            confirmation_description("run_command", &args),
+            "run_command(command=\"cat nope.txt\")"
+        );
+    }
+
+    #[test]
+    fn confirmation_description_shows_at_most_two_arguments() {
+        let args = serde_json::json!({"path": "a.rs", "content": "x", "mode": "w"});
+        let described = confirmation_description("write_file", &args);
+        assert!(described.starts_with("write_file("), "{described}");
+        assert_eq!(described.matches('=').count(), 2, "{described}");
+    }
+
+    #[test]
+    fn confirmation_description_flattens_and_truncates() {
+        let long = "a\n".repeat(200);
+        let described =
+            confirmation_description("run_command", &serde_json::json!({"command": long}));
+        assert!(!described.contains('\n'), "must stay one line");
+        assert!(described.ends_with("\u{2026})"), "{described}");
+    }
+
+    #[test]
+    fn confirmation_description_handles_null_arguments() {
+        assert_eq!(
+            confirmation_description("status", &serde_json::Value::Null),
+            "status"
+        );
     }
 }
