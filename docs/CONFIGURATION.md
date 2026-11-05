@@ -77,6 +77,20 @@ Security and approval settings:
 
 * `auto_approve_low_risk` → Automatically approve low-risk tool calls (default: `true`)
 * `blocked_commands` → List of command patterns to block
+* `require_confirmation` → Ask before medium+ risk actions (default: `true`)
+* `auto_approve_commands` → `run_command` prefixes that run **without a
+  prompt** even though `run_command` carries a risk floor. Defaults cover
+  read-only inspection (`git status`, `git log`, `git diff`, `ls`, `cat`,
+  `grep`, `rg`, `find`, `cargo check`, …) and local, reflog-undoable git edits
+  (`git add`, `git commit`, `git stash`, `git switch -c`, …). Matching is
+  strict: a command is auto-approved only if **every** chained segment
+  (`&&`, `;`) is on the list, has no blocking flag (`--force`, `--hard`, `-D`,
+  `--delete`, `-exec`, …) and no pipeline/substitution/redirection (`|`,
+  `` ` ``, `$(`, `>`, `<`). `git push`, `git reset`, `git rebase`, `git clean`
+  and unknown commands still prompt. Set to `[]` to prompt for everything.
+
+  Plan mode (`--mode plan`) uses the same list to decide what counts as
+  read-only: inspection runs, everything that mutates state is denied.
 
 ---
 

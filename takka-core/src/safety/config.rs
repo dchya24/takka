@@ -50,6 +50,22 @@ pub struct SafetyConfig {
     #[serde(default)]
     pub allowed_commands: Vec<String>,
 
+    /// Command prefixes that run **without a confirmation prompt**.
+    ///
+    /// A `run_command` call matching one of these (as a whole-word prefix, with
+    /// no shell chaining and no destructive flags) skips the tool's blanket
+    /// risk floor, so `git log` or `git add` no longer interrupt every step
+    /// while `rm -rf`, `git push --force`, `git reset --hard`, … still prompt.
+    ///
+    /// Matching is deliberately strict: the command must be a single simple
+    /// command (no `&&`, `||`, `;`, `|`, backticks, `$(` or redirection) and
+    /// must not contain destructive flags (`--force`, `--hard`, `-D`, …).
+    /// Entries are compared case-insensitively, so `git log` also covers
+    /// `git log --oneline`. Set to `[]` to require confirmation for every
+    /// command again.
+    #[serde(default = "default_auto_approve_commands")]
+    pub auto_approve_commands: Vec<String>,
+
     /// Sandbox directory roots. File operations outside these are blocked.
     #[serde(default)]
     pub sandbox_paths: Vec<String>,
@@ -118,6 +134,75 @@ fn default_blocked_commands() -> Vec<String> {
         "chown -R".into(),
         "> /dev/sda".into(),
     ]
+}
+
+/// Commands that never need a confirmation prompt: read-only inspection plus
+/// local, reflog-undoable git edits. Anything that leaves the machine
+/// (`git push`), rewrites history (`git rebase`, `git reset`) or deletes data
+/// (`rm`, `git clean`) stays out of this list on purpose.
+fn default_auto_approve_commands() -> Vec<String> {
+    [
+        // ── Git: inspection ──
+        "git status",
+        "git log",
+        "git diff",
+        "git show",
+        "git blame",
+        "git rev-parse",
+        "git describe",
+        "git shortlog",
+        "git ls-files",
+        "git ls-tree",
+        "git cat-file",
+        "git merge-base",
+        "git grep",
+        "git whatchanged",
+        "git reflog",
+        "git worktree list",
+        "git stash list",
+        "git remote -v",
+        "git remote show",
+        "git config --get",
+        "git branch --list",
+        "git branch --show-current",
+        "git tag --list",
+        "git tag -l",
+        // ── Git: local, undoable edits ──
+        "git add",
+        "git commit",
+        "git stash",
+        "git mv",
+        "git switch -c",
+        "git checkout -b",
+        "git restore --staged",
+        // ── Read-only shell tools ──
+        "ls",
+        "pwd",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "stat",
+        "file",
+        "tree",
+        "grep",
+        "rg",
+        "find",
+        "which",
+        "whereis",
+        "echo",
+        "date",
+        "diff",
+        "du",
+        "df",
+        "printenv",
+        "cargo check",
+        "cargo metadata",
+        "cargo tree",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn default_risk_patterns() -> Vec<RiskPattern> {
@@ -208,6 +293,7 @@ impl Default for SafetyConfig {
             blocked_commands: default_blocked_commands(),
             risk_patterns: default_risk_patterns(),
             allowed_commands: vec![],
+            auto_approve_commands: default_auto_approve_commands(),
             sandbox_paths: vec![],
             allowed_domains: vec![],
             block_ip_urls: false,

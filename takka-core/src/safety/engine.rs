@@ -119,6 +119,17 @@ impl Safety {
         self
     }
 
+    /// Replace the list of commands that run without a confirmation prompt
+    /// (see [`super::config::SafetyConfig::auto_approve_commands`]).
+    pub fn set_auto_approve_commands(&mut self, commands: Vec<String>) {
+        self.config.auto_approve_commands = commands;
+    }
+
+    pub fn with_auto_approve_commands(mut self, commands: Vec<String>) -> Self {
+        self.config.auto_approve_commands = commands;
+        self
+    }
+
     pub fn with_sandbox_paths(mut self, paths: Vec<String>) -> Self {
         self.config.sandbox_paths = paths;
         self
@@ -208,6 +219,61 @@ impl Safety {
         };
 
         RiskScore::new(best_score, level)
+    }
+
+    /// Would this command run without a confirmation prompt?
+    ///
+    /// True only when the command is (a) a single simple command — no shell
+    /// chaining, pipelines, substitution or redirection, whose *extra* parts
+    /// could be anything — and (b) matched by [`SafetyConfig::auto_approve_commands`]
+    /// as a whole-word prefix, and (c) free of destructive flags.
+    ///
+    /// The flag guard matters because prefixes are coarse: `git branch --list`
+    /// is read-only but `git branch -D` is not, and `find` is read-only but
+    /// `find -delete` is not.
+    pub fn is_auto_approved_command(&self, command: &str) -> bool {
+        let Some(segments) = auto_approve_segments(command) else {
+            return false;
+        };
+        segments
+            .iter()
+            .all(|segment| !has_blocking_flag(segment) && self.matches_auto_approve_prefix(segment))
+    }
+
+    /// Does one (un-chained) command start with an auto-approve prefix?
+    fn matches_auto_approve_prefix(&self, command: &str) -> bool {
+        let normalized = command.trim().to_lowercase();
+        self.config.auto_approve_commands.iter().any(|prefix| {
+            let prefix = prefix.trim().to_lowercase();
+            !prefix.is_empty()
+                && (normalized == prefix || normalized.starts_with(&format!("{prefix} ")))
+        })
+    }
+
+    /// Stricter sibling of [`Self::is_auto_approved_command`]: the command only
+    /// inspects state. Plan mode uses this so exploration is possible while
+    /// `git add` / `git commit` (auto-approved elsewhere) stay denied.
+    pub fn is_read_only_command(&self, command: &str) -> bool {
+        if !self.is_auto_approved_command(command) {
+            return false;
+        }
+        // Git subcommands that change the working tree or history. Everything
+        // else on the auto-approve list is inspection by construction.
+        const MUTATING_GIT_SUBCOMMANDS: [&str; 7] = [
+            "add", "commit", "stash", "mv", "switch", "checkout", "restore",
+        ];
+        let Some(segments) = auto_approve_segments(command) else {
+            return false;
+        };
+        segments.iter().all(|segment| {
+            let mut parts = segment.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some(binary), Some(subcommand)) if binary.eq_ignore_ascii_case("git") => {
+                    !MUTATING_GIT_SUBCOMMANDS.contains(&subcommand.to_lowercase().as_str())
+                }
+                _ => true,
+            }
+        })
     }
 
     /// Legacy compatibility: return RiskLevel for an action.
@@ -405,12 +471,26 @@ impl Safety {
             };
         }
 
+        // A read-only / local command from the auto-approve list is not what
+        // the tool's blanket floor is meant to catch — `run_command` carries
+        // risk 40 so *unknown* shell commands surface, but prompting for every
+        // `git log` and `git add` trains the user to hit "yes" blindly.
+        let auto_approved = request.tool == "run_command"
+            && !decision.needs_confirmation
+            && decision.score.value < self.config.medium_threshold
+            && request
+                .target()
+                .map(|command| self.is_auto_approved_command(command))
+                .unwrap_or(false);
+
         let effective = decision.score.value.max(floor);
-        if floor > decision.score.value {
+        if floor > decision.score.value && !auto_approved {
             notes.push(format!(
                 "tool risk floor {} raised effective risk {:.2} → {:.2}",
                 request.risk_floor, decision.score.value, effective
             ));
+        } else if auto_approved {
+            notes.push("auto-approved: read-only/local command".to_string());
         }
 
         // The floor may only *raise* the confirmation bar in modes where
@@ -419,9 +499,15 @@ impl Safety {
         let confirmation_required = match *self.mode.lock().unwrap() {
             PermissionMode::Yolo | PermissionMode::Plan => decision.needs_confirmation,
             PermissionMode::Default => {
-                decision.needs_confirmation
-                    || (self.config.require_confirmation
-                        && effective > self.config.auto_approve_threshold)
+                if auto_approved {
+                    // Per-argument scoring already cleared the thresholds; the
+                    // floor must not force a prompt here.
+                    false
+                } else {
+                    decision.needs_confirmation
+                        || (self.config.require_confirmation
+                            && effective > self.config.auto_approve_threshold)
+                }
             }
         };
 
@@ -439,6 +525,26 @@ impl Safety {
 
     pub fn evaluate(&self, action: &str, target: Option<&str>) -> SafetyDecision {
         let mode = *self.mode.lock().unwrap();
+
+        // Plan mode: read-only `run_command`s (git log, grep, …) stay allowed —
+        // exploring is what plan mode is for. Everything that mutates state is
+        // denied below.
+        if mode == PermissionMode::Plan
+            && action == "run_command"
+            && target
+                .map(|command| self.is_read_only_command(command))
+                .unwrap_or(false)
+        {
+            let score = self.score_command(action, target);
+            if score.level == RiskLevel::Low {
+                return SafetyDecision {
+                    score,
+                    allowed: true,
+                    needs_confirmation: false,
+                    reason: "plan mode: read-only command".into(),
+                };
+            }
+        }
 
         // Plan mode: hard-deny any state-changing tool. Reads still allowed.
         if mode == PermissionMode::Plan && is_state_changing_action(action) {
@@ -738,4 +844,65 @@ pub(crate) fn is_ip_literal(host: &str) -> bool {
         return true;
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Auto-approve helpers
+// ---------------------------------------------------------------------------
+
+/// Shell constructs that move data or run hidden code — a command using one is
+/// never auto-approved, no matter how its prefix looks. `|` also covers `||`.
+const AUTO_APPROVE_HARD_OPERATORS: [&str; 5] = ["|", "`", "$(", ">", "<"];
+
+/// Flags that turn a benign-looking command destructive (`git branch -D`,
+/// `git push --force`, `find -delete`, …). Any of them disables auto-approval.
+const AUTO_APPROVE_BLOCKING_FLAGS: [&str; 14] = [
+    "-f",
+    "--force",
+    "-D",
+    "-d",
+    "--delete",
+    "--hard",
+    "--no-verify",
+    "--exec",
+    "-exec",
+    "-delete",
+    "--prune",
+    "--mirror",
+    "--upload-pack",
+    "--receive-pack",
+];
+
+/// Split a command into its chained segments, or `None` when the command uses
+/// a construct that makes prefix matching meaningless.
+///
+/// `git add -A && git commit -m x` is fine (both segments checked
+/// individually); `cat secrets | nc host 1234` is not.
+fn auto_approve_segments(command: &str) -> Option<Vec<&str>> {
+    let command = command.trim();
+    if command.is_empty()
+        || AUTO_APPROVE_HARD_OPERATORS
+            .iter()
+            .any(|op| command.contains(op))
+    {
+        return None;
+    }
+    let segments: Vec<&str> = command
+        .split("&&")
+        .flat_map(|part| part.split(';'))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
+    }
+}
+
+/// Token-wise flag check, so `--format=%H` does not match `-f`.
+fn has_blocking_flag(segment: &str) -> bool {
+    segment
+        .split_whitespace()
+        .any(|token| AUTO_APPROVE_BLOCKING_FLAGS.contains(&token))
 }

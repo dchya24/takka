@@ -110,6 +110,19 @@ Patch release: inline REPL completion-dropdown fixes and a daemon-binary
 lookup fix.
 
 ### Fixed
+- Safety: `run_command` no longer asks for permission on every single call.
+  `run_command` carries a risk floor of 40/100, so the confirmation gate fired
+  even for `git log`; a new `safety.auto_approve_commands` list (read-only
+  inspection + local, reflog-undoable git edits such as `git add`/`git commit`)
+  now bypasses the floor. Matching is strict — the whole command must be simple
+  (no `|`, `` ` ``, `$(`, `>`, `<`) or a chain (`&&`, `;`) whose **every**
+  segment is on the list, with no destructive flag (`--force`, `--hard`, `-D`,
+  `--delete`, `-exec`, …). `git push`, `git reset`, `git rebase`, `git clean`
+  and unknown commands still prompt; yolo mode still blocks the blocklist.
+- Safety: plan mode (`--mode plan`) now permits read-only shell commands
+  (`git log`, `ls`, `grep`, …) instead of denying every `run_command` — the
+  same list gates it, and mutating subcommands (`git add`, `git commit`, …)
+  stay denied.
 - CLI: tool confirmations in the inline REPL now use the shared confirmation
   panel (risk level, action, diff preview, `[y]es/[n]o/[a]lways/[q]uit`)
   instead of a bare `dialoguer` prompt that the status line redraw used to
