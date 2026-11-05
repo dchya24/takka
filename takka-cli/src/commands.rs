@@ -29,6 +29,32 @@ static COLOR_ENABLED: AtomicBool = AtomicBool::new(true);
 /// frame instead.
 pub(crate) static SPINNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// True while a blocking prompt (tool confirmation, `question` dialog) owns
+/// stdin.
+///
+/// The REPL reads keys continuously — even during a run, so text typed
+/// mid-run can be queued — and in raw mode `event::read()` is unconditional:
+/// whichever reader asks first gets the key. That race is what ate the `y`/`a`
+/// keys of a confirmation prompt and turned them into "Invalid input". The REPL
+/// polls this flag and leaves stdin alone while a prompt is up.
+pub(crate) static INTERACTIVE_PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard for [`INTERACTIVE_PROMPT_ACTIVE`].
+pub(crate) struct InteractivePromptGuard(());
+
+impl InteractivePromptGuard {
+    pub(crate) fn activate() -> Self {
+        INTERACTIVE_PROMPT_ACTIVE.store(true, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for InteractivePromptGuard {
+    fn drop(&mut self) {
+        INTERACTIVE_PROMPT_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
 /// True while the full-screen TUI owns the terminal. The question (and
 /// confirmation) handler checks this to leave / re-enter the alternate
 /// screen around its prompt so dialoguer renders on a clean primary
@@ -72,6 +98,9 @@ impl takka_core::QuestionHandler for CliQuestionHandler {
         // after submission — and on Windows the two writers racing over
         // the console is what looks like a flickering dim lamp.
         let _render_gate = RENDER_GATE.lock().unwrap();
+        // Same stdin ownership as `prompt_confirmation`: the REPL key loop must
+        // not consume the keystrokes dialoguer is waiting for.
+        let _input_guard = InteractivePromptGuard::activate();
         let tui_active = TUI_ACTIVE.load(Ordering::Relaxed);
         if tui_active {
             // Drop the alternate screen so the prompt renders on the

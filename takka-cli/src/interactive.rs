@@ -387,7 +387,20 @@ async fn repl_loop(
         }
 
         // ── Wait for key event ──
-        let event = event::read()?;
+        // While a blocking prompt (tool confirmation / `question`) owns stdin we
+        // must not read: in raw mode whichever reader asks first wins, and the
+        // REPL used to swallow the `y`/`a` keys meant for that prompt. Poll
+        // instead of blocking so the flag is noticed before a key is taken, and
+        // don't repaint while waiting — the prompt is drawing the screen.
+        let event = loop {
+            if crate::commands::INTERACTIVE_PROMPT_ACTIVE.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
+            if event::poll(std::time::Duration::from_millis(50))? {
+                break event::read()?;
+            }
+        };
 
         match event {
             Event::Key(key) => {

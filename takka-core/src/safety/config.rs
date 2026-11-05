@@ -263,6 +263,22 @@ fn default_risk_patterns() -> Vec<RiskPattern> {
         RiskPattern::new("delete_file", r"(?i)\b(rm\s+|del\s+)", 0.4).with_reason("Deleting files"),
         RiskPattern::new("git_clean", r"(?i)\bgit\s+clean\s+", 0.45)
             .with_reason("Git clean removes untracked files"),
+        RiskPattern::new(
+            "git_force_push",
+            r"(?i)\bgit\s+push\b.*(--force\b|-f\b|--force-with-lease|-\+?\S*\+|:\S+)",
+            0.7,
+        )
+        .with_reason("Force-push rewrites remote history"),
+        RiskPattern::new("git_push", r"(?i)\bgit\s+push\b", 0.35)
+            .with_reason("Publishing to a remote"),
+        RiskPattern::new("git_rebase", r"(?i)\bgit\s+rebase\b", 0.45)
+            .with_reason("Rebase rewrites local history"),
+        RiskPattern::new(
+            "git_discard_changes",
+            r"(?i)\bgit\s+(checkout|restore)\s+(--\s+|\.[\s]*$|\*\s*$)",
+            0.5,
+        )
+        .with_reason("Discards uncommitted working-tree changes"),
         RiskPattern::new("docker_rm", r"(?i)\bdocker\s+(rm|rmi)\b", 0.35)
             .with_reason("Removing docker containers/images"),
         // --- Low (<0.3) ---

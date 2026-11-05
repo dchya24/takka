@@ -110,6 +110,28 @@ Patch release: inline REPL completion-dropdown fixes and a daemon-binary
 lookup fix.
 
 ### Fixed
+- CLI: the tool confirmation prompt no longer turns a typed `y`/`a` into
+  "Invalid input". In raw mode `read_line` cannot work (Enter arrives as `\r`)
+  *and* the REPL's key loop was consuming the keystrokes first. The prompt now
+  reads a single key via crossterm, echoes it, and publishes an
+  `INTERACTIVE_PROMPT_ACTIVE` flag that the REPL honours (its read loop polls
+  instead of blocking, so keys stay in the terminal for the prompt). Enter takes
+  the safe default (`No`), Esc aborts. Cooked mode (`takka run`, piped input)
+  still accepts typed `y`/`n`/`a`/`q` lines.
+- Safety: auto-approval now understands quoting, so a `git commit` whose message
+  contains `;`, `&&`, `>` or a flag-like word is no longer mistaken for shell
+  chaining (`git commit -m "feat: a; b && c > d"` runs without a prompt). Real
+  syntax still disqualifies: pipelines, `>`, `>>`, `` ` ``, `$(` and `<(` are
+  rejected anywhere, and risk patterns still scan quoted text (`bash -c "rm -rf
+  /"` executes its quotes). Input redirection (`<`, `<<`) is allowed, which
+  makes heredoc commit messages (`git commit -F - <<EOF`) auto-approved.
+- CLI: the confirmation panel shows the **whole** command (wrapped) instead of
+  truncating it at 120 characters.
+- Safety: the confirmation panel reported `Risk Level: LOW` for everything
+  because the request was scored without a target. Requests are now scored
+  against the actual command/path, and `git push` (+force-push), `git rebase`
+  and `git checkout -- .` have patterns (MEDIUM/HIGH) so the panel says what it
+  means.
 - Safety: `run_command` no longer asks for permission on every single call.
   `run_command` carries a risk floor of 40/100, so the confirmation gate fired
   even for `git log`; a new `safety.auto_approve_commands` list (read-only

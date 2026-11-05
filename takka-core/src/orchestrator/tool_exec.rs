@@ -176,9 +176,11 @@ impl Orchestrator {
             }
 
             if policy.confirmation_required {
-                let mut request = self
-                    .safety
-                    .create_request(tc_name, &confirmation_description(tc_name, &args));
+                let mut request = self.safety.create_request_for(
+                    tc_name,
+                    &confirmation_description(tc_name, &args),
+                    confirmation_target(tc_name, &args),
+                );
                 request.preview_diff = preview_diff_for_tool(tc_name, &args);
                 self.set_state(OrchestratorState::WaitingForUser);
                 self.events.emit(crate::events::Event::WaitingForUser);
@@ -424,9 +426,11 @@ impl Orchestrator {
             }
 
             if policy.confirmation_required {
-                let mut request = self
-                    .safety
-                    .create_request(tc_name, &confirmation_description(tc_name, &args));
+                let mut request = self.safety.create_request_for(
+                    tc_name,
+                    &confirmation_description(tc_name, &args),
+                    confirmation_target(tc_name, &args),
+                );
                 request.preview_diff = preview_diff_for_tool(tc_name, &args);
                 self.set_state(OrchestratorState::WaitingForUser);
                 self.events.emit(crate::events::Event::WaitingForUser);
@@ -700,6 +704,17 @@ impl Orchestrator {
 /// The confirmation panel used to be fed `format!("{:?}", args)`, which showed
 /// Rust's `Debug` output (`Object {"command": String("cat nope.txt")}`) — noisy
 /// and hard to read when approving a risky action.
+/// What the request is actually aimed at — the same convention the safety
+/// engine scores (`command` > `path` > `file_path`), so the confirmation panel
+/// can report a real risk level instead of "LOW" for everything.
+fn confirmation_target<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+    let _ = tool_name;
+    args.get("command")
+        .or_else(|| args.get("path"))
+        .or_else(|| args.get("file_path"))
+        .and_then(|value| value.as_str())
+}
+
 fn confirmation_description(tool_name: &str, args: &serde_json::Value) -> String {
     let mut preview = match args {
         serde_json::Value::Object(map) => {
@@ -713,8 +728,11 @@ fn confirmation_description(tool_name: &str, args: &serde_json::Value) -> String
         serde_json::Value::Null => String::new(),
         other => compact_value(other),
     };
-    if preview.chars().count() > 120 {
-        let truncated: String = preview.chars().take(117).collect();
+    // Long but bounded: the confirmation panel wraps this for display, so the
+    // operator can read the whole command before approving it.
+    const MAX_DESCRIPTION: usize = 400;
+    if preview.chars().count() > MAX_DESCRIPTION {
+        let truncated: String = preview.chars().take(MAX_DESCRIPTION - 1).collect();
         preview = format!("{truncated}\u{2026}");
     }
     if preview.is_empty() {
