@@ -78,6 +78,18 @@ deferred: []
 
 ## Implementation Notes
 
+<!-- Full route: appended during execution -->
+
+- Route `full` chosen by step-02 (`route_source: auto`): ~120 LOC across the renderer + tests, single file but non-mechanical.
+- The plan said preview flushes take `RENDER_GATE.try_lock()`, deferring on contention; implementation keeps the loop's existing iteration-wide gate hold, so the flush runs under the same gate the iteration holds and the deferral (parks at gate acquisition, flush lands a later tick) is strictly stronger. Same Always-rule, simpler code.
+- Divergence guard implemented as `PreviewFlush::Print/Diverged` on pure helpers (`completed_text`, `preview_prefix_matches`, `preview_flush`) so the deferred gates stay unit-testable; a deliberately held-back trailing partial line keeps the "announce whole lines" rule.
+- The end-of-run single-render guarantee is implemented as: suffix print when the committed preview is a strict line-prefix of the final render; today's full render otherwise (no-chunk runs match trivially -> full render).
+- `Commands::run` always returns Ok(()) — runtime errors surface as badges, not the return value; the stream-error e2e asserts failure via the `test_events` tap instead.
+- Matrix audit gaps the implementer left were closed by the orchestrator: stream-error rerouting used broken chunked framing (a clean EOF yields Ok, not a provider error); divergence e2e uses a growing code fence; a `test_preview_diverged` test tap added alongside `test_preview`.
+- 2026-11-05 verification: `cargo fmt --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace --all-targets` all green (CLI 288 incl. 4 preview smokes; total 943).
+- Implementation commit: 9123eed (full canonical id recorded in Review Triage Log entry 1 by step-04).
+
+
 <!-- Empty at planning time (full route) -->
 
 ## Plan Change Log
