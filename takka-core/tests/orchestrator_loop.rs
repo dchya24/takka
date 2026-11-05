@@ -1131,7 +1131,7 @@ fn run_emits_usage_event_from_provider_report() {
         tools.register(t);
     }
 
-    let mut orch = Orchestrator::new(provider, tools);
+    let orch = Orchestrator::new(provider, tools);
     orch.set_permission_mode(PermissionMode::Yolo);
 
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1177,7 +1177,7 @@ fn run_emits_no_usage_event_without_provider_report() {
         tools.register(t);
     }
 
-    let mut orch = Orchestrator::new(provider, tools);
+    let orch = Orchestrator::new(provider, tools);
     orch.set_permission_mode(PermissionMode::Yolo);
 
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1216,7 +1216,7 @@ async fn streaming_run_emits_usage_event_from_final_chunk() {
         tools.register(t);
     }
 
-    let mut orch = Orchestrator::new(provider, tools);
+    let orch = Orchestrator::new(provider, tools);
     orch.set_permission_mode(PermissionMode::Yolo);
 
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));

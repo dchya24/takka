@@ -586,6 +586,13 @@ pub struct Commands {
     test_runs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     test_events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Test-only tap (cfg(test)): the plain text of the preview lines the
+    /// last `run()` printed live, captured from the renderer thread's
+    /// `RenderFinal` (its terminal output is not capturable in-process).
+    #[cfg(test)]
+    test_preview: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    #[cfg(test)]
+    test_preview_diverged: std::sync::Arc<std::sync::Mutex<bool>>,
 }
 
 impl Default for Commands {
@@ -623,6 +630,10 @@ impl Commands {
             test_runs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             test_events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_preview: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_preview_diverged: std::sync::Arc::new(std::sync::Mutex::new(false)),
         }
     }
 
@@ -1826,6 +1837,14 @@ impl Commands {
         struct RenderFinal {
             /// Accumulated text from all streaming blocks.
             block_text: String,
+            /// Plain text of the preview lines printed live above the
+            /// status line, in print order (empty when nothing was
+            /// previewed — the no-chunk fallback signal).
+            preview_committed: Vec<String>,
+            /// True when the progressive re-render stopped extending the
+            /// printed prefix mid-run; the end-of-run path then keeps
+            /// today's full markdown render.
+            preview_diverged: bool,
         }
 
         let r_progress = progress.clone();
@@ -1854,6 +1873,14 @@ impl Commands {
                     let painter = painter.clone();
                     move || painter.lock().unwrap().erase()
                 };
+
+                // Live-preview state: the plain text of the lines already
+                // printed, the completed text they were rendered from
+                // (skips re-parsing when nothing new completed), and the
+                // divergence flag that ends previewing for this run.
+                let mut preview_committed: Vec<String> = Vec::new();
+                let mut preview_flushed = String::new();
+                let mut preview_diverged = false;
 
                 // Print the initial spinner.
                 commit_spinner();
@@ -1933,6 +1960,42 @@ impl Commands {
                         }
                     }
 
+                    // Live preview: announce newly completed streamed text
+                    // as styled markdown above the status line, riding the
+                    // console-log hook's erase → print → repaint cycle. The
+                    // flush runs under the render gate this iteration
+                    // already holds; when a prompt owns the gate the
+                    // renderer parks at the top of the tick (blocking lock),
+                    // which defers the whole flush to a later tick — the
+                    // gate is never contended twice and nothing prints
+                    // while the prompt is up.
+                    if !preview_diverged {
+                        let block_guard = block_text.lock().unwrap();
+                        let completed = completed_text(&block_guard);
+                        if completed != preview_flushed {
+                            match preview_flush(&preview_committed, completed) {
+                                PreviewFlush::Print(new_lines) => {
+                                    preview_flushed = completed.to_string();
+                                    if !new_lines.is_empty() {
+                                        consume_spinner();
+                                        inline::print_lines(&new_lines);
+                                        commit_spinner();
+                                        preview_committed
+                                            .extend(new_lines.iter().map(line_plain_text));
+                                    }
+                                }
+                                PreviewFlush::Diverged => {
+                                    // A later re-render changed lines that
+                                    // were already printed (e.g. a soft line
+                                    // break joined two of them). Stop
+                                    // previewing; the end-of-run path falls
+                                    // back to today's full render.
+                                    preview_diverged = true;
+                                }
+                            }
+                        }
+                    }
+
                     // Drain all available events (non-blocking).
                     if !events_done {
                         loop {
@@ -1971,6 +2034,8 @@ impl Commands {
 
                 RenderFinal {
                     block_text: block_text.into_inner().unwrap(),
+                    preview_committed,
+                    preview_diverged,
                 }
             })
             .expect("failed to spawn renderer thread");
@@ -2112,6 +2177,13 @@ impl Commands {
         stop_flag.store(true, Ordering::Relaxed);
 
         let render_final = renderer.join().expect("renderer thread panicked");
+        // Test tap: e2e tests observe what the live preview printed (the
+        // renderer thread's terminal output is not capturable in-process).
+        #[cfg(test)]
+        {
+            *self.test_preview.lock().unwrap() = render_final.preview_committed.clone();
+            *self.test_preview_diverged.lock().unwrap() = render_final.preview_diverged;
+        }
         // The question handler only does its spinner consume/re-arm dance
         // while this flag is set, so it never touches the screen in modes
         // where no transient spinner exists (e.g. the full-screen TUI).
@@ -2166,7 +2238,23 @@ impl Commands {
                 self.last_run.output_chars = source.chars().count();
                 if !source.is_empty() {
                     let parsed = md_widget::MarkdownContent::parse(source);
-                    inline::print_lines(&parsed.lines);
+                    // The live preview printed the streamed answer above the
+                    // status line: those lines ARE the final answer (design
+                    // decision A), so only the suffix the preview never
+                    // reached is emitted here — usually the trailing partial
+                    // line. A prefix mismatch (mid-run divergence, or a
+                    // final text that escaped the stream) keeps today's full
+                    // render — the story's documented duplication case. An
+                    // empty preview matches trivially, so the suffix is the
+                    // whole render: the no-chunk fallback stays today's path
+                    // exactly.
+                    let preview_is_the_answer = !render_final.preview_diverged
+                        && preview_prefix_matches(&render_final.preview_committed, &parsed.lines);
+                    if preview_is_the_answer {
+                        inline::print_lines(&parsed.lines[render_final.preview_committed.len()..]);
+                    } else {
+                        inline::print_lines(&parsed.lines);
+                    }
                 }
                 inline::print_blank();
             }
@@ -3487,8 +3575,6 @@ Instructions the agent follows when this skill is loaded.
 // Free function so it can be called from inside the spawned tokio task
 // without moving a closure (and therefore without capturing &self).
 
-/// Render a two-line transient area:
-///   Line 1: spinner progress
 // ── Transient status line ───────────────���───────────────────
 
 /// Per-run figures the REPL shows in its end-of-run summary.
@@ -3645,6 +3731,74 @@ impl StatusPainter {
         let _ = stdout.execute(MoveToColumn(0));
         let _ = stdout.execute(Clear(ClearType::FromCursorDown));
     }
+}
+
+// ── Live preview of streamed text (story 1.1) ────────────────
+//
+// While a run streams, the renderer announces each newly completed line
+// of `block_text` as styled markdown printed above the status line, using
+// the console-log hook's proven erase → print → repaint cycle. The printed
+// lines ARE the final answer: at end of run only the suffix the preview
+// never reached is printed, so the answer appears exactly once.
+
+/// One renderer tick's live-preview decision.
+enum PreviewFlush {
+    /// Styled lines to print below the already-printed ones (may be
+    /// empty — nothing new completed since the last flush).
+    Print(Vec<RLine<'static>>),
+    /// The re-render no longer extends the printed prefix (an earlier
+    /// line changed — e.g. a soft line break joined two printed lines).
+    /// The caller stops previewing for this run; the end-of-run path
+    /// falls back to today's full render.
+    Diverged,
+}
+
+/// Plain-text projection of a styled line, for prefix comparison.
+fn line_plain_text(line: &RLine<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// The portion of `text` safe to announce this tick: everything up to and
+/// including the last newline. A trailing fragment without a newline can
+/// still grow into a longer line, so it stays pending until the newline
+/// arrives (whole-line flush granularity — epic decision 2026-11-05a).
+fn completed_text(text: &str) -> &str {
+    match text.rfind('\n') {
+        Some(end) => &text[..=end],
+        None => "",
+    }
+}
+
+/// Strict-prefix check: every already-printed preview line must equal the
+/// plain text of the re-rendered line at the same position. This is the
+/// guardrail that turns any styled-line instability into the documented
+/// render-at-end fallback instead of corrupted scrollback. An empty
+/// `committed` matches trivially — the caller then prints the whole
+/// render, which is exactly today's no-preview behavior.
+fn preview_prefix_matches(committed: &[String], rendered: &[RLine<'_>]) -> bool {
+    rendered.len() >= committed.len()
+        && committed
+            .iter()
+            .zip(rendered)
+            .all(|(printed, line)| *printed == line_plain_text(line))
+}
+
+/// Decide what a preview flush prints: re-render the completed streamed
+/// text with `parse_partial` (auto-closing open fences, so open constructs
+/// can't leak their styling into later lines) and emit only the lines
+/// beyond what was already printed.
+fn preview_flush(committed: &[String], completed: &str) -> PreviewFlush {
+    if completed.is_empty() {
+        return PreviewFlush::Print(Vec::new());
+    }
+    let mut rendered = crate::widgets::markdown::MarkdownContent::parse_partial(completed);
+    if !preview_prefix_matches(committed, &rendered.lines) {
+        return PreviewFlush::Diverged;
+    }
+    PreviewFlush::Print(rendered.lines.split_off(committed.len()))
 }
 
 fn render_event(event: &takka_core::Event, timeline: &mut ToolTimeline, detailed: bool) {
@@ -4184,6 +4338,144 @@ mod status_painter_tests {
     }
 }
 
+// ── Live-preview flush helper tests (story 1.1) ──────────────
+
+#[cfg(test)]
+mod preview_flush_tests {
+    use super::*;
+    use crate::widgets::markdown::MarkdownContent as Md;
+
+    fn plains(lines: &[RLine<'static>]) -> Vec<String> {
+        lines.iter().map(line_plain_text).collect()
+    }
+
+    /// The happy-path shape of one flush: `Print` with plain-text lines.
+    fn printed(committed: &[String], text: &str) -> Vec<String> {
+        match preview_flush(committed, text) {
+            PreviewFlush::Print(lines) => plains(&lines),
+            PreviewFlush::Diverged => panic!("expected Print, got Diverged for {text:?}"),
+        }
+    }
+
+    /// Whole-line granularity: a trailing fragment without a newline can
+    /// still grow into a longer line, so it stays pending (deferred to a
+    /// later tick — the gate-contention path is this same deferral).
+    #[test]
+    fn trailing_partial_line_is_held_back() {
+        assert_eq!(completed_text("Hello wor"), "");
+        assert_eq!(completed_text("Hello\nwor"), "Hello\n");
+        assert_eq!(completed_text("Hello\n"), "Hello\n");
+        assert_eq!(completed_text(""), "");
+    }
+
+    /// Streaming arrival: the first flush prints the completed lines…
+    #[test]
+    fn first_flush_prints_completed_lines() {
+        assert_eq!(printed(&[], "Hello\n"), vec!["Hello"]);
+    }
+
+    /// …and each later flush prints only the suffix beyond what was
+    /// already printed — in arrival order, each line exactly once.
+    /// (Lines are blank-line-separated paragraphs: single-newline soft
+    /// breaks join into one line and are the divergence case below.)
+    #[test]
+    fn later_flushes_print_only_the_suffix() {
+        let committed = vec!["Hello".to_string()];
+        assert_eq!(printed(&committed, "Hello\n"), Vec::<String>::new());
+        assert_eq!(printed(&committed, "Hello\n\nWorld\n"), vec!["World"]);
+        assert_eq!(
+            printed(&committed, "Hello\n\nWorld\n\nSecond para\n"),
+            vec!["World", "Second para"]
+        );
+    }
+
+    /// Open-construct safety (story criterion 2): a chunk ending inside an
+    /// unfenced code block renders as a temporarily closed code block, so
+    /// no later non-code text can inherit code styling.
+    #[test]
+    fn open_fence_is_temporarily_closed() {
+        let p = printed(&[], "```rust\nfn a() {\n");
+        assert!(p.iter().any(|l| l.contains("fn a() {")), "code line: {p:?}");
+        let last = p.last().expect("non-empty render");
+        assert!(
+            last.contains("drag-select to copy"),
+            "fence closed temporarily: {p:?}"
+        );
+    }
+
+    /// …and the fence closes properly once only the closer arrives: the
+    /// temporary render was already exact, so the suffix is empty.
+    #[test]
+    fn fence_closes_properly_when_only_the_closer_arrives() {
+        let committed: Vec<String> = match preview_flush(&[], "```rust\nfn a() {\n") {
+            PreviewFlush::Print(lines) => lines.iter().map(line_plain_text).collect(),
+            PreviewFlush::Diverged => panic!("expected Print"),
+        };
+        assert_eq!(
+            printed(&committed, "```rust\nfn a() {\n```\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Guardrail, code-block case: more code arriving after a temporary
+    /// close shifts the block's bottom border into a line that was
+    /// already printed — the flush reports divergence instead of
+    /// corrupted scrollback, and the run falls back to today's render.
+    #[test]
+    fn code_lines_after_a_temporary_close_diverge_to_the_fallback() {
+        let committed: Vec<String> = match preview_flush(&[], "```rust\nfn a() {\n") {
+            PreviewFlush::Print(lines) => lines.iter().map(line_plain_text).collect(),
+            PreviewFlush::Diverged => panic!("expected Print"),
+        };
+        assert!(matches!(
+            preview_flush(&committed, "```rust\nfn a() {\n}\n```\nDone\n"),
+            PreviewFlush::Diverged
+        ));
+    }
+
+    /// Instability guardrail: when a later re-render changes a line that
+    /// was already printed (a soft line break joins two printed lines),
+    /// the flush reports divergence and the caller falls back to today's
+    /// render-at-end for that run.
+    #[test]
+    fn shifted_lines_diverge_to_the_fallback() {
+        let committed = vec!["line one".to_string()];
+        assert!(matches!(
+            preview_flush(&committed, "line one\nline two\n"),
+            PreviewFlush::Diverged
+        ));
+    }
+
+    /// End-of-run selection, no-chunk fallback (story criterion 5): an
+    /// empty printed prefix matches trivially, so the "suffix" is the
+    /// whole render — exactly today's single full render. (The leading
+    /// empty line is the markdown renderer's own heading spacing.)
+    #[test]
+    fn no_preview_matches_everything_and_yields_the_full_render() {
+        let parsed = Md::parse("# Title\n\nBody\n");
+        assert!(preview_prefix_matches(&[], &parsed.lines));
+        assert_eq!(plains(&parsed.lines), vec!["", "# Title", "Body"]);
+    }
+
+    /// End-of-run selection: printed lines the final render no longer
+    /// contains (final text escaped the stream, or a mid-run divergence)
+    /// must keep today's full render.
+    #[test]
+    fn mismatching_or_overshooting_prefixes_do_not_match() {
+        let parsed = Md::parse("real answer\n");
+        assert!(!preview_prefix_matches(
+            &["stale".to_string()],
+            &parsed.lines
+        ));
+        let longer = vec!["extra".to_string(), "lines".to_string()];
+        assert!(!preview_prefix_matches(&longer, &parsed.lines));
+        assert!(preview_prefix_matches(
+            &["real answer".to_string()],
+            &parsed.lines
+        ));
+    }
+}
+
 #[cfg(test)]
 mod search_snippet_tests {
     use super::*;
@@ -4336,6 +4628,12 @@ mod e2e_tests {
     /// with a connection error and never leaves the machine, keeping the
     /// tests hermetic.
     fn hermetic_runtime_config() -> std::path::PathBuf {
+        hermetic_runtime_config_at("http://127.0.0.1:9")
+    }
+
+    /// Same shape as [`hermetic_runtime_config`], pointed at an explicit
+    /// provider endpoint (the scripted SSE server of the streaming tests).
+    fn hermetic_runtime_config_at(api_base: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "agentic-e2e-{}-{}.json",
             std::process::id(),
@@ -4346,19 +4644,21 @@ mod e2e_tests {
         ));
         std::fs::write(
             &path,
-            r#"{
+            format!(
+                r#"{{
   "providers": [
-    {
+    {{
       "name": "hermetic-test",
       "type": "openai-compatible",
-      "api_base": "http://127.0.0.1:9",
+      "api_base": "{api_base}",
       "api_key": "unused",
       "models": [
-        { "model": "hermetic-model", "temperature": 0.0, "max_tokens": 64 }
+        {{ "model": "hermetic-model", "temperature": 0.0, "max_tokens": 64 }}
       ]
-    }
+    }}
   ]
-}"#,
+}}"#
+            ),
         )
         .expect("write hermetic runtime config");
         path
@@ -4606,6 +4906,288 @@ mod e2e_tests {
     #[tokio::test]
     async fn smoke_interrupt_mode_does_not_queue_spawned() {
         smoke_interrupt_mode_does_not_queue(RuntimeMode::Spawn).await;
+    }
+
+    /// Minimal OpenAI-compatible SSE server for the streaming tests:
+    /// answers every POST with a scripted streaming completion — the given
+    /// text deltas (a delay before each, so the renderer's 80 ms ticks see
+    /// them arrive one by one), then a `finish_reason: "stop"` event and
+    /// `[DONE]`. Chunked-transfer framed; the connection is closed after
+    /// the stream ends. Loops over incoming connections so the daemon
+    /// (`Spawn` mode) can use it too.
+    fn spawn_scripted_sse_server(deltas: Vec<(std::time::Duration, String)>) -> u16 {
+        spawn_scripted_sse_server_mode(deltas, false)
+    }
+
+    /// Streaming-preview harness variant: after the deltas the connection
+    /// drops without a stop frame or `[DONE]` — the provider-error path
+    /// (I/O matrix row: stream error mid-preview).
+    fn spawn_scripted_sse_server_abrupt(deltas: Vec<(std::time::Duration, String)>) -> u16 {
+        spawn_scripted_sse_server_mode(deltas, true)
+    }
+
+    fn spawn_scripted_sse_server_mode(
+        deltas: Vec<(std::time::Duration, String)>,
+        close_abruptly: bool,
+    ) -> u16 {
+        use std::io::{Read, Write};
+
+        fn write_chunk(stream: &mut std::net::TcpStream, payload: &str) -> std::io::Result<()> {
+            write!(stream, "{:x}\r\n{payload}\r\n", payload.len())?;
+            stream.flush()
+        }
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted SSE server");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::Builder::new()
+            .name("scripted-sse-server".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    // Drain the request (small JSON body arrives with the
+                    // head; the response only depends on nothing at all).
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                let head_end = buf
+                                    .windows(4)
+                                    .position(|w| w == b"\r\n\r\n")
+                                    .map(|pos| pos + 4);
+                                if let Some(head_end) = head_end {
+                                    let head = String::from_utf8_lossy(&buf[..head_end]);
+                                    let content_length: usize = head
+                                        .lines()
+                                        .find_map(|line| {
+                                            let (name, value) = line.split_once(':')?;
+                                            name.trim()
+                                                .eq_ignore_ascii_case("content-length")
+                                                .then(|| value.trim().parse().ok())?
+                                        })
+                                        .unwrap_or(0);
+                                    if buf.len() >= head_end + content_length {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let header =
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                    // The response head is written raw — chunked framing
+                    // applies to the body only.
+                    if stream.write_all(header.as_bytes()).is_err() {
+                        continue;
+                    }
+                    let _ = stream.flush();
+                    for (delay, delta) in &deltas {
+                        std::thread::sleep(*delay);
+                        let event = serde_json::json!({
+                            "id": "chatcmpl-scripted",
+                            "choices": [{
+                                "delta": {"content": delta},
+                                "finish_reason": serde_json::Value::Null,
+                            }]
+                        });
+                        if write_chunk(&mut stream, &format!("data: {event}\r\n\r\n")).is_err() {
+                            break;
+                        }
+                    }
+                    if !close_abruptly {
+                        let stop = serde_json::json!({
+                            "id": "chatcmpl-scripted",
+                            "choices": [{
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }]
+                        });
+                        let _ = write_chunk(&mut stream, &format!("data: {stop}\r\n\r\n"));
+                        let _ = write_chunk(&mut stream, "data: [DONE]\r\n\r\n");
+                        // Terminal chunk (size 0) closes the response body.
+                        let _ = write_chunk(&mut stream, "");
+                    }
+                    if close_abruptly {
+                        // Broken chunked framing after the deltas: reqwest's
+                        // body decoder fails mid-stream, which the provider
+                        // surfaces as a real stream error (not a tidy EOF).
+                        let _ = stream.write_all(b"this is not chunked framing\r\n");
+                        let _ = stream.flush();
+                        continue;
+                    }
+                }
+            })
+            .expect("spawn scripted SSE server");
+        port
+    }
+
+    /// Streaming-preview e2e (story 1.1, PTY-free): a scripted
+    /// OpenAI-compatible provider streams markdown deltas with delays; the
+    /// inline renderer path (`Commands::run` — shared by `takka run` and
+    /// the REPL) must surface every completed line through the live
+    /// preview in arrival order, each exactly once, and the end-of-run
+    /// path must not re-print the answer (the committed lines stand).
+    ///
+    /// The renderer thread's terminal output cannot be captured in-process,
+    /// so the assertion rides the cfg(test) tap on `RenderFinal` (the plain
+    /// text of the printed preview lines). Deltas arrive 120 ms apart, so
+    /// each completed line flushes within two 80 ms renderer ticks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_live_preview_prints_streamed_lines_in_order() {
+        let deltas = vec![
+            (
+                std::time::Duration::from_millis(120),
+                "# Title\n\n".to_string(),
+            ),
+            (
+                std::time::Duration::from_millis(120),
+                "First para\n\n".to_string(),
+            ),
+            (std::time::Duration::from_millis(120), "Second ".to_string()),
+            (std::time::Duration::from_millis(120), "para\n".to_string()),
+        ];
+        let port = spawn_scripted_sse_server(deltas);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        let _ = std::fs::remove_file(&fixture);
+        assert!(result.is_ok(), "run should complete: {:?}", result.err());
+
+        // The live preview printed each completed streamed line exactly
+        // once, in arrival order. (The leading empty line is the markdown
+        // renderer's own heading spacing; "Second " + "para\n" coalesce
+        // into one completed line.)
+        assert_eq!(
+            commands.test_preview.lock().unwrap().clone(),
+            vec![
+                "".to_string(),
+                "# Title".to_string(),
+                "First para".to_string(),
+                "Second para".to_string(),
+            ]
+        );
+    }
+
+    /// I/O matrix row "stream error mid-preview" (story 1.1): deltas are
+    /// previewed, then the connection drops without a stop frame; the run
+    /// reports the provider error while the already printed preview stays
+    /// as ordinary scrollback (only the status line is erased).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_live_preview_survives_provider_stream_error() {
+        let deltas = vec![(
+            std::time::Duration::from_millis(60),
+            "# Title\n\n".to_string(),
+        )];
+        let port = spawn_scripted_sse_server_abrupt(deltas);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+
+        let _run_result =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        let _ = std::fs::remove_file(&fixture);
+
+        // `Commands::run` always returns Ok (the runtime error is reported as
+        // a badge); assert the failure itself via the event tap.
+        let events = commands.test_events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("Stream read error: error decoding response body")),
+            "the broken framing surfaces as a provider stream error: {events:?}"
+        );
+        drop(events);
+        // The previewed line was printed before the drop and is kept.
+        assert!(!*commands.test_preview_diverged.lock().unwrap());
+        assert_eq!(
+            commands.test_preview.lock().unwrap().clone(),
+            vec!["".to_string(), "# Title".to_string()],
+        );
+    }
+
+    /// I/O matrix row "no streamed chunks" (story 1.1): nothing prints
+    /// live and `preview_diverged` stays false, so the end-of-run path
+    /// renders the full styled markdown exactly once (today's behavior).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_live_preview_no_chunks_falls_back_to_single_render() {
+        let port = spawn_scripted_sse_server(vec![]);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("hi"))
+            .await
+            .expect("Commands::run hung: no terminal event within 60s");
+        let _ = std::fs::remove_file(&fixture);
+
+        assert!(result.is_ok(), "run should complete: {:?}", result.err());
+        assert!(!*commands.test_preview_diverged.lock().unwrap());
+        // Nothing printed live: the preview tap is empty.
+        assert!(
+            commands.test_preview.lock().unwrap().is_empty(),
+            "no chunks must print no preview: {:?}",
+            commands.test_preview.lock().unwrap()
+        );
+    }
+
+    /// I/O matrix row "final text escapes the stream" (story 1.1): when
+    /// the progressive re-render would change lines already printed, the
+    /// flush reports divergence, previewing stops, and the end-of-run
+    /// path keeps today's full markdown render.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_live_preview_diverges_to_full_render() {
+        // An open code fence whose body keeps growing: the temporary
+        // close shifts the block's bottom border into already printed
+        // territory, which is the divergence trigger.
+        let deltas = vec![
+            (
+                std::time::Duration::from_millis(80),
+                "```rust\n".to_string(),
+            ),
+            (
+                std::time::Duration::from_millis(80),
+                "fn a() {}\n".to_string(),
+            ),
+        ];
+        let port = spawn_scripted_sse_server(deltas);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("hi"))
+            .await
+            .expect("Commands::run hung: no terminal event within 60s");
+        let _ = std::fs::remove_file(&fixture);
+
+        assert!(result.is_ok(), "run should complete: {:?}", result.err());
+        assert!(
+            *commands.test_preview_diverged.lock().unwrap(),
+            "growing code fence must diverge to the fallback"
+        );
     }
 }
 

@@ -698,6 +698,7 @@ impl Orchestrator {
 ///   return on execution).
 /// - `apply_patch`: returns the patch text directly (it's already a
 ///   unified diff).
+///
 /// One-line, human-readable description of a tool call for the confirmation
 /// prompt: `run_command(command="cat nope.txt")`.
 ///

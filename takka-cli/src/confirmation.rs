@@ -147,13 +147,9 @@ pub fn prompt_confirmation(request: &ConfirmationRequest) -> Option<Confirmation
 
     loop {
         let answer = if raw {
-            match read_prompt_key() {
-                Some(answer) => {
-                    echo_prompt_key(&answer);
-                    answer
-                }
-                None => return None,
-            }
+            let answer = read_prompt_key()?;
+            echo_prompt_key(&answer);
+            answer
         } else {
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_err() {

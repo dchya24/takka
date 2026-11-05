@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
 
     let console_layer = fmt::layer()
         .with_target(cli.debug)
-        .with_writer(|| widgets::log_writer::ConsoleLogWriter::new())
+        .with_writer(widgets::log_writer::ConsoleLogWriter::new)
         .with_filter(console_filter);
 
     let file_layer = match &log_file_path {
