@@ -3,7 +3,7 @@ type: epic
 title: "TUI completion parity"
 parent: "initiative-repl-ux-hardening"
 covers: ["R3"]
-after: [{ epic = 2, needs = "the TUI key dispatcher changes settled (mid-run input handling)" }]
+after: ["epic-mid-run-input"]
 refined: false
 risk: low
 ---
@@ -53,3 +53,7 @@ as the REPL's do.
 - parent — [Requirements](../initiative-repl-ux-hardening.md#requirements) (line R3)
 - source — `docs/tui-feature-gap.md`, sections G-01, G-02
 - companion — [memlog](.memlog.md)
+
+## Notes
+
+- Waits on epic-mid-run-input because: its stories settle the TUI key dispatcher changes (mid-run input handling) this epic builds on.

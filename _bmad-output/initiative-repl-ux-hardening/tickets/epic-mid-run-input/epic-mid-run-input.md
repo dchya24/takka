@@ -3,7 +3,7 @@ type: epic
 title: "Talk to the agent mid-run"
 parent: "initiative-repl-ux-hardening"
 covers: ["R1"]
-after: [{ epic = 1, needs = "the live-run rendering contract settled in the single-writer status painter and gate" }]
+after: ["epic-streaming-preview"]
 refined: false
 risk: medium
 ---
@@ -58,3 +58,7 @@ typed text visibly steering or queueing per mode in both UIs.
 - source — `docs/tui-feature-gap.md`, section "Real-time streaming" row (TUI mid-run input currently gated by `is_loading`)
 - adopted design — `docs/superpowers/specs/2026-08-06-interactive-live-progress-and-steering-design.md` (Fase 2b steer/queue contract this epic wires into)
 - companion — [memlog](.memlog.md)
+
+## Notes
+
+- Waits on epic-streaming-preview because: its closing stories fix the live-run rendering contract (painter + gate) this epic builds on.

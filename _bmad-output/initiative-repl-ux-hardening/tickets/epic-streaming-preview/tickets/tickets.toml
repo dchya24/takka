@@ -1,0 +1,57 @@
+# epic-streaming-preview — entries in build order; tickets.py ignores unknown keys.
+# next_id = 6 # written by `tickets.py move`; the folder's counter never goes below it
+
+[[entry]]
+id = 1
+type = "story"
+title = "Live preview of streamed text through the painter"
+description = "The thinnest path through every layer the epic touches: on each renderer tick the pending block_text accumulates as whole lines and prints above the status line via the painter's erase-print-repaint cycle; a run with no streamed chunks falls back to today's render once, at the end."
+verify = "Against a scripted streaming provider, reply words appear progressively above the status line while the run continues; on finish the styled markdown renders exactly once."
+covers = ["R1"]
+after = []
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "Preview line rules: wrap and resize"
+description = "Over-long streamed lines wrap once at the terminal width (same rule as the console-log hook); lines already printed are never reflowed after a resize, only new lines measure the new width."
+verify = "A 300-char line prints wrapped with no ghost columns; resizing mid-stream leaves printed lines untouched and new lines measure the new width."
+covers = ["R1"]
+after = [1]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Multi-block streaming and tool-row interleave"
+description = "Streamed text between tool calls flows in arrival order; tool rows and thinking blocks interleave through the same gate without eating preview lines or leaving the status line anywhere but last."
+verify = "A scripted multi-turn run (text → tool → text → tool → text) interleaves blocks and tool rows in arrival order, and the final render contains all blocks exactly once."
+covers = ["R1"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 4
+type = "story"
+title = "Finish and mid-stream cancel cleanup"
+description = "The run's terminal paths (natural finish and Ctrl+C) erase the status line exactly once and leave the printed preview lines as ordinary scrollback — no stray bands, no lost last line."
+verify = "Ctrl+C at each stream phase (thinking, preview, tool execution) leaves clean scrollback with already printed text intact."
+covers = ["R1"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Refactor sweep"
+description = "Cleanup only, scoped at its start from the plans and review findings the other entries deferred; anything pushed out of an entry here becomes a new story."
+verify = "Diff before/after touches only cleanup; full workspace checks stay green."
+covers = ["R1"]
+after = [1, 2, 3, 4]
+hitl = false
+risk = "low"
