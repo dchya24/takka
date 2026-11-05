@@ -5,6 +5,7 @@
 id = 1
 type = "story"
 title = "Live preview of streamed text through the painter"
+# refine passed 2026-11-05 (full criteria approved); not re-listed under ready_to_refine
 description = "The thinnest path through every layer the epic touches: on each renderer tick the pending block_text accumulates as whole lines and prints above the status line via the painter's erase-print-repaint cycle; a run with no streamed chunks falls back to today's render once, at the end."
 verify = "Against a scripted streaming provider, reply words appear progressively above the status line while the run continues; on finish the styled markdown renders exactly once."
 covers = ["R1"]
