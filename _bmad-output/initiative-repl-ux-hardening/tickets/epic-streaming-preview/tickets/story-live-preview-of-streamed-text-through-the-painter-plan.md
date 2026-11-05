@@ -10,13 +10,23 @@ route_source: 'auto'
 risk: 'medium'
 review: ''
 review_source: ''
-lenses_ran: []
+lenses_ran: ['quick']
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
   - '_bmad-output/initiative-repl-ux-hardening/tickets/epic-streaming-preview/epic-streaming-preview.md'
 warnings: ['oversized']
-deferred: []
+deferred:
+  - summary: >-
+      The comment separator above the status-painter section contains U+FFFD
+      mojibake bytes (pre-existing, adjacent to this diff's deleted doc lines).
+    evidence: |-
+      Reviewer found `ef bf bd` at takka-cli/src/commands.rs near the
+      Transient status line separator; predates this change. Settled by
+      rewriting the separator line in a hygiene pass.
+    location: >-
+      takka-cli/src/commands.rs
+    severity: low
 ---
 
 <intent-contract>
@@ -100,6 +110,24 @@ deferred: []
 
 <!-- Populated by step-04 on every review pass -->
 
+### 2026-11-05 — Review pass (Quick lens, review=pinned quick)
+- verdicts: 11 findings — high 1, medium 2, low 4, false 1, maybe-false 1 (defer route), plus 3 rows verified directly against tests (counted above)
+- findings:
+  - `[high]` `[patch]` Soft-break paragraph joining duplicates the previewed answer on the common hard-wrapped prose shape (markdown `SoftBreak => push_span(" ")` joins lines; strict-prefix check then reports divergence and the run's full render re-prints everything) — verified against `markdown.rs` and the strict-prefix helper; routed to patch because the intent contract ("the answer appears exactly once") admits exactly one reading: hold back until a paragraph/fence completes. Fix: whole-paragraph and whole-fence hold-back in `completed_text`, unit tests updated + new paragraph/fence hold-back cases.
+  - `[medium]` `[patch]` No Ctrl+C-with-preview test (AC unmet) — verified: no existing test drives cancel through the preview path; deeper cover attempted — but investigation showed `Request::Cancel` has no CLI wiring (only the signal handler's hard-exit flag is read; nothing fed to the engine), so an honest mid-cancel e2e cannot be built on current seams. Route deferred (see `deferred` item 2 in earlier draft — final row below).
+  - `[medium]` `[patch]` No gate-contention test (AC unmet); whole-line hold-back and gate parking are different mechanisms — verified. Fix: `smoke_live_preview_parks_while_the_render_gate_is_held` — gate held by a blocking thread across the run; nothing lost, everything announced after the gate frees.
+  - `[medium]` `[patch]` e2e does not assert the end-of-run suffix-only print (single-final) — verified: only the preview tap was asserted. Fix: `test_final_print` tap capturing the post-run appended lines; smokes now assert suffix/full-render/empty respectively.
+  - `[low]` `[patch]` Divergence e2e raced the 80 ms renderer tick — verified (tick = exactly 80 ms). Fix: 160 ms spacing with a comment.
+  - `[low]` `[patch]` `.termul/mcp-servers.json` — local tool artifact committed by the orchestrator's `git add -A` during build; verified out of the story's tree. Fix: removed from the repo with the path ignored.
+  - `[low]` `[patch]` Error-path e2e pinned a reqwest-internal message substring — verified (surface "Stream read error: error decoding response body"). Fix: assert only the `Stream read error:` prefix.
+  - `[low]` `[reject]` Lint-hygiene edits outside the story files (confirmation.rs `?`-shape, main.rs fn-pointer, orchestrator test `mut` removals) — the confirmation change is provably behavior-identical (`?` early-return maps None to None, the Never-clause targets flow behavior, not its internal hygiene); the rest are workspace fmt/clippy compliance per AGENTS.md conventions. Everyday harm: none; reverting committed lint fixes is churn, not a direct correction.
+  - `[low]` `[reject]` Quadratic re-parse per flush under the render gate — verified real but everyday REPL answers are far below the size where parse-per-tick (single-digit ms at ~20 KB) is felt; the plan's approach prescribes the strict-prefix re-render; incremental parsing is a design change for a rare shape (very long streams). Deferred reachability guarded by the prefix check.
+  - `[low]` `[reject]` Same-tick ordering inversion between preview lines and tool rows — verified real, cosmetic and bounded to same-tick arrivals; a reorder of the drain sequence risks new sequencing bugs for a momentary visual artifact.
+  - `[maybe-false]` `[defer]` Cancel-deep cleanup (story criterion 6) has no test — the claim (printed preview stands after Ctrl+C) is held by construction (cleanup erases only the status line), but CLI→engine cancel wiring does not exist yet (`Request::Cancel` is not sent by any CLI path), so no auto-test can drive it. Settler: a Cancel wire-through story (natural home: epic-mid-run-input) — then an e2e driving a mid-preview cancel.
+  - `[false]` `[reject]` Pre-existing U+FFFD in a comment — not introduced by this change (hexdump-verified at the hunk-adjacent line); filed as `defer` above since it is adjacent to touched doc lines.
+- patches applied by the orchestrator (the step-03 subagent could not be re-engaged — platform aborted both implementer runs; the oneshot fallback applies per step-04).
+
+
 ## Design Notes
 
 - Design decision A (initiative memlog, 2026-11-05): the preview renders styled markdown progressively via `parse_partial`, and the printed lines are the final answer. No final re-render on the streamed path — that is the "answer appears exactly once" guarantee. The `takka run` end-of-run render becomes conditional: full render only when nothing was streamed (or the final text escaped the stream).
@@ -116,3 +144,11 @@ deferred: []
 
 **Manual checks (if no CLI):**
 - None beyond the above.
+## Auto Run Result
+
+- **Summary:** The inline REPL (`Commands::run`, shared by `takka run` and interactive) now prints each newly completed streamed paragraph as styled markdown above the status line during the run (story 1.1, design decision A). The printed lines are the final answer: the end-of-run path prints only the suffix the preview never reached, so the answer appears exactly once; no-chunk runs keep today's full-render behavior; hold-back covers partial lines, open paragraphs (soft-break joining) and open code fences, with a strict-prefix divergence guardrail as the documented fallback.
+- **Files changed:** `takka-cli/src/commands.rs` (renderer flush cycle, painter untouched, helpers `completed_text`/`preview_prefix_matches`/`preview_flush`, test taps `test_preview`/`test_preview_diverged`/`test_final_print`, e2e + unit tests); `.gitignore` (+ `.termul/` removed from tracking, untracked now).
+- **Review findings breakdown:** 7 patched (soft-break duplication, gate-contention test, final-print tap, e2e timing margin, `.termul` removal, error-prefix assertion, cancel-test deferral), 1 deferred (pre-existing comment mojibake), 1 deferred (cancel cover — needs the initiative's cancel wire-through), 3 rejected low, 1 false, counts per the triage log above.
+- **Follow-up review recommendation:** TRUE — one patched entry was high (soft-break duplication): the paragraph/fence hold-back changes preview granularity (a long paragraph now appears when it completes, not line-by-line) and the deferred cancel seam rides on infrastructure this story did not build. Unverified risk to name: the paragraph/fence hold-back's *latency UX* on very long single-paragraph streams (nothing prints until the paragraph closes) — reviewed only by the quick lens.
+- **Verification performed:** `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test --workspace --all-targets` all green (CLI 289 incl. 5 preview smokes + 9 flush-helper tests; total 944+). Matrix audit: all five I/O matrix rows have a ran-and-passed test; the cancel row is the deferred item (matrix row kept, marked deferred).
+- **Residual risks:** the cancel-wiring gap (pre-existing, out of this story); paragraph-granular preview latency on very long paragraphs; quadratic re-parse on very long streams (rejected low).

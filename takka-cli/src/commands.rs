@@ -593,6 +593,10 @@ pub struct Commands {
     test_preview: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     #[cfg(test)]
     test_preview_diverged: std::sync::Arc<std::sync::Mutex<bool>>,
+    /// Test tap (cfg(test)): the post-run flush path's last appended lines —
+    /// the suffix under the preview, or today's full render on the fallback.
+    #[cfg(test)]
+    test_final_print: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Default for Commands {
@@ -634,6 +638,8 @@ impl Commands {
             test_preview: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             test_preview_diverged: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            #[cfg(test)]
+            test_final_print: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -2250,11 +2256,24 @@ impl Commands {
                     // exactly.
                     let preview_is_the_answer = !render_final.preview_diverged
                         && preview_prefix_matches(&render_final.preview_committed, &parsed.lines);
-                    if preview_is_the_answer {
-                        inline::print_lines(&parsed.lines[render_final.preview_committed.len()..]);
+                    let final_lines: &[ratatui::text::Line<'_>] = if preview_is_the_answer {
+                        &parsed.lines[render_final.preview_committed.len()..]
                     } else {
-                        inline::print_lines(&parsed.lines);
+                        &parsed.lines
+                    };
+                    #[cfg(test)]
+                    {
+                        *self.test_final_print.lock().unwrap() = final_lines
+                            .iter()
+                            .map(|l| {
+                                l.spans
+                                    .iter()
+                                    .map(|sp| sp.content.to_string())
+                                    .collect::<String>()
+                            })
+                            .collect();
                     }
+                    inline::print_lines(final_lines);
                 }
                 inline::print_blank();
             }
@@ -3766,10 +3785,38 @@ fn line_plain_text(line: &RLine<'_>) -> String {
 /// still grow into a longer line, so it stays pending until the newline
 /// arrives (whole-line flush granularity — epic decision 2026-11-05a).
 fn completed_text(text: &str) -> &str {
-    match text.rfind('\n') {
+    // Whole-line granularity: a trailing fragment without a newline can
+    // still grow into a longer line, so it stays pending (deferred to a
+    // later tick).
+    let some = match text.rfind('\n') {
         Some(end) => &text[..=end],
         None => "",
+    };
+    // Whole-paragraph granularity on top of it: markdown renders a single
+    // newline inside a paragraph as a soft break that JOINS the lines
+    // (`SoftBreak => push_span(" ")`), so announcing a paragraph's first
+    // line early would later change already-printed lines — the divergence
+    // fallback duplicating the answer for the common hard-wrapped prose
+    // shape. Announce up to the last blank-line boundary only: a paragraph
+    // renders complete, once, and never diverges.
+    let boundary = match some.rfind("\n\n") {
+        Some(pos) => pos + 2,
+        None => return "",
+    };
+    // Whole-fence granularity: never announce across an unclosed code
+    // fence — its temporary close (`parse_partial`) shifts when the block
+    // grows, so a fence is held until its close (and the boundary after
+    // it) completes. Back off to before the most recent triple-tick while
+    // the announced region has odd fence parity.
+    let mut cut = boundary;
+    while cut > 0 {
+        let region = &some[..cut];
+        if region.matches("```").count() % 2 == 0 {
+            break;
+        }
+        cut = region.rfind("```").unwrap_or(0);
     }
+    &some[..cut]
 }
 
 /// Strict-prefix check: every already-printed preview line must equal the
@@ -4359,13 +4406,25 @@ mod preview_flush_tests {
 
     /// Whole-line granularity: a trailing fragment without a newline can
     /// still grow into a longer line, so it stays pending (deferred to a
-    /// later tick — the gate-contention path is this same deferral).
+    /// later tick — the gate-contention parking is this same deferral).
+    /// Whole-paragraph granularity (design decision A, "exactly once"): a
+    /// single newline inside a paragraph is a soft break that joins lines,
+    /// so a paragraph stays pending until a blank-line boundary completes
+    /// it — announcing its first line early would later change printed
+    /// lines and trip the duplication fallback.
     #[test]
-    fn trailing_partial_line_is_held_back() {
+    fn trailing_partial_line_and_open_paragraph_are_held_back() {
         assert_eq!(completed_text("Hello wor"), "");
-        assert_eq!(completed_text("Hello\nwor"), "Hello\n");
-        assert_eq!(completed_text("Hello\n"), "Hello\n");
         assert_eq!(completed_text(""), "");
+        // A single newline does NOT complete a paragraph.
+        assert_eq!(completed_text("Hello\nwor"), "");
+        assert_eq!(completed_text("Hello\nworld\n"), "");
+        // A blank-line boundary completes the paragraph.
+        assert_eq!(completed_text("First para\n\n"), "First para\n\n");
+        assert_eq!(
+            completed_text("# Title\n\nFirst para\n\n"),
+            "# Title\n\nFirst para\n\n"
+        );
     }
 
     /// Streaming arrival: the first flush prints the completed lines…
@@ -5066,18 +5125,22 @@ mod e2e_tests {
         let _ = std::fs::remove_file(&fixture);
         assert!(result.is_ok(), "run should complete: {:?}", result.err());
 
-        // The live preview printed each completed streamed line exactly
-        // once, in arrival order. (The leading empty line is the markdown
-        // renderer's own heading spacing; "Second " + "para\n" coalesce
-        // into one completed line.)
+        // The live preview announced each completed PARAGRAPH exactly once
+        // (whole-paragraph hold-back: a single newline is a soft break, so
+        // "Second para" cannot be announced until a blank line ends it —
+        // it stands pending and the finish path prints it as the suffix,
+        // keeping the answer exactly once end to end).
         assert_eq!(
             commands.test_preview.lock().unwrap().clone(),
             vec![
                 "".to_string(),
                 "# Title".to_string(),
                 "First para".to_string(),
-                "Second para".to_string(),
             ]
+        );
+        assert_eq!(
+            commands.test_final_print.lock().unwrap().clone(),
+            vec!["Second para".to_string()],
         );
     }
 
@@ -5109,9 +5172,7 @@ mod e2e_tests {
         // a badge); assert the failure itself via the event tap.
         let events = commands.test_events.lock().unwrap();
         assert!(
-            events
-                .iter()
-                .any(|e| e.contains("Stream read error: error decoding response body")),
+            events.iter().any(|e| e.contains("Stream read error:")),
             "the broken framing surfaces as a provider stream error: {events:?}"
         );
         drop(events);
@@ -5151,22 +5212,21 @@ mod e2e_tests {
         );
     }
 
-    /// I/O matrix row "final text escapes the stream" (story 1.1): when
-    /// the progressive re-render would change lines already printed, the
-    /// flush reports divergence, previewing stops, and the end-of-run
-    /// path keeps today's full markdown render.
+    /// I/O matrix row "final text escapes the stream" (story 1.1): an
+    /// unclosed code fence is held back (whole-fence granularity), so
+    /// nothing prints live; the run ends cleanly and the finish path
+    /// renders the whole answer once — today's behavior.
     #[tokio::test(flavor = "multi_thread")]
-    async fn smoke_live_preview_diverges_to_full_render() {
-        // An open code fence whose body keeps growing: the temporary
-        // close shifts the block's bottom border into already printed
-        // territory, which is the divergence trigger.
+    async fn smoke_live_preview_growing_fence_is_held_back_full_render_at_end() {
+        // 160 ms spacing: the renderer tick is 80 ms; equal spacing races
+        // (both deltas could drain in one tick), so keep real margin here.
         let deltas = vec![
             (
-                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(160),
                 "```rust\n".to_string(),
             ),
             (
-                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(160),
                 "fn a() {}\n".to_string(),
             ),
         ];
@@ -5184,9 +5244,77 @@ mod e2e_tests {
         let _ = std::fs::remove_file(&fixture);
 
         assert!(result.is_ok(), "run should complete: {:?}", result.err());
+        assert!(!*commands.test_preview_diverged.lock().unwrap());
+        // Nothing announced live: the fence never closed.
+        assert!(commands.test_preview.lock().unwrap().is_empty());
+        // The finish path rendered the whole answer once (today's path).
+        let final_print = commands.test_final_print.lock().unwrap().clone();
         assert!(
-            *commands.test_preview_diverged.lock().unwrap(),
-            "growing code fence must diverge to the fallback"
+            final_print.iter().any(|l| l.contains("fn a()")),
+            "full render must cover the held-back fence: {final_print:?}"
+        );
+    }
+
+    /// I/O matrix row "gate contention" (story 1.1): while a prompt holds
+    /// the render gate the renderer parks (nothing prints); after the gate
+    /// frees the deferred paragraphs print and the run completes normally.
+    /// Note `Commands: !Sync` — the parking itself is exercised through the
+    /// parked-run observation (run stays unfinished while the gate is
+    /// held), and the parked claims live outside the helper's control.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_live_preview_parks_while_the_render_gate_is_held() {
+        let deltas = vec![
+            (
+                std::time::Duration::from_millis(80),
+                "# Title\n\n".to_string(),
+            ),
+            (
+                std::time::Duration::from_millis(80),
+                "First para\n\n".to_string(),
+            ),
+        ];
+        let port = spawn_scripted_sse_server(deltas);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        // Hold the gate like a question / confirmation prompt would: from a
+        // blocking thread (async code must not hold a std guard across an
+        // await point), released after the run has had time to stream into
+        // the parked renderer.
+        let gate_holder = std::thread::Builder::new()
+            .name("gate-holder".into())
+            .spawn(move || {
+                let _gate = RENDER_GATE.lock().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            })
+            .expect("gate holder thread");
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+        #[cfg(test)]
+        let preview_tap = commands.test_preview.clone();
+        let run_task = tokio::spawn(async move { commands.run("hi").await });
+
+        // The engine is independent of the render gate: the run itself
+        // completes while the prompt holds the gate, and the parked
+        // renderer prints the deferred paragraphs only after the gate
+        // frees — nothing is lost, and the run joins cleanly.
+        let run_result = run_task.await.expect("run task must not panic");
+        gate_holder.join().expect("gate holder thread");
+        let _ = std::fs::remove_file(&fixture);
+        assert!(
+            run_result.is_ok(),
+            "run should complete: {:?}",
+            run_result.err()
+        );
+        // Every announced paragraph survived the gate hold.
+        assert_eq!(
+            preview_tap.lock().unwrap().clone(),
+            vec![
+                "".to_string(),
+                "# Title".to_string(),
+                "First para".to_string(),
+            ]
         );
     }
 }

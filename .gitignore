@@ -42,3 +42,4 @@ omp-session-*.html
 logs/
 
 .worktrees
+.termul/
