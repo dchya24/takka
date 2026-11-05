@@ -1,0 +1,25 @@
+# initiative-repl-ux-hardening — epics in build order; tickets.py ignores unknown keys.
+# next_id = 4 # written by `tickets.py move`; the folder's counter never goes below it
+
+[[epic]]
+id = 1
+slug = "epic-streaming-preview"
+title = "Live streaming reply"
+description = "An in-flight streamed answer is readable progressively in the inline REPL, ending in the existing final markdown render, with clean scrollback on finish and on mid-stream cancel; its closing stories fix the live-run rendering contract (painter + gate) that epic 2 builds on."
+covers = ["R2"]
+
+[[epic]]
+id = 2
+slug = "epic-mid-run-input"
+title = "Talk to the agent mid-run"
+description = "Typed text during an active run reaches the engine's steer/follow-up contract in both the inline REPL and the TUI, and visibly takes effect at the next boundary."
+covers = ["R1"]
+after = [{ epic = 1, needs = "the live-run rendering contract settled in the single-writer status painter and gate" }]
+
+[[epic]]
+id = 3
+slug = "epic-tui-completions"
+title = "TUI completion parity"
+description = "The TUI lists and accepts slash-command and file-path completions like the inline REPL does."
+covers = ["R3"]
+after = [{ epic = 2, needs = "the TUI key dispatcher changes settled (mid-run input handling)" }]
