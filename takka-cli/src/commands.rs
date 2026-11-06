@@ -3776,7 +3776,7 @@ Instructions the agent follows when this skill is loaded.
 // Free function so it can be called from inside the spawned tokio task
 // without moving a closure (and therefore without capturing &self).
 
-// ── Transient status line ───────────────���───────────────────
+// ── Transient status line ─────────────────────────────────────
 
 /// Per-run figures the REPL shows in its end-of-run summary.
 #[derive(Debug, Default, Clone, Copy)]
