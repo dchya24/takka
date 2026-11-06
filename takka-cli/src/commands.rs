@@ -597,6 +597,11 @@ pub struct Commands {
     /// the suffix under the preview, or today's full render on the fallback.
     #[cfg(test)]
     test_final_print: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Test tap (cfg(test)): the interleaved print order of the last run —
+    /// `text:<line>` / `tool:<name>` / `thinking` markers from the renderer
+    /// (story 1.3 e2e interleave assertion).
+    #[cfg(test)]
+    test_render_order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Default for Commands {
@@ -640,6 +645,8 @@ impl Commands {
             test_preview_diverged: std::sync::Arc::new(std::sync::Mutex::new(false)),
             #[cfg(test)]
             test_final_print: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_render_order: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1780,8 +1787,6 @@ impl Commands {
         // `/timeline compact` keeps one row per tool: no streamed output, no
         // error bodies, no diff hunks.
         let timeline_detailed = self.timeline_style() == TimelineStyle::Detailed;
-        let (event_tx, event_rx) = std::sync::mpsc::channel::<takka_core::Event>();
-
         // ── Live rendering strategy (single writer) ───────────
         //
         // ALL terminal output during the run flows through ONE task
@@ -1811,10 +1816,24 @@ impl Commands {
         // for — but without line-counting bugs, because the renderer tracks
         // visual lines accurately for the ONE block it replaces.
 
-        // Chunk channel: on_chunk forwards deltas here instead of writing
-        // to stdout directly (keeps all writes in the renderer task).
-        // Chunk channel (std::sync::mpsc for cross-thread use).
-        let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<String>();
+        /// One queue item: a streamed delta or a lifecycle event (story 1.3).
+        ///
+        /// ONE ordered queue, drained in arrival order: stdout positions fall
+        /// out of the queue itself, so text announced live sits above the
+        /// tool/thinking row that arrived after it. The order is total
+        /// because every runtime mode folds deltas and events through the
+        /// same async `run_turn` loop (`takka-cli/src/client.rs`) — two
+        /// separate channels drained chunks-first-every-tick could print a
+        /// tool row below text that arrived after it (the same-tick
+        /// inversion story 1.1 kept in scope).
+        enum RendererUpdate {
+            /// A streamed answer delta (appends to the preview text).
+            Chunk(String),
+            /// A lifecycle event (tool row / thinking block / badges).
+            Event(takka_core::Event),
+        }
+
+        let (update_tx, update_rx) = std::sync::mpsc::channel::<RendererUpdate>();
 
         let progress = std::sync::Arc::new(std::sync::Mutex::new({
             let mut p = progress::ProgressState::new();
@@ -1851,6 +1870,12 @@ impl Commands {
             /// printed prefix mid-run; the end-of-run path then keeps
             /// today's full markdown render.
             preview_diverged: bool,
+            /// cfg(test) only: the interleaved print order of the run —
+            /// `text:<line>` for live preview lines, `tool:<name>` for
+            /// timeline rows, `thinking` for thinking blocks. The e2e
+            /// smokes assert the story-1.3 interleave against this list.
+            #[cfg(test)]
+            render_order: Vec<String>,
         }
 
         let r_progress = progress.clone();
@@ -1880,13 +1905,12 @@ impl Commands {
                     move || painter.lock().unwrap().erase()
                 };
 
-                // Live-preview state: the plain text of the lines already
-                // printed, the completed text they were rendered from
-                // (skips re-parsing when nothing new completed), and the
-                // divergence flag that ends previewing for this run.
-                let mut preview_committed: Vec<String> = Vec::new();
-                let mut preview_flushed = String::new();
-                let mut preview_diverged = false;
+                // Live-preview state (story 1.1 machinery, unchanged): the
+                // plain text of the lines already printed, the completed
+                // text they were rendered from (skips re-parsing when
+                // nothing new completed), and the divergence flag that
+                // ends previewing for this run.
+                let mut preview = PreviewTracker::default();
 
                 // Print the initial spinner.
                 commit_spinner();
@@ -1920,17 +1944,15 @@ impl Commands {
                     _log_hook_guard = crate::widgets::log_writer::SpinnerHookGuard::install(hook);
                 }
 
-                // Wrap the receivers in a Mutex so we can share them
-                // (they are !Sync but we only access from this thread).
-                let chunk_rx = std::sync::Mutex::new(chunk_rx);
-                let event_rx = std::sync::Mutex::new(event_rx);
-                let mut chunks_done = false;
-                let mut events_done = false;
+                // Wrap the receiver in a Mutex so we can access it
+                // (it is !Sync but we only access from this thread).
+                let update_rx = std::sync::Mutex::new(update_rx);
+                let mut updates_done = false;
                 // Tool call arguments keyed by call id, for the timeline rows.
                 let mut timeline = ToolTimeline::default();
 
                 loop {
-                    if chunks_done && events_done {
+                    if updates_done {
                         break;
                     }
 
@@ -1948,65 +1970,63 @@ impl Commands {
                         redraw_spinner();
                     }
 
-                    // Drain all available chunks (non-blocking).
-                    if !chunks_done {
+                    // Drain the queue in ARRIVAL ORDER (story 1.3): chunks
+                    // append to the preview text; an event's row renders
+                    // only after the text that arrived before it has been
+                    // announced; trailing chunks announce at tick end —
+                    // today's pure-text behavior. The whole drain runs
+                    // under the render gate this iteration already holds;
+                    // when a prompt owns the gate the renderer parks at the
+                    // top of the tick (blocking lock), which defers the
+                    // whole tick to a later one — the gate is never
+                    // contended twice and nothing prints while the prompt
+                    // is up.
+                    let mut pending_text = false;
+                    if !updates_done {
                         loop {
-                            match chunk_rx.lock().unwrap().try_recv() {
-                                Ok(chunk) => {
+                            match update_rx.lock().unwrap().try_recv() {
+                                Ok(RendererUpdate::Chunk(chunk)) => {
                                     if !chunk.is_empty() {
                                         block_text.lock().unwrap().push_str(&chunk);
+                                        pending_text = true;
                                     }
                                 }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    chunks_done = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Live preview: announce newly completed streamed text
-                    // as styled markdown above the status line, riding the
-                    // console-log hook's erase → print → repaint cycle. The
-                    // flush runs under the render gate this iteration
-                    // already holds; when a prompt owns the gate the
-                    // renderer parks at the top of the tick (blocking lock),
-                    // which defers the whole flush to a later tick — the
-                    // gate is never contended twice and nothing prints
-                    // while the prompt is up.
-                    if !preview_diverged {
-                        let block_guard = block_text.lock().unwrap();
-                        let completed = completed_text(&block_guard);
-                        if completed != preview_flushed {
-                            match preview_flush(&preview_committed, completed) {
-                                PreviewFlush::Print(new_lines) => {
-                                    preview_flushed = completed.to_string();
-                                    if !new_lines.is_empty() {
-                                        consume_spinner();
-                                        inline::print_lines(&new_lines);
-                                        commit_spinner();
-                                        preview_committed
-                                            .extend(new_lines.iter().map(line_plain_text));
+                                Ok(RendererUpdate::Event(event)) => {
+                                    // Arrival order: announce the streamed
+                                    // text queued before this event first,
+                                    // so its row prints BELOW that text.
+                                    if pending_text {
+                                        let block_guard = block_text.lock().unwrap();
+                                        preview.announce(
+                                            block_guard.as_str(),
+                                            &consume_spinner,
+                                            &commit_spinner,
+                                        );
+                                        pending_text = false;
                                     }
-                                }
-                                PreviewFlush::Diverged => {
-                                    // A later re-render changed lines that
-                                    // were already printed (e.g. a soft line
-                                    // break joined two of them). Stop
-                                    // previewing; the end-of-run path falls
-                                    // back to today's full render.
-                                    preview_diverged = true;
-                                }
-                            }
-                        }
-                    }
-
-                    // Drain all available events (non-blocking).
-                    if !events_done {
-                        loop {
-                            match event_rx.lock().unwrap().try_recv() {
-                                Ok(event) => {
+                                    // Thinking suppression (story 1.3
+                                    // decision, 2026-11-06): the tool-call
+                                    // turn's Thinking event re-posts the
+                                    // turn's streamed content, which the
+                                    // preview has already printed as the
+                                    // answer (design decision A) — skip it
+                                    // whenever the full text is inside the
+                                    // flushed preview. Not fully previewed,
+                                    // or a diverged preview: renders as
+                                    // today. No terminal work happens when
+                                    // suppressed, so the status line keeps
+                                    // its position untouched.
+                                    if let takka_core::Event::Thinking { content } = &event {
+                                        if !preview.diverged
+                                            && !content.trim().is_empty()
+                                            && preview
+                                                .flushed
+                                                .trim_end()
+                                                .ends_with(content.trim_end())
+                                        {
+                                            continue;
+                                        }
+                                    }
                                     // Erase the status line first: the row
                                     // (or a thinking block) must land where
                                     // the spinner was, and `commit_spinner`
@@ -2020,16 +2040,48 @@ impl Commands {
                                         || matches!(event, takka_core::Event::Thinking { .. })
                                     {
                                         render_event(&event, &mut timeline, timeline_detailed);
+                                        // cfg(test): record what actually
+                                        // printed for the interleave
+                                        // assertions — the thinking block
+                                        // (non-empty content only) and the
+                                        // tool completion row (under
+                                        // `show_tool_calls`). ToolFinished
+                                        // is a synthesized echo with no
+                                        // `render_event` arm (prints
+                                        // nothing), and ToolDelta lines only
+                                        // print in detailed mode — neither
+                                        // is marked.
+                                        #[cfg(test)]
+                                        match &event {
+                                            takka_core::Event::Thinking { content }
+                                                if !content.trim().is_empty() =>
+                                            {
+                                                preview.order.push("thinking".to_string())
+                                            }
+                                            takka_core::Event::ToolOutput { .. }
+                                                if render_panels =>
+                                            {
+                                                preview.order.push("tool".to_string())
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                     commit_spinner();
                                 }
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    events_done = true;
+                                    updates_done = true;
                                     break;
                                 }
                             }
                         }
+                    }
+                    // End-of-tick flush: pure-text ticks announce
+                    // their completed paragraphs here (unchanged rule for
+                    // ticks without events).
+                    if pending_text {
+                        let block_guard = block_text.lock().unwrap();
+                        preview.announce(block_guard.as_str(), &consume_spinner, &commit_spinner);
                     }
                 }
 
@@ -2040,8 +2092,10 @@ impl Commands {
 
                 RenderFinal {
                     block_text: block_text.into_inner().unwrap(),
-                    preview_committed,
-                    preview_diverged,
+                    preview_committed: preview.committed,
+                    preview_diverged: preview.diverged,
+                    #[cfg(test)]
+                    render_order: preview.order,
                 }
             })
             .expect("failed to spawn renderer thread");
@@ -2068,7 +2122,7 @@ impl Commands {
                             p.set_phase(progress::Phase::Streaming);
                             p.add_stream_chars(chunk.chars().count());
                         }
-                        let _ = chunk_tx.send(chunk.to_string());
+                        let _ = update_tx.send(RendererUpdate::Chunk(chunk.to_string()));
                     }
                 },
                 {
@@ -2076,10 +2130,11 @@ impl Commands {
                     // path, so e2e tests observe their lifecycle here.
                     #[cfg(test)]
                     let test_events = std::sync::Arc::clone(&self.test_events);
-                    // `move` (needed for the test tap) would move the
-                    // original sender; forward through a clone instead so
-                    // `drop(event_tx)` below still releases the renderer.
-                    let event_tx = event_tx.clone();
+                    // `move` (needed for the test tap) moves this block's
+                    // captured sender; shadow it with a clone so the
+                    // original stays alive and `drop(update_tx)` below
+                    // still releases the renderer.
+                    let update_tx = update_tx.clone();
                     let e_progress = progress.clone();
                     let e_tools = run_tools.clone();
                     let e_usage = run_usage.clone();
@@ -2123,11 +2178,17 @@ impl Commands {
                         #[cfg(test)]
                         test_events.lock().unwrap().push(format!("{event:?}"));
                         let is_usage = matches!(event, takka_core::Event::Usage { .. });
+                        // ModelChunk is the raw per-delta echo; the renderer
+                        // gets the same text as a Chunk and has no use for
+                        // the event (story 1.3: one queue, no no-op spins).
+                        let is_noop_model_chunk =
+                            matches!(event, takka_core::Event::ModelChunk { .. });
                         if !is_usage
+                            && !is_noop_model_chunk
                             && (show_thoughts
                                 || !matches!(event, takka_core::Event::Thinking { .. }))
                         {
-                            let _ = event_tx.send(event);
+                            let _ = update_tx.send(RendererUpdate::Event(event));
                         }
                     }
                 },
@@ -2178,8 +2239,7 @@ impl Commands {
             )
             .await;
 
-        drop(chunk_tx);
-        drop(event_tx);
+        drop(update_tx);
         stop_flag.store(true, Ordering::Relaxed);
 
         let render_final = renderer.join().expect("renderer thread panicked");
@@ -2189,6 +2249,7 @@ impl Commands {
         {
             *self.test_preview.lock().unwrap() = render_final.preview_committed.clone();
             *self.test_preview_diverged.lock().unwrap() = render_final.preview_diverged;
+            *self.test_render_order.lock().unwrap() = render_final.render_order.clone();
         }
         // The question handler only does its spinner consume/re-arm dance
         // while this flag is set, so it never touches the screen in modes
@@ -2236,14 +2297,16 @@ impl Commands {
 
         match result {
             Ok(final_result) => {
-                let source = if final_result.is_empty() {
+                // RunStats keeps today's semantics: the orchestrator's
+                // final answer (or the stream when it returned nothing) —
+                // NOT the suffix-decision source (review patch 2026-11-06).
+                let today_source = if final_result.is_empty() {
                     &render_final.block_text
                 } else {
                     &final_result
                 };
-                self.last_run.output_chars = source.chars().count();
-                if !source.is_empty() {
-                    let parsed = md_widget::MarkdownContent::parse(source);
+                self.last_run.output_chars = today_source.chars().count();
+                if !today_source.is_empty() {
                     // The live preview printed the streamed answer above the
                     // status line: those lines ARE the final answer (design
                     // decision A), so only the suffix the preview never
@@ -2253,11 +2316,38 @@ impl Commands {
                     // render — the story's documented duplication case. An
                     // empty preview matches trivially, so the suffix is the
                     // whole render: the no-chunk fallback stays today's path
-                    // exactly.
-                    let preview_is_the_answer = !render_final.preview_diverged
-                        && preview_prefix_matches(&render_final.preview_committed, &parsed.lines);
-                    let final_lines: &[ratatui::text::Line<'_>] = if preview_is_the_answer {
-                        &parsed.lines[render_final.preview_committed.len()..]
+                    // exactly. Multi-turn runs (story 1.3): `final_result`
+                    // covers only the LAST turn, so today's source would
+                    // re-print the last block after it was already previewed
+                    // — the print source upgrades to the FULL stream, but
+                    // only after the strict line-prefix match against its
+                    // parse verifies; a mismatch falls back to today's
+                    // source and today's decision (the documented rule).
+                    let mut parsed = md_widget::MarkdownContent::parse(today_source);
+                    let mut suffix_start = if !render_final.preview_diverged
+                        && preview_prefix_matches(&render_final.preview_committed, &parsed.lines)
+                    {
+                        Some(render_final.preview_committed.len())
+                    } else {
+                        None
+                    };
+                    if suffix_start.is_none()
+                        && end_of_run_uses_full_stream(
+                            &render_final.preview_committed,
+                            render_final.preview_diverged,
+                            &render_final.block_text,
+                            &final_result,
+                        )
+                        && preview_prefix_matches(
+                            &render_final.preview_committed,
+                            &md_widget::MarkdownContent::parse(&render_final.block_text).lines,
+                        )
+                    {
+                        parsed = md_widget::MarkdownContent::parse(&render_final.block_text);
+                        suffix_start = Some(render_final.preview_committed.len());
+                    }
+                    let final_lines: &[ratatui::text::Line<'_>] = if let Some(n) = suffix_start {
+                        &parsed.lines[n..]
                     } else {
                         &parsed.lines
                     };
@@ -3897,6 +3987,86 @@ fn preview_flush(committed: &[String], completed: &str) -> PreviewFlush {
     PreviewFlush::Print(rendered.lines.split_off(committed.len()))
 }
 
+/// Whether the multi-turn end-of-run rule upgrades the print source to
+/// the FULL streamed text (story 1.3): `block_text` accumulates EVERY
+/// turn's deltas (T1+T2+T3) while the orchestrator returns only the last
+/// turn's answer (T3) — with the story-1.1 preview live, T3 is already on
+/// screen, so today's source would print it again. This is a GATE only:
+/// the caller still verifies the strict line-prefix match against the
+/// full stream's parse and falls back to today's source and decision when
+/// it fails (plan task 3: "otherwise keep today's decision"). Divergence
+/// and empty previews keep today's source. Pure and unit-testable.
+fn end_of_run_uses_full_stream(
+    committed: &[String],
+    diverged: bool,
+    block_text: &str,
+    final_result: &str,
+) -> bool {
+    !diverged
+        && !committed.is_empty()
+        && (final_result.is_empty() || block_text.ends_with(final_result))
+}
+
+/// Live-preview run state (story 1.1 machinery, regrouped in story 1.3 so
+/// the drain loop can announce text at arrival-order boundaries instead of
+/// one place per tick).
+#[derive(Default)]
+struct PreviewTracker {
+    /// Plain text of the preview lines already printed, in print order.
+    committed: Vec<String>,
+    /// The completed text the committed lines were rendered from (skips
+    /// re-parsing when nothing new completed).
+    flushed: String,
+    /// True when the progressive re-render stopped extending the printed
+    /// prefix mid-run; the end-of-run path then keeps today's full render.
+    diverged: bool,
+    /// cfg(test) only: the interleaved print order of the run —
+    /// `text:<line>` for live preview lines, alongside the event markers
+    /// the renderer drains pushes adjacent to them.
+    #[cfg(test)]
+    order: Vec<String>,
+}
+
+impl PreviewTracker {
+    /// Announce newly completed streamed text as styled markdown above the
+    /// status line, riding the console-log hook's erase → print → repaint
+    /// cycle (the same atom for every printed item, so the status line is
+    /// always the last line).
+    fn announce(&mut self, block_text: &str, consume: &dyn Fn(), commit: &dyn Fn()) {
+        if self.diverged {
+            return;
+        }
+        let completed = completed_text(block_text);
+        if completed == self.flushed {
+            return;
+        }
+        match preview_flush(&self.committed, completed) {
+            PreviewFlush::Print(new_lines) => {
+                self.flushed = completed.to_string();
+                if !new_lines.is_empty() {
+                    consume();
+                    inline::print_lines(&new_lines);
+                    commit();
+                    #[cfg(test)]
+                    self.order.extend(
+                        new_lines
+                            .iter()
+                            .map(|l| format!("text:{}", line_plain_text(l))),
+                    );
+                    self.committed.extend(new_lines.iter().map(line_plain_text));
+                }
+            }
+            PreviewFlush::Diverged => {
+                // A later re-render changed lines that were already printed
+                // (e.g. a soft line break joined two of them). Stop
+                // previewing; the end-of-run path falls back to today's
+                // full render.
+                self.diverged = true;
+            }
+        }
+    }
+}
+
 fn render_event(event: &takka_core::Event, timeline: &mut ToolTimeline, detailed: bool) {
     use crate::widgets::{components, diff as diff_widget, inline, tool_call};
 
@@ -4690,6 +4860,68 @@ mod preview_flush_tests {
         );
         assert_eq!(committed, committed_before, "committed stays untouched");
     }
+
+    // ── End-of-run source selection (story 1.3) ──────────────
+
+    /// Multi-turn runs accumulate every turn's deltas in `block_text`
+    /// while the orchestrator returns only the last turn's answer: with a
+    /// non-empty, undiverged preview and `final_result` a suffix of the
+    /// stream, the multi-turn gate fires (the caller still verifies the
+    /// strict line-prefix match against the full stream's parse).
+    #[test]
+    fn end_of_run_uses_full_stream_gate_covers_the_multi_turn_shape() {
+        let stream = "First para\n\nSecond para\n\nThird para\n\n";
+        assert!(end_of_run_uses_full_stream(
+            &["First para".to_string(), "Second para".to_string()],
+            false,
+            stream,
+            "Third para\n\n"
+        ));
+        // The same inputs diverged: today's source (final_result) wins.
+        assert!(!end_of_run_uses_full_stream(
+            &["First para".to_string()],
+            true,
+            stream,
+            "Third para\n\n"
+        ));
+        // A final result that escaped the stream: today's source wins.
+        assert!(!end_of_run_uses_full_stream(
+            &["First para".to_string()],
+            false,
+            stream,
+            "escaped final answer"
+        ));
+        // Empty commit (no-chunk or diverged-empty preview): today's source.
+        assert!(!end_of_run_uses_full_stream(
+            &[],
+            false,
+            stream,
+            "Third para\n\n"
+        ));
+    }
+
+    /// Single-turn runs keep today's decision byte-for-byte: when
+    /// `final_result` equals the accumulated stream (the normal
+    /// single-turn shape — the orchestrator returns the raw delta
+    /// accumulation), the gate may fire but the two parses are the same,
+    /// so the caller's first branch matches and behavior is unchanged.
+    #[test]
+    fn end_of_run_uses_full_stream_single_turn_is_identical() {
+        let stream = "Hello world\n\n";
+        assert!(end_of_run_uses_full_stream(
+            &["Hello world".to_string()],
+            false,
+            stream,
+            stream
+        ));
+        // final_result non-empty but not a stream suffix: gate off.
+        assert!(!end_of_run_uses_full_stream(
+            &["Hello world".to_string()],
+            false,
+            stream,
+            "final"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -5142,16 +5374,169 @@ mod e2e_tests {
         spawn_scripted_sse_server_mode(deltas, true)
     }
 
+    /// One scripted LLM turn for the multi-turn harness (story 1.3).
+    #[derive(Clone)]
+    enum ScriptedTurn {
+        /// Text-only deltas, then a `stop` finish.
+        Text(Vec<(std::time::Duration, String)>),
+        /// Text deltas followed by ONE tool call, finished with
+        /// `finish_reason: tool_calls` — the model asks to run `tool`
+        /// next turn.
+        TextThenTool(Vec<(std::time::Duration, String)>, String, String),
+    }
+
+    /// Multi-turn scripted provider (story 1.3): each incoming connection
+    /// consumes the next scripted turn, so POST 1 can answer with a tool
+    /// call whose result feeds POST 2 — a full agent loop against the
+    /// OpenAI-compatible wire format, no real provider involved.
+    fn spawn_scripted_sse_server_turns(turns: Vec<ScriptedTurn>) -> u16 {
+        use std::io::Write;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted SSE server");
+        let port = listener.local_addr().expect("local addr").port();
+        let turns = std::sync::Arc::new(std::sync::Mutex::new(turns));
+        std::thread::Builder::new()
+            .name("scripted-sse-server-turns".into())
+            .spawn(move || {
+                let mut index = 0usize;
+                while let Some(mut stream) = accept_scripted_connection(&listener) {
+                    let turn = {
+                        let guard = turns.lock().unwrap();
+                        guard.get(index).cloned()
+                    };
+                    index += 1;
+                    if stream.write_all(SCRIPTED_SSE_HEADER.as_bytes()).is_err() {
+                        continue;
+                    }
+                    let _ = stream.flush();
+                    let Some(turn) = turn else {
+                        // Out of script: behave like a provider that never
+                        // finishes so the test's timeout reports the hang
+                        // with a clear cause.
+                        std::thread::sleep(std::time::Duration::from_secs(120));
+                        continue;
+                    };
+                    let (deltas, tool_call) = match &turn {
+                        ScriptedTurn::Text(deltas) => (deltas, None),
+                        ScriptedTurn::TextThenTool(deltas, tool, arguments) => {
+                            (deltas, Some((tool.clone(), arguments.clone())))
+                        }
+                    };
+                    for (delay, delta) in deltas {
+                        std::thread::sleep(*delay);
+                        let event = serde_json::json!({
+                            "id": "chatcmpl-scripted",
+                            "choices": [{
+                                "delta": {"content": delta},
+                                "finish_reason": serde_json::Value::Null,
+                            }]
+                        });
+                        if write_sse_frame(&mut stream, &format!("data: {event}\r\n\r\n")).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if let Some((tool, arguments)) = tool_call {
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                        let event = serde_json::json!({
+                            "id": "chatcmpl-scripted",
+                            "choices": [{
+                                "delta": {"tool_calls": [{
+                                    "index": 0,
+                                    "id": "call-scripted",
+                                    "type": "function",
+                                    "function": {"name": tool, "arguments": arguments},
+                                }]},
+                                "finish_reason": serde_json::Value::Null,
+                            }]
+                        });
+                        let _ = write_sse_frame(&mut stream, &format!("data: {event}\r\n\r\n"));
+                        let stop = serde_json::json!({
+                            "id": "chatcmpl-scripted",
+                            "choices": [{
+                                "delta": {},
+                                "finish_reason": "tool_calls",
+                            }]
+                        });
+                        let _ = write_sse_frame(&mut stream, &format!("data: {stop}\r\n\r\n"));
+                    } else {
+                        let stop = serde_json::json!({
+                            "id": "chatcmpl-scripted",
+                            "choices": [{
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }]
+                        });
+                        let _ = write_sse_frame(&mut stream, &format!("data: {stop}\r\n\r\n"));
+                    }
+                    let _ = write_sse_frame(&mut stream, "data: [DONE]\r\n\r\n");
+                    // Terminal chunk (size 0) closes the response body.
+                    let _ = write_sse_frame(&mut stream, "");
+                }
+            })
+            .expect("spawn scripted SSE turns server");
+        port
+    }
+
+    /// Accept one scripted server connection and drain its HTTP request
+    /// (reads to the declared content-length). Shared by the single-script
+    /// and multi-turn SSE harnesses (review patch 2026-11-06: the drain
+    /// logic must not live twice).
+    fn accept_scripted_connection(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        use std::io::Read;
+        let mut stream = listener.incoming().next()?.ok()?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    let head_end = buf
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|pos| pos + 4);
+                    if let Some(head_end) = head_end {
+                        let head = String::from_utf8_lossy(&buf[..head_end]);
+                        let content_length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= head_end + content_length {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        Some(stream)
+    }
+
+    /// The chunked SSE response head + one frame writer, shared by the SSE
+    /// harnesses.
+    const SCRIPTED_SSE_HEADER: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+
+    fn write_sse_frame(stream: &mut std::net::TcpStream, payload: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        write!(stream, "{:x}\r\n{payload}\r\n", payload.len())?;
+        stream.flush()
+    }
+
     fn spawn_scripted_sse_server_mode(
         deltas: Vec<(std::time::Duration, String)>,
         close_abruptly: bool,
     ) -> u16 {
-        use std::io::{Read, Write};
-
-        fn write_chunk(stream: &mut std::net::TcpStream, payload: &str) -> std::io::Result<()> {
-            write!(stream, "{:x}\r\n{payload}\r\n", payload.len())?;
-            stream.flush()
-        }
+        use std::io::Write;
 
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted SSE server");
@@ -5159,46 +5544,10 @@ mod e2e_tests {
         std::thread::Builder::new()
             .name("scripted-sse-server".into())
             .spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { break };
-                    // Drain the request (small JSON body arrives with the
-                    // head; the response only depends on nothing at all).
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 8192];
-                    loop {
-                        match stream.read(&mut chunk) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                buf.extend_from_slice(&chunk[..n]);
-                                let head_end = buf
-                                    .windows(4)
-                                    .position(|w| w == b"\r\n\r\n")
-                                    .map(|pos| pos + 4);
-                                if let Some(head_end) = head_end {
-                                    let head = String::from_utf8_lossy(&buf[..head_end]);
-                                    let content_length: usize = head
-                                        .lines()
-                                        .find_map(|line| {
-                                            let (name, value) = line.split_once(':')?;
-                                            name.trim()
-                                                .eq_ignore_ascii_case("content-length")
-                                                .then(|| value.trim().parse().ok())?
-                                        })
-                                        .unwrap_or(0);
-                                    if buf.len() >= head_end + content_length {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let header =
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                while let Some(mut stream) = accept_scripted_connection(&listener) {
                     // The response head is written raw — chunked framing
                     // applies to the body only.
-                    if stream.write_all(header.as_bytes()).is_err() {
+                    if stream.write_all(SCRIPTED_SSE_HEADER.as_bytes()).is_err() {
                         continue;
                     }
                     let _ = stream.flush();
@@ -5211,7 +5560,8 @@ mod e2e_tests {
                                 "finish_reason": serde_json::Value::Null,
                             }]
                         });
-                        if write_chunk(&mut stream, &format!("data: {event}\r\n\r\n")).is_err() {
+                        if write_sse_frame(&mut stream, &format!("data: {event}\r\n\r\n")).is_err()
+                        {
                             break;
                         }
                     }
@@ -5223,10 +5573,10 @@ mod e2e_tests {
                                 "finish_reason": "stop",
                             }]
                         });
-                        let _ = write_chunk(&mut stream, &format!("data: {stop}\r\n\r\n"));
-                        let _ = write_chunk(&mut stream, "data: [DONE]\r\n\r\n");
+                        let _ = write_sse_frame(&mut stream, &format!("data: {stop}\r\n\r\n"));
+                        let _ = write_sse_frame(&mut stream, "data: [DONE]\r\n\r\n");
                         // Terminal chunk (size 0) closes the response body.
-                        let _ = write_chunk(&mut stream, "");
+                        let _ = write_sse_frame(&mut stream, "");
                     }
                     if close_abruptly {
                         // Broken chunked framing after the deltas: reqwest's
@@ -5472,6 +5822,154 @@ mod e2e_tests {
                 "# Title".to_string(),
                 "First para".to_string(),
             ]
+        );
+    }
+    /// Interleave e2e (story 1.3, the verify's shape): a scripted
+    /// multi-turn provider runs text → tool → text → tool → text. Each
+    /// streamed block must print live in arrival order with the tool row
+    /// BETWEEN its turns (one unified arrival-ordered queue), every
+    /// duplicated Thinking recap must be suppressed (its text is already
+    /// in the preview), and the end-of-run print must add nothing — every
+    /// block on screen exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_multi_turn_interleaves_tool_rows_in_arrival_order() {
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "Second para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "Third para\n\n".to_string(),
+            )]),
+        ];
+        let port = spawn_scripted_sse_server_turns(turns);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            commands.run("run through the plan"),
+        )
+        .await
+        .expect("Commands::run hung: no terminal event within 60s");
+        let _ = std::fs::remove_file(&fixture);
+
+        assert!(result.is_ok(), "run should complete: {:?}", result.err());
+
+        // Arrival order across the whole run: text above the row that
+        // followed it, one completion row per turn, and no stray thinking
+        // block (its content is already in the preview — suppressed).
+        let order = commands.test_render_order.lock().unwrap().clone();
+        assert_eq!(
+            order,
+            vec![
+                "text:First para".to_string(),
+                "tool".to_string(),
+                "text:Second para".to_string(),
+                "tool".to_string(),
+                "text:Third para".to_string(),
+            ],
+            "interleave must follow arrival order: {order:?}"
+        );
+
+        // The preview announced every block exactly once (each block ends
+        // at a blank-line boundary, so nothing stays pending). Note: a
+        // paragraph-first render produces no leading blank line — story
+        // 1.1's empty first line came from its heading lead-in.
+        assert_eq!(
+            commands.test_preview.lock().unwrap().clone(),
+            vec![
+                "First para".to_string(),
+                "Second para".to_string(),
+                "Third para".to_string(),
+            ]
+        );
+        // End of run: the multi-turn source rule parses the full stream,
+        // the committed lines cover it — nothing re-prints.
+        assert!(!*commands.test_preview_diverged.lock().unwrap());
+        assert!(
+            commands.test_final_print.lock().unwrap().is_empty(),
+            "final print must be suffix-free: {:?}",
+            commands.test_final_print.lock().unwrap()
+        );
+    }
+    /// I/O matrix row "thinking between blocks" (story 1.3), second half:
+    /// when the tool-call turn's text was NOT announced by the preview
+    /// (it ends without a blank-line boundary, so the hold-back keeps it
+    /// pending), the Thinking block must still render as today — the
+    /// suppression only applies to fully previewed content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_unpreviewed_thinking_still_renders() {
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                // No blank-line boundary: `completed_text` holds it back.
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "Unfinished".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                " tail\n\n".to_string(),
+            )]),
+        ];
+        let port = spawn_scripted_sse_server_turns(turns);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            commands.run("run through the plan"),
+        )
+        .await
+        .expect("Commands::run hung: no terminal event within 60s");
+        let _ = std::fs::remove_file(&fixture);
+
+        assert!(result.is_ok(), "run should complete: {:?}", result.err());
+
+        // The un-previewed turn text rendered through the Thinking block
+        // (today's path), and the preview picked the paragraph up as soon
+        // as the blank-line boundary completed it — arrival order holds.
+        assert_eq!(
+            commands.test_render_order.lock().unwrap().clone(),
+            vec![
+                "thinking".to_string(),
+                "tool".to_string(),
+                "text:Unfinished tail".to_string(),
+            ]
+        );
+        assert_eq!(
+            commands.test_preview.lock().unwrap().clone(),
+            vec!["Unfinished tail".to_string()]
+        );
+        assert!(!*commands.test_preview_diverged.lock().unwrap());
+        assert!(
+            commands.test_final_print.lock().unwrap().is_empty(),
+            "final print must be suffix-free: {:?}",
+            commands.test_final_print.lock().unwrap()
         );
     }
 }
