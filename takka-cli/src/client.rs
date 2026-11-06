@@ -155,7 +155,12 @@ pub(crate) async fn send_and_wait_io(
 }
 
 /// Run loop shared by both modes: stream deltas, surface lifecycle events,
-/// and answer interactive gates through the connection.
+/// answer interactive gates through the connection, and watch the cancel
+/// flag between events (story 1.4): one cheap flag load per loop pass;
+/// when the flag flips, `Request::Cancel` is sent exactly once and the
+/// engine's cancel handle unwinds the run at its next turn boundary
+/// (`AgenticError::Cancelled` → the run's normal Err path — the cleanup
+/// the caller already owns).
 pub(crate) async fn run_turn<C, E, R>(
     io: &mut impl ConnectionIo,
     task: String,
@@ -163,6 +168,7 @@ pub(crate) async fn run_turn<C, E, R>(
     mut on_chunk: C,
     mut on_event: E,
     mut responder: R,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String>
 where
     C: FnMut(&str),
@@ -171,7 +177,17 @@ where
 {
     let request_id = io.raw_send(Request::Run { task, attachments }).await?;
     let mut streamed = String::new();
+    let mut cancel_sent = false;
     loop {
+        // Cooperative cancel watch (story 1.4): checked between events,
+        // forwarded to the engine exactly once. The orchestrator honors it
+        // at the next turn boundary — deltas may continue briefly (an
+        // in-flight LLM call is not aborted); that latency is the
+        // documented contract, bounded by the boundary.
+        if !cancel_sent && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            io.raw_send(Request::Cancel).await?;
+            cancel_sent = true;
+        }
         let event = io.raw_next_event().await?;
         if event.request_id.as_deref() != Some(&request_id) {
             continue;
@@ -266,13 +282,23 @@ impl RuntimeClient {
         on_chunk: C,
         on_event: E,
         responder: R,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String>
     where
         C: FnMut(&str),
         E: FnMut(takka_core::Event),
         R: FnMut(&ProtocolEvent) -> Option<Request>,
     {
-        run_turn(self, task, attachments, on_chunk, on_event, responder).await
+        run_turn(
+            self,
+            task,
+            attachments,
+            on_chunk,
+            on_event,
+            responder,
+            cancel,
+        )
+        .await
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
@@ -693,13 +719,23 @@ impl AgentConnection {
         on_chunk: C,
         on_event: E,
         responder: R,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String>
     where
         C: FnMut(&str),
         E: FnMut(takka_core::Event),
         R: FnMut(&ProtocolEvent) -> Option<Request>,
     {
-        run_turn(self, task, attachments, on_chunk, on_event, responder).await
+        run_turn(
+            self,
+            task,
+            attachments,
+            on_chunk,
+            on_event,
+            responder,
+            cancel,
+        )
+        .await
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {

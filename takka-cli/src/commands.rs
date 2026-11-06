@@ -602,6 +602,22 @@ pub struct Commands {
     /// (story 1.3 e2e interleave assertion).
     #[cfg(test)]
     test_render_order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Test tap (cfg(test)): which terminal badge each run's Err branch
+    /// rendered (story 1.4: "Cancelled by user" must surface as the
+    /// cancel notice; everything else keeps the red error badge).
+    #[cfg(test)]
+    test_notice: std::sync::Arc<std::sync::Mutex<Vec<RunOutcomeBadge>>>,
+    /// Test tap (cfg(test)): how many times a run executed the terminal
+    /// cursor-cleanup block — the "status line erased exactly once"
+    /// guarantee asserted by the cancel smokes (story 1.4 review).
+    #[cfg(test)]
+    test_terminal_cleanup_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only cancel flag (cfg(test), story 1.4): a private instance
+    /// the cancel smokes flip, so parallel tests in one process never
+    /// observe each other's cancel. Production always resolves the
+    /// process-wide flag the signal task flips (`run_cancel_flag`).
+    #[cfg(test)]
+    test_cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for Commands {
@@ -647,6 +663,14 @@ impl Commands {
             test_final_print: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             test_render_order: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_notice: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_terminal_cleanup_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                0,
+            )),
+            #[cfg(test)]
+            test_cancel_flag: None,
         }
     }
 
@@ -667,6 +691,33 @@ impl Commands {
     pub(crate) fn with_daemon_info_path(mut self, path: std::path::PathBuf) -> Self {
         self.daemon_info_path_override = Some(path);
         self
+    }
+
+    /// Install a private cancel flag for the hermetic cancel smokes
+    /// (story 1.4): runs then watch THIS flag instead of the process
+    /// global, so flipping it mid-run cannot cancel a concurrently
+    /// running test's run (tests share one process; the process flag is
+    /// process-global).
+    #[cfg(test)]
+    pub(crate) fn with_cancel_flag(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.test_cancel_flag = Some(flag);
+        self
+    }
+
+    /// The cancel flag handle the active run watches (story 1.4): the
+    /// process-wide flag the signal task flips, or the test-injected
+    /// instance under cfg(test).
+    fn run_cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        #[cfg(test)]
+        {
+            if let Some(flag) = &self.test_cancel_flag {
+                return flag.clone();
+            }
+        }
+        crate::cancel_flag()
     }
 
     /// `takka attach` (Fase 3a): with `--shutdown`, ask the running
@@ -2100,10 +2151,21 @@ impl Commands {
             })
             .expect("failed to spawn renderer thread");
 
+        // Resolve the run's cancel flag before the connection borrow
+        // (story 1.4): `run_turn` watches it between events.
+        let cancel_flag = self.run_cancel_flag();
+        // Per-run two-stage semantics (story 1.4 review): the first Ctrl+C
+        // of THIS run is the cooperative one. A flag surviving from the
+        // previous run (set at the idle prompt or carried over from a
+        // cancelled run) would insta-cancel this run and turn the NEXT
+        // press into the force-exit — reset it before the watcher's first
+        // read.
+        cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         let runtime = self
             .connection
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Runtime not initialized"))?;
+
         // Live phase tracking for the status line. Both callbacks run on
         // runtime threads, so they only touch the shared `ProgressState`
         // (never the terminal — the renderer owns that).
@@ -2236,6 +2298,7 @@ impl Commands {
                     }
                     _ => None,
                 },
+                cancel_flag,
             )
             .await;
 
@@ -2261,6 +2324,9 @@ impl Commands {
         // "spinner mode" (we never wrote chunks to stdout), so cleanup
         // is the same in every case: erase the spinner line, then render
         // the accumulated text as styled markdown.
+        #[cfg(test)]
+        self.test_terminal_cleanup_count
+            .fetch_add(1, Ordering::Relaxed);
         let mut s = std::io::stdout();
         {
             use crossterm::cursor::{MoveToColumn, MoveUp};
@@ -2368,7 +2434,19 @@ impl Commands {
                 inline::print_blank();
             }
             Err(e) => {
-                inline::print_line(&components::error_badge(&e.to_string()));
+                // Story 1.4: "Cancelled by user" is a desired outcome —
+                // the cancel notice, not the red error badge.
+                let badge = run_outcome_badge(&e);
+                match badge {
+                    RunOutcomeBadge::Cancelled => {
+                        inline::print_line(&components::info_badge(&e.to_string()));
+                    }
+                    RunOutcomeBadge::Error => {
+                        inline::print_line(&components::error_badge(&e.to_string()));
+                    }
+                }
+                #[cfg(test)]
+                self.test_notice.lock().unwrap().push(badge);
                 inline::print_blank();
             }
         }
@@ -2406,6 +2484,19 @@ impl Commands {
         #[cfg(test)]
         self.test_runs
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Resolve the run's cancel flag before the connection borrow
+        // (story 1.4): the TUI path gets the same cancel wiring as the
+        // inline REPL — both UIs fold every event through `run_turn`.
+        // Per-run two-stage reset: the TUI's first Ctrl+C is the
+        // cooperative one (story 1.4 review fix).
+        let cancel_flag = self.run_cancel_flag();
+        // Per-run two-stage semantics (story 1.4 review): the first Ctrl+C
+        // of THIS run is the cooperative one. A flag surviving from the
+        // previous run (set at the idle prompt or carried over from a
+        // cancelled run) would insta-cancel this run and turn the NEXT
+        // press into the force-exit — reset it before the watcher's first
+        // read.
+        cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         let runtime = self
             .connection
             .as_mut()
@@ -2455,6 +2546,7 @@ impl Commands {
                     }
                     _ => None,
                 },
+                cancel_flag,
             )
             .await;
 
@@ -3917,6 +4009,30 @@ fn line_plain_text(line: &RLine<'_>) -> String {
         .iter()
         .map(|span| span.content.as_ref())
         .collect()
+}
+
+/// Which terminal badge a run's `Err` value renders as (story 1.4).
+/// "Cancelled by user" is a desired outcome, so it surfaces as the
+/// neutral cancel notice instead of the red error badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcomeBadge {
+    Cancelled,
+    Error,
+}
+
+/// Decide the badge for a run error. The cancel fact crosses the
+/// protocol as a plain string (orchestrator `Err(AgenticError::
+/// Cancelled)` → engine `Event::Error { message }` → `anyhow!(message)`
+/// in `run_turn`), so the type is gone by the time it lands here.
+/// Recomputing the same `thiserror` literal keeps both sides coupled to
+/// the one variant — if core ever rewords it, this follows
+/// automatically (documented coupling, story 1.4 design notes).
+fn run_outcome_badge(error: &anyhow::Error) -> RunOutcomeBadge {
+    if error.to_string() == takka_core::AgenticError::Cancelled.to_string() {
+        RunOutcomeBadge::Cancelled
+    } else {
+        RunOutcomeBadge::Error
+    }
 }
 
 /// The portion of `text` safe to announce this tick: everything up to and
@@ -5972,6 +6088,418 @@ mod e2e_tests {
             commands.test_final_print.lock().unwrap()
         );
     }
+
+    // ── Story 1.4: finish and mid-stream cancel cleanup ─────────
+
+    /// Poll the live event tap until one of the streamed events contains
+    /// `needle` (bounded so a regression fails the test, never hangs it).
+    /// Runs on a plain driver thread while `commands` is held by the run.
+    fn wait_for_tap_event(tap: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, needle: &str) {
+        wait_for_tap_event_count(tap, needle, 1);
+    }
+
+    /// Same as [`wait_for_tap_event`], but waits for the Nth occurrence —
+    /// used to land the cancel flag exactly inside an iteration-N provider
+    /// call (`ModelRequest` is emitted AFTER the iteration's boundary
+    /// check and BEFORE the provider call streams).
+    fn wait_for_tap_event_count(
+        tap: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        needle: &str,
+        count: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let saw = tap
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.contains(needle))
+                .count();
+            if saw >= count {
+                return;
+            }
+            // Checked after the satisfied condition: a starved poll thread
+            // that woke up past the deadline with the condition already
+            // met must not fail spuriously (story 1.4 review).
+            assert!(
+                std::time::Instant::now() < deadline,
+                "event tap never saw {count}× {needle}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// I/O matrix row "cancel mid-preview" (story 1.4): the cancel flag
+    /// flips while streamed paragraphs are already printed; the run
+    /// returns gracefully, the preview lines stand as ordinary
+    /// scrollback, the final print stays empty (no re-render of the
+    /// answer), and "Cancelled by user" surfaces as the cancel notice —
+    /// not the red error badge. Hermetic scripted provider only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_cancel_mid_preview_unwinds_with_notice() {
+        // Multi-turn shape so the cancel has a boundary to win at: core
+        // checks `AgenticError::Cancelled` at the START of every loop
+        // iteration, and a single-turn run never loops — a mid-stream
+        // cancel on a text-only turn would flag the request while the run
+        // still completes normally (documented in the Implementation
+        // Notes). Turns: text+tool → the flag lands mid-turn-1 streaming;
+        // the tool call forces iteration 2, whose boundary check unwinds
+        // with Cancelled.
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![
+                    (
+                        std::time::Duration::from_millis(120),
+                        "# Title\n\n".to_string(),
+                    ),
+                    (
+                        std::time::Duration::from_millis(120),
+                        "First para\n\n".to_string(),
+                    ),
+                ],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(2000),
+                "Second para\n\n".to_string(),
+            )]),
+        ];
+        // flag lands mid-turn-1 streaming (the driver waits for the
+        // second streamed paragraph's ModelChunk).
+        let port = spawn_scripted_sse_server_turns(turns);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_cancel_flag(cancel_flag.clone());
+
+        // Drive the cancel from a plain thread while the run holds
+        // `commands`: wait for the first delta to reach the client, give
+        // the renderer two 80 ms ticks to announce it live, then flip.
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("cancel-driver".into())
+            .spawn(move || {
+                wait_for_tap_event(&tap, "ModelChunk");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .expect("cancel driver thread");
+
+        // Commands::run always returns Ok — the unwind surfaces through
+        // the outcome badge (test_notice), asserted below.
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("cancel driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+        // The Err unwind rendered the CANCEL notice; the red error badge
+        // would have shown up here as RunOutcomeBadge::Error.
+        // Lock once (a MutexGuard temporary in the assert would deadlock
+        // the panic format's second lock on the same std Mutex).
+        let notice = commands.test_notice.lock().unwrap().clone();
+        assert_eq!(
+            notice,
+            vec![RunOutcomeBadge::Cancelled],
+            "cancelled run must print the cancel notice: {notice:?}"
+        );
+        // Status line erased exactly once (the shared terminal-cleanup
+        // block runs once per run, both outcomes).
+        assert_eq!(
+            commands.test_terminal_cleanup_count.load(Ordering::Relaxed),
+            1,
+            "terminal cleanup must run exactly once per run"
+        );
+        // Preview lines stand as ordinary scrollback (printed before the
+        // cancel flipped; the run streams on briefly until the turn
+        // boundary, which may only add more lines).
+        let preview = commands.test_preview.lock().unwrap().clone();
+        assert!(
+            preview.iter().any(|l| l == "# Title"),
+            "printed preview lines must survive the unwind: {preview:?}"
+        );
+        // No re-render of the answer on the cancel path.
+        assert!(
+            commands.test_final_print.lock().unwrap().is_empty(),
+            "cancel path must not re-render the answer: {:?}",
+            commands.test_final_print.lock().unwrap()
+        );
+    }
+
+    /// Review fix (story 1.4 pass 1): the shared cancel flag must RESET at
+    /// each run start — the two-stage semantics are per-run. After a
+    /// mid-run cancel, a second run on the same `Commands` (as the inline
+    /// REPL does) completes normally: no insta-cancel, empty notice, and
+    /// the per-run reset makes the next Ctrl+C the cooperative one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_cancel_then_next_run_starts_fresh() {
+        let turns = vec![
+            // Run 1: turned cancellation (mid-turn-2 provider call → the
+            // iteration 3 boundary unwinds with Cancelled).
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(2000),
+                    "never reached\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            // Run 2: a fresh single turn that completes normally.
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "Second run\n\n".to_string(),
+            )]),
+        ];
+        let port = spawn_scripted_sse_server_turns(turns);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_cancel_flag(cancel_flag.clone());
+
+        // Cancel run 1 once its second provider call is underway.
+        let tap = commands.test_events.clone();
+        let cancel_flag_for_driver = cancel_flag.clone();
+        let driver = std::thread::Builder::new()
+            .name("cancel-driver".into())
+            .spawn(move || {
+                wait_for_tap_event_count(&tap, "ModelRequest", 2);
+                cancel_flag_for_driver.store(true, std::sync::atomic::Ordering::Relaxed);
+                cancel_flag_for_driver.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .expect("cancel driver thread");
+
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("cancel driver panicked");
+
+        // Run 1 unwind recorded as the cancel notice.
+        let first_notice = commands.test_notice.lock().unwrap().clone();
+        assert_eq!(first_notice, vec![RunOutcomeBadge::Cancelled]);
+        // The flag survived the unwind (the review's stale-flag defect):
+        // the run-2 start reset is what must clear it.
+        assert!(cancel_flag.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Run 2 on the same Commands completes normally — the per-run
+        // reset cleared the stale flag before the watcher's first read.
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("again"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+
+        // Run 2 completed Ok: the badge list gains nothing (the tap only
+        // records Err-branch badges) — the stale flag did not insta-cancel
+        // the follow-up run.
+        let notices = commands.test_notice.lock().unwrap().clone();
+        assert_eq!(
+            notices,
+            vec![RunOutcomeBadge::Cancelled],
+            "run 2 must complete normally (no second badge): {notices:?}"
+        );
+        // Run 2's preview printed normally and the final render is empty
+        // (suffix-only, the answer printed ahead of the run ending).
+        let preview = commands.test_preview.lock().unwrap().clone();
+        assert!(
+            preview.iter().any(|l| l == "Second run"),
+            "run 2 must complete with its own preview: {preview:?}"
+        );
+        assert!(commands.test_final_print.lock().unwrap().is_empty());
+    }
+
+    /// I/O matrix row "cancel during thinking" (story 1.4): the flag
+    /// flips after the session started but before the first delta
+    /// arrives; the run unwinds cleanly at the boundary, nothing prints
+    /// live, and the notice prints once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_cancel_during_thinking_prints_notice_without_live_lines() {
+        // Multi-turn shape (see smoke_cancel_mid_preview): the flag flips
+        // inside turn 1's think window (first delta lands 2s in; the
+        // paragraph never reaches a blank-line boundary, so even a
+        // late-arriving delta cannot announce a live line), and the tool
+        // call forces an iteration 2 whose boundary check unwinds with
+        // Cancelled.
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![
+                    (
+                        std::time::Duration::from_millis(2000),
+                        "Unfinished ".to_string(),
+                    ),
+                    (std::time::Duration::from_millis(120), " tail\n".to_string()),
+                ],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(2000),
+                "never reached\n\n".to_string(),
+            )]),
+        ];
+        let port = spawn_scripted_sse_server_turns(turns);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_cancel_flag(cancel_flag.clone());
+
+        // Flip the flag as soon as the run has started (turn 1's
+        // provider call is inside its 2s think window — no delta has
+        // arrived).
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("cancel-driver".into())
+            .spawn(move || {
+                wait_for_tap_event(&tap, "SessionStarted");
+                cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .expect("cancel driver thread");
+
+        // Commands::run always returns Ok — the unwind surfaces through
+        // the outcome badge (test_notice), asserted below.
+        let _outcome = tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("hi"))
+            .await
+            .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("cancel driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+
+        // Lock once (a MutexGuard temporary in the assert would deadlock
+        // the panic format's second lock on the same std Mutex).
+        let notice = commands.test_notice.lock().unwrap().clone();
+        assert_eq!(
+            notice,
+            vec![RunOutcomeBadge::Cancelled],
+            "notice must print exactly once on the thinking-phase cancel: {notice:?}"
+        );
+        assert_eq!(
+            commands.test_terminal_cleanup_count.load(Ordering::Relaxed),
+            1,
+            "terminal cleanup must run exactly once per run"
+        );
+        // No live lines: nothing was announced while the run unwound.
+        let preview = commands.test_preview.lock().unwrap().clone();
+        assert!(
+            preview.is_empty(),
+            "no paragraph completed before the cancel: {preview:?}"
+        );
+        assert!(commands.test_final_print.lock().unwrap().is_empty());
+    }
+
+    /// I/O matrix row "cancel during tool execution" (story 1.4): the
+    /// flag flips after the tool executed; the tool row and preview
+    /// lines stand, the run unwinds at the next turn boundary, and the
+    /// notice (not the red badge) prints.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_cancel_during_tool_execution_keeps_rows_and_unwinds() {
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            // Tool-phase cancel, deterministically: the flag lands inside
+            // turn 2's provider call — which runs for 2s behind its first
+            // SSE delta — and turn 2 carries its own tool call, creating
+            // the iteration 3 boundary the unwind needs.
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(2000),
+                    "Third para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "never reached\n\n".to_string(),
+            )]),
+        ];
+        let port = spawn_scripted_sse_server_turns(turns);
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_cancel_flag(cancel_flag.clone());
+
+        // Flip inside turn 2's provider call: `ModelRequest` for
+        // iteration 2 is emitted AFTER that iteration's boundary check
+        // (so the flag cannot race ahead of it) and while the provider
+        // call streams for 2s — plenty of room for the 10 ms tap poll.
+        // The iteration 3 boundary (turn 2's tool call) then unwinds with
+        // Cancelled. The tool row from turn 1 (already printed) stands.
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("cancel-driver".into())
+            .spawn(move || {
+                wait_for_tap_event_count(&tap, "ModelRequest", 2);
+                cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .expect("cancel driver thread");
+
+        // Commands::run always returns Ok — the unwind surfaces through
+        // the outcome badge (test_notice), asserted below.
+        let _outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            commands.run("run through the plan"),
+        )
+        .await
+        .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("cancel driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+
+        // Lock once (a MutexGuard temporary in the assert would deadlock
+        // the panic format's second lock on the same std Mutex).
+        let notice = commands.test_notice.lock().unwrap().clone();
+        assert_eq!(
+            notice,
+            vec![RunOutcomeBadge::Cancelled],
+            "tool-phase cancel must unwind through the cancel notice: {notice:?}"
+        );
+        assert_eq!(
+            commands.test_terminal_cleanup_count.load(Ordering::Relaxed),
+            1,
+            "terminal cleanup must run exactly once per run"
+        );
+        // Tool row + preview lines stand.
+        let order = commands.test_render_order.lock().unwrap().clone();
+        assert!(
+            order.contains(&"tool".to_string()),
+            "tool row must have rendered before the cancel: {order:?}"
+        );
+        let preview = commands.test_preview.lock().unwrap().clone();
+        assert!(
+            preview.iter().any(|l| l == "First para"),
+            "preview lines must survive the tool-phase cancel: {preview:?}"
+        );
+        // No re-render on the cancel path.
+        assert!(commands.test_final_print.lock().unwrap().is_empty());
+    }
 }
 
 /// Core helpers for `takka config migrate`: plan, guard, and execute
@@ -6256,6 +6784,10 @@ mod daemon_smoke_tests {
                 |_| {},
                 move |evt| captured.lock().unwrap().push(format!("{evt:?}")),
                 |_| None,
+                // The watcher is inert here: the process flag stays
+                // false for the whole test process (cancel smokes use
+                // their own injected flags).
+                crate::cancel_flag(),
             ),
         )
         .await
@@ -6717,6 +7249,36 @@ mod render_tool_delta_tests {
     fn empty_delta_produces_no_lines() {
         let lines = render_tool_delta("run_command", "");
         assert!(lines.is_empty());
+    }
+}
+
+/// Story 1.4: the run-Err badge decision — "Cancelled by user" is a
+/// desired outcome and renders as the cancel notice; every other error
+/// keeps the red error badge.
+#[cfg(test)]
+mod cancel_notice_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_error_picks_the_cancel_notice() {
+        let error = anyhow::anyhow!(takka_core::AgenticError::Cancelled.to_string());
+        assert_eq!(run_outcome_badge(&error), RunOutcomeBadge::Cancelled);
+    }
+
+    #[test]
+    fn other_errors_keep_the_red_error_badge() {
+        for message in [
+            "Provider error: connection refused",
+            "Cancelled by userx", // near-miss must not match
+            "",
+        ] {
+            let error = anyhow::anyhow!(message);
+            assert_eq!(
+                run_outcome_badge(&error),
+                RunOutcomeBadge::Error,
+                "{message}"
+            );
+        }
     }
 }
 

@@ -28,9 +28,11 @@ use std::sync::OnceLock;
 use takka_core::Config;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-/// Shared cancel flag. The signal handler flips this on the first Ctrl+C;
-/// the orchestrator's loop boundary picks it up and returns gracefully.
-/// A second Ctrl+C escalates to a hard exit.
+/// Shared cancel flag. The signal task flips this on the first Ctrl+C;
+/// the shared run loop (`client::run_turn`) watches it between events and
+/// forwards it as `Request::Cancel`, which the engine routes into the
+/// orchestrator's cancel handle — the run unwinds at the next turn
+/// boundary. A second Ctrl+C escalates to a hard exit.
 static CANCEL_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 pub(crate) fn cancel_flag() -> Arc<AtomicBool> {
@@ -160,8 +162,10 @@ async fn main() -> Result<()> {
     let color_enabled = widgets::capabilities::should_use_color();
 
     // ── Ctrl+C graceful shutdown (background task) ─────────
-    // First Ctrl+C: cooperative cancel. The agent loop checks this flag at
-    // every turn boundary and returns AgenticError::Cancelled.
+    // First Ctrl+C: cooperative cancel. `run_turn` (the shared run loop)
+    // watches this flag between events and forwards it as
+    // `Request::Cancel`; the orchestrator returns
+    // AgenticError::Cancelled at the next turn boundary.
     // Second Ctrl+C: force-exit (we may be stuck in a tool that doesn't
     // observe the flag).
     let cancel = cancel_flag();
@@ -169,13 +173,19 @@ async fn main() -> Result<()> {
         tokio::signal::ctrl_c().await.ok();
         if cancel.swap(true, Ordering::SeqCst) {
             // Already cancelled once — hard exit on second Ctrl+C.
-            eprintln!("\n⚠ Force-exiting on second Ctrl+C.");
+            widgets::log_writer::write_notice_to_stderr(
+                "\n⚠ Force-exiting on second Ctrl+C.".as_bytes(),
+            );
             std::process::exit(130);
         }
-        eprintln!("\n⚠ Cancel requested (press Ctrl+C again to force-exit).");
+        widgets::log_writer::write_notice_to_stderr(
+            "\n⚠ Cancel requested (press Ctrl+C again to force-exit).".as_bytes(),
+        );
         // Wait for a possible second Ctrl+C.
         tokio::signal::ctrl_c().await.ok();
-        eprintln!("\n⚠ Force-exiting on second Ctrl+C.");
+        widgets::log_writer::write_notice_to_stderr(
+            "\n⚠ Force-exiting on second Ctrl+C.".as_bytes(),
+        );
         std::process::exit(130);
     });
 

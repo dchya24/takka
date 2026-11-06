@@ -1815,11 +1815,23 @@ impl App {
                         self.progress.stop();
                         self.current_response.clear();
 
-                        self.messages.push(Message {
-                            role: MessageRole::Error,
-                            content: format!("Error: {}", err),
-                            timestamp: chrono::Local::now(),
-                        });
+                        // "Cancelled by user" (AgenticError::Cancelled —
+                        // story 1.4) is a desired outcome: system notice,
+                        // not a red error line (same decision as the
+                        // inline REPL's cancel notice).
+                        if err.contains("Cancelled by user") {
+                            self.messages.push(Message {
+                                role: MessageRole::System,
+                                content: "Run cancelled".to_string(),
+                                timestamp: chrono::Local::now(),
+                            });
+                        } else {
+                            self.messages.push(Message {
+                                role: MessageRole::Error,
+                                content: format!("Error: {}", err),
+                                timestamp: chrono::Local::now(),
+                            });
+                        }
                     }
                     AppMessage::Progress(msg) => {
                         self.progress.set_message(msg);

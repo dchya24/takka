@@ -89,6 +89,24 @@ fn emit(line: &[u8]) {
     }
 }
 
+/// Spinner-aware stderr write for out-of-band notices (story 1.4: the
+/// signal task's Ctrl+C warnings). It mirrors the console-log hook's
+/// protocol by ROUTING THROUGH the installed hook rather than
+/// reimplementing it: while a run is on screen, the renderer's hook
+/// guard is installed and owns the single-writer discipline (try-lock
+/// the render gate → erase the status line → write → re-commit; a plain
+/// write as the fallback when a prompt holds the gate). Without a live
+/// spinner there is nothing to protect, so the line is a plain
+/// raw-mode-safe stderr write. This is the only sanctioned stderr path
+/// for the signal task — a free `eprintln!` there would stomp the
+/// transient status line mid-run.
+pub fn write_notice_to_stderr(line: &[u8]) {
+    match current_hook() {
+        Some(hook) => hook(line),
+        None => write_line_to_stderr(line),
+    }
+}
+
 /// Line-buffered, spinner-aware stderr writer for the console tracing layer.
 ///
 /// A fresh instance is handed to the layer per event, so the buffered
@@ -143,11 +161,19 @@ impl Drop for ConsoleLogWriter {
 mod tests {
     use super::*;
 
+    /// The hook slot is a PROCESS GLOBAL; both hook-driven tests below
+    /// install/clear it — a single mutex serializes them so parallel
+    /// test threads can never tear each other's setup (story 1.4
+    /// review: the notice test's added pair turned the shared slot into
+    /// a race).
+    static HOOK_SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Lines are only handed to the hook once a newline (or the final drop)
     /// completes them, so a multi-`write` event never gets split into
     /// several spinner erase/repaint cycles.
     #[test]
     fn buffers_until_newline_then_emits_complete_lines() {
+        let _guarded = HOOK_SLOT_LOCK.lock().unwrap();
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         set_spinner_hook(Some(Arc::new(move |bytes: &[u8]| {
@@ -168,6 +194,31 @@ mod tests {
         drop(writer);
         assert_eq!(seen.lock().unwrap().len(), 2);
 
+        set_spinner_hook(None);
+    }
+
+    /// Notice lines (story 1.4: the signal task's Ctrl+C warnings) ride
+    /// the installed hook while a run's spinner guard is up — the erase
+    /// → write → repaint protocol stays owned by the hook, and the
+    /// signal task never free-writes over the transient line.
+    #[test]
+    fn notice_writes_route_through_the_installed_hook() {
+        let _guarded = HOOK_SLOT_LOCK.lock().unwrap();
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        set_spinner_hook(Some(Arc::new(move |bytes: &[u8]| {
+            sink.lock().unwrap().push(bytes.to_vec());
+        })));
+
+        write_notice_to_stderr("\n⚠ Cancel requested".as_bytes());
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["\n⚠ Cancel requested".as_bytes().to_vec()]
+        );
+
+        // No stale hook may survive the assertion (the plain-write
+        // fallback path writes straight to stderr, which is not
+        // capturable in-process and needs no assertion).
         set_spinner_hook(None);
     }
 }

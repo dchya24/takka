@@ -1499,9 +1499,10 @@ async fn process_message(
     inline::print_blank();
 
     let start = Instant::now();
-    // Ctrl+C cancellation is handled by the signal handler in main.rs,
-    // which sets the global CANCEL_FLAG.  The orchestrator checks this
-    // flag at every turn boundary and returns gracefully.
+    // Ctrl+C: main.rs's signal task flips the shared CANCEL_FLAG; the
+    // shared run loop (`client::run_turn`) forwards it as
+    // `Request::Cancel`, the engine routes it into the orchestrator's
+    // cancel handle, and the run unwinds at the next turn boundary.
     let result = commands.run(input).await;
 
     if let Err(e) = result {
