@@ -3684,8 +3684,13 @@ impl UsageTotals {
 /// The line is overwritten in place (`MoveUp` + repaint) instead of being
 /// erased and redrawn — the erase/draw cycle blinks on Windows conhost. Since
 /// its width now varies with the phase label, elapsed time and token counter,
-/// every frame is padded to the widest frame seen so a shorter one can never
-/// leave stale characters behind.
+/// every frame is padded — under the min-cover rule
+/// ([`frame_pad_on_resize`]) — to cover everything the predecessor could
+/// have painted unwrapped at the terminal's current width, so a shorter
+/// frame can never leave stale characters behind. The ambient width is
+/// re-measured fresh every frame (nothing caches it), and the returned pad
+/// becomes the next baseline: the painter's only stored state is
+/// `frame_width`.
 struct StatusPainter {
     frame_width: usize,
     /// `ctrl+c to cancel` is only worth the columns when the terminal is wide
@@ -3701,7 +3706,10 @@ impl StatusPainter {
         }
     }
 
-    /// Build the next frame, padded to the widest one painted so far.
+    /// Build the next frame, padded per the min-cover resize rule: the
+    /// ambient width is re-measured fresh each frame and the pad covers
+    /// everything the predecessor could have painted unwrapped at that
+    /// width. The returned pad doubles as the new baseline.
     fn next_line(
         &mut self,
         state: &std::sync::Mutex<crate::widgets::progress::ProgressState>,
@@ -3712,12 +3720,11 @@ impl StatusPainter {
             crate::widgets::spinner::status_line(&progress, self.show_cancel_hint)
         };
         let width = line.width();
-        if width < self.frame_width {
-            line.spans
-                .push(RSpan::raw(" ".repeat(self.frame_width - width)));
-        } else {
-            self.frame_width = width;
+        let pad = frame_pad_on_resize(self.frame_width, inline::terminal_width(), width);
+        if pad > width {
+            line.spans.push(RSpan::raw(" ".repeat(pad - width)));
         }
+        self.frame_width = pad;
         line
     }
 
@@ -3752,6 +3759,28 @@ impl StatusPainter {
     }
 }
 
+/// The pad width for the next status frame under a mid-run resize
+/// (story 1.2, the min-cover rule):
+///
+/// `pad = max(line_width, min(frame_width, ambient_now))`
+///
+/// Cover every column the predecessor could have painted WITHOUT WRAPPING
+/// at the width the terminal has now — `redraw`'s in-place overwrite
+/// writes no `Clear`, so anything short of that coverage strands stale
+/// glyphs. Within one ambient width (the baseline was measured at the
+/// current width) this is exactly `max(line_width, frame_width)` —
+/// today's pad-to-widest, bit-for-bit. On a partial narrowing the
+/// retained baseline still fits (`min` keeps it); on a deep narrow (the
+/// baseline itself no longer fits) the pad caps at the new width, so the
+/// frame never exceeds the terminal. The one irrecoverable exception is
+/// the transition frame painted before the new width was first observed
+/// — a documented residual; every frame after that observation fits
+/// exactly. The caller's only state is `frame_width` — the returned pad
+/// becomes the next baseline; no ambient measurement is stored.
+fn frame_pad_on_resize(frame_width: usize, ambient_now: usize, line_width: usize) -> usize {
+    line_width.max(frame_width.min(ambient_now))
+}
+
 // ── Live preview of streamed text (story 1.1) ────────────────
 //
 // While a run streams, the renderer announces each newly completed line
@@ -3759,6 +3788,18 @@ impl StatusPainter {
 // the console-log hook's proven erase → print → repaint cycle. The printed
 // lines ARE the final answer: at end of run only the suffix the preview
 // never reached is printed, so the answer appears exactly once.
+//
+// Wrap & resize doctrine (story 1.2, the console-log hook rule): a
+// streamed line is announced once, whole, and the TERMINAL does all
+// wrapping — an over-long line wraps once at the terminal's own ambient
+// width, exactly as `log_writer::write_line_to_stderr` writes whole raw
+// log lines with zero custom wrapping. Nothing in the preview path
+// measures or caches a width; `preview_flush` is width-blind by
+// construction. On a resize, lines already printed are never re-rendered,
+// re-wrapped, or truncated — their scrollback is final; only lines not
+// yet announced see the new width (the status painter's per-frame
+// re-measure is the one width-aware surface, and it resets only its pad
+// baseline, never a printed line).
 
 /// One renderer tick's live-preview decision.
 enum PreviewFlush {
@@ -4383,6 +4424,65 @@ mod status_painter_tests {
 
         assert!(big > small, "token counter should widen the line");
     }
+
+    // ── Resize doctrine (story 1.2) ─────────────────────────
+    //
+    // `redraw` overwrites in place with MoveUp(1) + repaint and no
+    // Clear, so the next frame must cover every column its predecessor
+    // could have painted WITHOUT WRAPPING at the width the terminal has
+    // now. `frame_pad_on_resize` is that pure min-cover rule:
+    // `pad = max(line_width, min(frame_width, ambient_now))`.
+
+    #[test]
+    fn pad_unchanged_width_is_todays_pad_to_widest_bit_for_bit() {
+        // Baseline measured at the current ambient: exactly today's
+        // pad-to-widest rule, unchanged.
+        assert_eq!(frame_pad_on_resize(60, 100, 40), 60);
+        assert_eq!(frame_pad_on_resize(40, 100, 40), 40);
+        // First frame: no baseline yet, the line sets it.
+        assert_eq!(frame_pad_on_resize(0, 100, 55), 55);
+        // A wider frame re-baselines the pad upward within one width.
+        assert_eq!(frame_pad_on_resize(60, 100, 70), 70);
+    }
+
+    #[test]
+    fn pad_on_widening_keeps_the_widest_baseline() {
+        // Baseline 60 measured at 80 cols; the terminal widens to 120.
+        // The widest-so-far baseline still pads (60 fits unwrapped at
+        // 120), and only a wider frame lifts the baseline.
+        assert_eq!(frame_pad_on_resize(60, 120, 40), 60);
+        assert_eq!(frame_pad_on_resize(60, 120, 80), 80);
+    }
+
+    #[test]
+    fn pad_on_partial_narrowing_keeps_the_retained_baseline() {
+        // Baseline 60 built at 100 cols; the terminal narrows to 80. The
+        // predecessor painted 60 columns unwrapped (60 ≤ 80), so the
+        // next frame must still cover those 60 — resetting the pad to
+        // the new frame's own width would strand stale glyphs in
+        // columns 40–59 under the no-Clear in-place overwrite.
+        assert_eq!(frame_pad_on_resize(60, 80, 40), 60);
+    }
+
+    #[test]
+    fn pad_on_deep_narrowing_caps_at_the_new_ambient_width() {
+        // Baseline 60 built at 100 cols; the terminal narrows to 50. The
+        // baseline itself no longer fits: best-effort cover the maximal
+        // one row, and the frame never exceeds the new width.
+        assert_eq!(frame_pad_on_resize(60, 50, 40), 50);
+    }
+
+    #[test]
+    fn pad_widen_then_narrow_needs_only_the_frame_width_state() {
+        // The caller's only stored state is `frame_width`; no second,
+        // stale ambient measurement participates in the decision. The
+        // same baseline pads correctly across a widening and a later
+        // narrowing, decided purely by the fresh per-frame measurement.
+        let baseline = 70;
+        assert_eq!(frame_pad_on_resize(baseline, 100, 50), 70); // widened
+        assert_eq!(frame_pad_on_resize(baseline, 60, 50), 60); // narrowed
+        assert_eq!(frame_pad_on_resize(baseline, 80, 90), 90); // wider frame re-baselines
+    }
 }
 
 // ── Live-preview flush helper tests (story 1.1) ──────────────
@@ -4532,6 +4632,55 @@ mod preview_flush_tests {
             &["real answer".to_string()],
             &parsed.lines
         ));
+    }
+
+    // ── Wrap / resize doctrine (story 1.2) ──────────────────
+
+    /// Over-long streamed lines wrap once, at the terminal's own ambient
+    /// width, by the terminal itself — the console-log hook rule
+    /// (`log_writer::write_line_to_stderr` writes whole raw lines with
+    /// zero custom wrapping). The flush therefore announces a 300-char
+    /// paragraph as exactly ONE logical line carrying every character;
+    /// nothing code-side wraps, truncates, or splits it.
+    #[test]
+    fn overlong_paragraph_flushes_as_one_whole_line() {
+        let para = "w".repeat(300);
+        let text = format!("{para}\n\n");
+        let completed = completed_text(&text);
+        assert_eq!(
+            completed,
+            format!("{para}\n\n"),
+            "paragraph completes whole"
+        );
+        let lines = printed(&[], completed);
+        assert_eq!(lines.len(), 1, "one logical line, no splitting");
+        assert_eq!(lines[0].chars().count(), 300, "no truncation");
+    }
+
+    /// The flush is width-blind by construction: its signature takes no
+    /// width and its body consults none, so output is a pure function of
+    /// (committed, completed) — whatever the terminal width does between
+    /// ticks cannot change it. A re-flush of the same stream therefore
+    /// prints only the genuinely new lines, and the already-printed
+    /// `committed` entries stay untouched opaque strings (never
+    /// re-derived, re-wrapped, or re-rendered on a resize).
+    #[test]
+    fn flush_is_width_blind_and_prints_only_genuinely_new_lines() {
+        let para = "w".repeat(300);
+        let committed = vec![para.clone()];
+        let committed_before = committed.clone();
+        // "Width changed mid-stream" is invisible here by construction —
+        // the flush sees no width: the 300-char line already printed is
+        // not re-printed, and only genuinely new lines come out.
+        assert_eq!(
+            printed(&committed, &format!("{para}\n\n")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            printed(&committed, &format!("{para}\n\nNext\n\n")),
+            vec!["Next"]
+        );
+        assert_eq!(committed, committed_before, "committed stays untouched");
     }
 }
 

@@ -24,6 +24,13 @@ use super::capabilities::should_use_color;
 /// Uses `\r\n` (CRLF) instead of just `\n` so output is correct both in
 /// cooked mode (terminal driver strips the extra `\r`) and raw mode (where
 /// `\n` alone only moves the cursor down without returning to column 0).
+///
+/// Wrap doctrine (story 1.2): the line is written whole and the TERMINAL
+/// wraps it, once, at its own ambient width — the same rule as the
+/// console-log hook (`log_writer::write_line_to_stderr`, which writes raw
+/// whole lines with zero custom wrapping). No code-side wrapping or
+/// truncation happens here, and printed lines are final: a terminal
+/// resize never re-renders, re-wraps, or truncates them.
 pub fn print_line(line: &Line<'_>) {
     let mut stdout = io::stdout();
     let styled = should_use_color();
