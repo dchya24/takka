@@ -3771,11 +3771,19 @@ impl StatusPainter {
 /// current width) this is exactly `max(line_width, frame_width)` —
 /// today's pad-to-widest, bit-for-bit. On a partial narrowing the
 /// retained baseline still fits (`min` keeps it); on a deep narrow (the
-/// baseline itself no longer fits) the pad caps at the new width, so the
-/// frame never exceeds the terminal. The one irrecoverable exception is
+/// baseline itself no longer fits) the baseline CONTRIBUTION is capped
+/// at the new width, so the frame wraps only when its own content is
+/// wider than the terminal (status content can exceed a very narrow
+/// width — documented residual, out of this story's fix scope). In that
+/// case the cap still covers the maximal recoverable one row's worth of
+/// predecessor columns. The one irrecoverable exception is
 /// the transition frame painted before the new width was first observed
-/// — a documented residual; every frame after that observation fits
-/// exactly. The caller's only state is `frame_width` — the returned pad
+/// (wrap/clipped residue until the terminal reflows it; on the wider
+/// state after a deep-narrow the clamped baseline cannot cover columns
+/// beyond the clamp until a naturally wider frame paints — same family
+/// of cosmetic, bounded stale-column residuals; every frame after the
+/// observation fits exactly). The caller's only state is
+/// `frame_width` — the returned pad
 /// becomes the next baseline; no ambient measurement is stored.
 fn frame_pad_on_resize(frame_width: usize, ambient_now: usize, line_width: usize) -> usize {
     line_width.max(frame_width.min(ambient_now))
