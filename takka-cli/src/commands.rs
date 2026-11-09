@@ -2450,11 +2450,9 @@ impl Commands {
             let r_stop_reader = stop_flag.clone();
             let cancel_reader = cancel_flag.clone();
             // Story-2.2: the reader routes its notices through the log
-            // hook; a cfg-test smoke may install a per-instance capture
-            // sink (no globals, no cross-test capture).
-            // Story-2.2: the reader's notice write. In production (no test
-            // capture wired) the log hook posts to stderr; a cfg(test)
-            // sink captures the exact line for the e2e.
+            // hook in production; a cfg-test smoke may install a
+            // per-instance capture sink (no globals, no cross-test
+            // captures — the smoke asserts the reader's exact notice).
             let mid_run_notice = move |msg: String| {
                 crate::widgets::log_writer::write_notice_dispatch(
                     msg,
