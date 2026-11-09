@@ -32,9 +32,12 @@ pub(crate) const NO_DAEMON_MESSAGE: &str =
 
 /// Upper bound for waiting until a freshly spawned daemon publishes its
 /// discovery file (the broker writes it after bind, so its existence
-/// means the listener is ready).
+/// means the listener is ready). 10s was too tight on loaded macOS CI
+/// runners (observed: "daemon info file did not appear within 10s" in
+/// run 42601781829); the bound is startup plumbing, not the thing
+/// under test.
 #[cfg(unix)]
-const DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Upper bound for the shutdown retry loop against a busy broker (the
 /// previous connection's slot clears within milliseconds of its EOF;
@@ -872,7 +875,7 @@ async fn wait_for_daemon_info(info_path: &Path) -> Result<DaemonInfo> {
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(anyhow!(
-                "spawned daemon did not publish {} within 10s",
+                "spawned daemon did not publish {} within 60s",
                 info_path.display()
             ));
         }

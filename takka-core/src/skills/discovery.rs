@@ -507,10 +507,23 @@ description: Just enough
     fn expand_tilde_path() {
         // HOME is process-global: other tests in this crate mutate it
         // (memory_file/config fallback tests), so hold the shared guard.
-        let _guard = crate::test_env_lock::ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Pin the home this assertion compares against instead of trusting
+        // the runner's ambient env: Windows CI images have been observed
+        // exposing no HOME/USERPROFILE to the test process (run
+        // 42601781829 failed exactly there), while this contract only
+        // cares that `~` resolves against home_dir() to an absolute path.
+        let home = std::env::temp_dir().join(format!("takka_expand_tilde_{}", std::process::id()));
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        #[cfg(windows)]
+        std::env::set_var("USERPROFILE", &home);
         let expanded = expand_path("~/something");
-        // Must resolve to an absolute path under the user's home dir on
-        // every platform (Windows uses `C:\Users\...` — no leading slash).
+        let _ = fs::remove_dir_all(&home);
+        // Must resolve to an absolute path under the pinned home on every
+        // platform (Windows uses `C:\Users\...` — no leading slash).
         assert!(
             expanded.is_absolute(),
             "expected ~ to expand to an absolute path, got {:?}",
@@ -602,7 +615,13 @@ description: Just enough
 
     impl HomeEnvGuard {
         fn hold(home: &Path) -> Self {
-            let lock = crate::test_env_lock::ENV_LOCK.lock().unwrap();
+            // unwrap_or_else: one env test's failure poisons the shared
+            // mutex; later tests should still serialize correctly instead
+            // of cascading PoisonErrors (3 Windows CI failures in
+            // run 42601781829 were this cascade after the first panic).
+            let lock = crate::test_env_lock::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let guard = Self {
                 _lock: lock,
                 home: std::env::var_os("HOME"),
