@@ -7692,14 +7692,24 @@ mod daemon_smoke_tests {
         }
 
         async fn connect(&self) -> AgentConnection {
-            AgentConnection::connect_daemon_at(
+            match AgentConnection::connect_daemon_at(
                 &self.info_path,
                 self.init_overrides(),
                 CLI_CAPABILITIES,
                 false,
             )
             .await
-            .expect("daemon attach failed")
+            {
+                Ok(conn) => conn,
+                Err(error) => {
+                    // Quote the daemon's own log: a handshake refusal on a
+                    // CI runner otherwise dies silent (macOS failures were
+                    // a guess chain until the spawn evidence patch).
+                    let stderr = std::fs::read_to_string(self.dir.join("daemon-stderr.log"))
+                        .unwrap_or_default();
+                    panic!("daemon attach failed: {error}; daemon stderr: {}", stderr);
+                }
+            }
         }
 
         /// Wait until the broker exited cleanly and unlinked its
