@@ -3,7 +3,7 @@ title: 'Story 1.1 — Live preview of streamed text through the painter'
 type: 'feature'
 ticket: 'story-live-preview-of-streamed-text-through-the-painter'
 created: '2026-11-05'
-status: 'draft'
+status: built
 baseline_revision: '79a3982f07f6de6ccb4c8702e084595c8350c4c9'
 route: 'full'
 route_source: 'auto'

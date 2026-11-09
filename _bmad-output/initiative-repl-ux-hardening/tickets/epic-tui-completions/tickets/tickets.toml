@@ -1,0 +1,13 @@
+# epic-tui-completions — entries in build order; tickets.py ignores unknown keys.
+# next_id = 2 # written by `tickets.py move`; the folder's counter never goes below it
+
+[[entry]]
+id = 1
+type = "story"
+title = "TUI mid-run completions and idle parity verification"
+description = "While a run is active in the TUI, typing keeps living completion behavior: the mid-run input buffer drives the existing dropdown engine, so `/` and `@` (and the model/skill follow-ups) open and filter as in the idle state; Up/Down navigate, Tab/Enter accept-fill into the mid-run buffer, Enter with an open dropdown fills instead of submitting, Esc dismisses — typing outside a dropdown keeps the story-2.4 dispatch contract. The idle path is verified against the inline REPL's completion contract (skill chaining, model meta/descriptions, overlay placement) and drift found there is fixed or recorded."
+verify = "A scripted run in the TUI shows `/` and `@` dropdowns opened from mid-run typed text; accepting fills the mid-run input and Enter while a dropdown is open fills instead of steering; idle completion matches the inline REPL's behavior; full workspace checks stay green incl. e2e smoke suite."
+covers = ["R3"]
+after = ["epic-mid-run-input"]
+hitl = false
+risk = "low"

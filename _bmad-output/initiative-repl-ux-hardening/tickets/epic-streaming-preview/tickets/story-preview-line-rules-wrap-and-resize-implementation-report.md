@@ -1,6 +1,6 @@
 ---
 title: 'Story 1.2 — Preview line rules: wrap and resize — implementation report'
-ticket: 'story-preview-line-rules-wrap-and-resize'
+story: 'story-preview-line-rules-wrap-and-resize'
 plan: 'story-preview-line-rules-wrap-and-resize-plan.md'
 implemented: '2026-11-06'
 baseline_revision: '5a2b35d60c062af23339adaf665736aebbdebd67'

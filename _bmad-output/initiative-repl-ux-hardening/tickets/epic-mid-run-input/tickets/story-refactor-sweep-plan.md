@@ -1,7 +1,7 @@
 ---
 title: 'Story 2.5 — Refactor sweep'
 type: 'chore'
-ticket: 'story-tui-mid-run-input-refactor-sweep'
+ticket: 'story-refactor-sweep'
 created: '2026-11-08'
 status: 'built'
 baseline_revision: '0d268e1'
