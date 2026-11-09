@@ -2281,30 +2281,40 @@ async fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             // If Shift is held, scroll instead of moving cursor
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.scroll_up();
-            } else {
+            } else if !app.is_loading {
+                // Mid-run cursor keys only move the hidden idle buffer's
+                // cursor (visible nowhere) — keep them idle-only.
                 app.move_cursor_left();
             }
         }
         KeyCode::Right => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.scroll_down();
-            } else {
+            } else if !app.is_loading {
+                // See the Left arm: idle-only cursor movement.
                 app.move_cursor_right();
             }
         }
-        KeyCode::Home => app.move_cursor_start(),
-        KeyCode::End => app.move_cursor_end(),
+        KeyCode::Home if !app.is_loading => app.move_cursor_start(),
+        KeyCode::End if !app.is_loading => app.move_cursor_end(),
         KeyCode::Up => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.scroll_up();
-            } else {
+            } else if !app.is_loading {
+                // History browsing edits the idle buffer — meaning while a
+                // run is loading that buffer isn't even the pane's content
+                // (story 3.1 echoes mid_run_input instead). Mid-run a
+                // plain Up/Down must not silently rewrite the hidden idle
+                // buffer; it is a no-op (the dropdown engine is NOT active:
+                // no dropdown open or the interception block above ran).
                 app.history_up();
             }
         }
         KeyCode::Down => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.scroll_down();
-            } else {
+            } else if !app.is_loading {
+                // See the Up arm: no hidden-idle-buffer history edits mid-run.
                 app.history_down();
             }
         }
@@ -2488,6 +2498,32 @@ mod tests {
         handle_key_event(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await;
         handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).await;
         assert_eq!(app.mid_run_input, "/quit ");
+    }
+
+    /// Plain Up/Down mid-run must NOT browse history: history edits the
+    /// idle buffer, which the loading pane no longer renders (story 3.1
+    /// echo) — the mutation would be silent. Idle still navigates history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_history_keys_leave_buffers_alone() {
+        let (mut app, _commands) = test_app();
+        app.input = "pre-run prompt".into();
+        app.cursor_pos = "pre-run prompt".len();
+        app.history = vec!["older entry".to_string()];
+        app.is_loading = true;
+        type_mid_run(&mut app, "steering text");
+
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE)).await;
+
+        // Nothing changed: neither buffer, nor history state.
+        assert_eq!(app.input, "pre-run prompt");
+        assert_eq!(app.cursor_pos, "pre-run prompt".len());
+        assert_eq!(app.history_index, -1);
+        assert_eq!(app.mid_run_input, "steering text");
     }
 
     /// Backspace corrects the mid-run buffer and the dropdown re-evaluates;
