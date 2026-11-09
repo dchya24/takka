@@ -607,7 +607,7 @@ pub struct Commands {
     /// Text submitted while a run was active in FollowUp mode. Drained
     /// after the run's terminal event: each item is sent as the next run
     /// (client-issued; see `drain_follow_ups`).
-    pending_follow_ups: std::collections::VecDeque<String>,
+    pending_follow_ups: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// Current nesting depth of `drain_follow_ups` (drained runs drain
     /// again on completion; capped at [`MAX_FOLLOW_UP_DRAIN_DEPTH`]).
     drain_depth: usize,
@@ -645,6 +645,11 @@ pub struct Commands {
     /// (story 1.3 e2e interleave assertion).
     #[cfg(test)]
     test_render_order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Test sink (cfg(test), story 2.2): per-INSTANCE notice capture for
+    /// the mid-run reader's queue/cancel notices — no globals, so
+    /// parallel tests never capture each other's stderr writes.
+    #[cfg(test)]
+    test_mid_run_notice_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
     /// Test tap (cfg(test)): the mid-run key injection source for story
     /// 2.1 smokes — the reader takes this once instead of the keyboard.
     #[cfg(test)]
@@ -697,7 +702,7 @@ impl Commands {
             skill_index: None,
             active_skill: None,
             queue_mode: QueueMode::default(),
-            pending_follow_ups: std::collections::VecDeque::new(),
+            pending_follow_ups: Default::default(),
             drain_depth: 0,
             show_thoughts_override: None,
             timeline_style: TimelineStyle::Detailed,
@@ -720,6 +725,8 @@ impl Commands {
             test_mid_run_keys: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             test_input_echoes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            test_mid_run_notice_sink: None,
             #[cfg(test)]
             test_terminal_cleanup_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 0,
@@ -753,6 +760,17 @@ impl Commands {
     /// global, so flipping it mid-run cannot cancel a concurrently
     /// running test's run (tests share one process; the process flag is
     /// process-global).
+    /// Per-instance notice-capture sink for the mid-run reader's queue
+    /// and cancel notices (cfg(test), story 2.2).
+    #[cfg(test)]
+    pub(crate) fn with_mid_run_notice_sink(
+        mut self,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Self {
+        self.test_mid_run_notice_sink = Some(sink);
+        self
+    }
+
     /// Inject the story-2.1 mid-run key source (cfg(test) only): the
     /// reader thread's keyboard-feed replacement for deterministic smokes.
     #[cfg(test)]
@@ -2348,27 +2366,40 @@ impl Commands {
         // read.
         cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        // ── Mid-run input (story 2.1, Interrupt mode) ────────────────
+        // ── Mid-run input (story 2.1, both queue modes now — 2.2) ─────
         //
         // While the run owns the terminal, ONE spawned reader thread
         // collects typed characters, echoes them through the renderer's
         // ordered queue (`RendererUpdate::InputEcho` — the single-writer
-        // discipline holds), and on Enter submits the line through
-        // `steer_tx` — `run_turn`'s watch loop forwards it to the engine
-        // as `Request::Steer`. Ctrl+C rides the story-1.4 two-stage
-        // cancel path from the same thread (raw mode hides SIGINT from
-        // the tokio signal task, so the key reader is the cancel source
-        // in the inline REPL). The reader ends when the run's stop flag
-        // flips. FollowUp mode (the default) is story 2.2: no reader
-        // spawns yet, so those runs stay byte-for-byte today's shape.
+        // discipline holds), and on Enter routes the line per the
+        // captured queue mode: Interrupt → `Request::Steer` via
+        // `steer_tx` (the `run_turn` watcher); FollowUp (the CLI default)
+        // → the client-side follow-up queue + a log-hook notice, whose
+        // existing post-run drain executes the line as the next run.
+        // Ctrl+C rides the story-1.4 two-stage cancel path from the same
+        // thread. The reader ends when the run's stop flag flips.
+        // Mid-run `/queue` mode switching is out of scope: the mode is
+        // captured at spawn (a switch applies from the next run).
+        // The reader's notice write: production goes to the log hook
+        // (through the reader's closure), cfg(test) smokes capture it
+        // per-instance — no global, no parallel-test collisions.
+        // Unconditional steering channel: follows both queue modes; the
+        // reader only writes to it in Interrupt mode (story 2.2 does not
+        // need `None` in follow-up — see implementation notes).
         let steer_rx;
-        if matches!(self.queue_mode, QueueMode::Interrupt) {
+        let queue_mode_captured = self.queue_mode;
+        let pending_follow_ups_shared = self.pending_follow_ups.clone();
+        #[allow(unused_assignments)] // review: see the join at the drain
+        let mut reader_thread_handle: Option<std::thread::JoinHandle<()>> = None;
+        {
             let (steer_tx, steer_line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let (echo_tx, echo_rx) = std::sync::mpsc::channel::<String>();
             steer_rx = Some(steer_line_rx);
             // No standing "input is live" badge: an Interrupt run with no
             // typed text stays byte-for-byte today's output (story-2.1
             // review fix, zero-residue rule).
+            #[cfg(test)]
+            let notice_sink = self.test_mid_run_notice_sink.clone().unwrap_or_default();
             // cfg(test) injection: the cancel smokes feed deterministic
             // keys instead of the keyboard (story 1.4's cancel-driver
             // pattern). `test_mid_run_keys` is a one-shot take.
@@ -2376,7 +2407,22 @@ impl Commands {
             let test_keys = self.test_mid_run_keys.clone();
             let r_stop_reader = stop_flag.clone();
             let cancel_reader = cancel_flag.clone();
-            std::thread::Builder::new()
+            // Story-2.2: the reader routes its notices through the log
+            // hook; a cfg-test smoke may install a per-instance capture
+            // sink (no globals, no cross-test capture).
+            // Story-2.2: the reader's notice write. In production (no test
+            // capture wired) the log hook posts to stderr; a cfg(test)
+            // sink captures the exact line for the e2e.
+            let mid_run_notice = move |msg: String| {
+                crate::widgets::log_writer::write_notice_dispatch(
+                    msg,
+                    #[cfg(test)]
+                    Some(crate::widgets::log_writer::NoticeSink(notice_sink.clone())),
+                    #[cfg(not(test))]
+                    None,
+                );
+            };
+            let reader_spawn_handle = std::thread::Builder::new()
                 .name("takka-mid-run-input".into())
                 .spawn(move || {
                     let mut buffer = String::new();
@@ -2428,14 +2474,10 @@ impl Commands {
                                 // requests the cooperative cancel, the
                                 // second force-exits at 130.
                                 if cancel_reader.swap(true, Ordering::SeqCst) {
-                                    crate::widgets::log_writer::write_notice_to_stderr(
-                                        "\n\u{26a0} Force-exiting on second Ctrl+C.".as_bytes(),
-                                    );
+                                    mid_run_notice("\n\u{26a0} Force-exiting on second Ctrl+C.".to_string());
                                     std::process::exit(130);
                                 }
-                                crate::widgets::log_writer::write_notice_to_stderr(
-                                    "\n\u{26a0} Cancel requested (press Ctrl+C again to force-exit).".as_bytes(),
-                                );
+                                mid_run_notice("\n\u{26a0} Cancel requested (press Ctrl+C again to force-exit).".to_string());
                                 buffer.clear();
                                 let _ = echo_tx.send(String::new());
                             }
@@ -2447,7 +2489,28 @@ impl Commands {
                                 let line = std::mem::take(&mut buffer);
                                 let _ = echo_tx.send(String::new());
                                 if !line.is_empty() {
-                                    let _ = steer_tx.send(line);
+                                    match queue_mode_captured {
+                                        QueueMode::Interrupt => {
+                                            let _ = steer_tx.send(line);
+                                        }
+                                        QueueMode::FollowUp => {
+                                            // Story 2.2: the default mode
+                                            // queues the text client-side;
+                                            // the drain runs it as the next
+                                            // run, and the log hook makes
+                                            // the queueing visible in the
+                                            // same transient band the
+                                            // notices use.
+                                            pending_follow_ups_shared
+                                                .lock()
+                                                .unwrap()
+                                                .push_back(line.clone());
+                                            mid_run_notice(format!(
+                                                "\n\u{21b3} queued for the next run: \"{}\"",
+                                                line
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2455,9 +2518,11 @@ impl Commands {
                     let _ = echo_tx.send(String::new());
                 })
                 .expect("failed to spawn mid-run input reader");
-            // Spool the reader's echo frames into the renderer's single
-            // ordered queue (the renderer owns the terminal; the spooler
-            // is a plain forwarder, not a writer).
+            // Keep the reader's handle: the drain runs only after the
+            // reader joined, so an Enter landing inside the stop-flag
+            // window cannot push past the promised next-run drain
+            // (story-2.2 review fix #2).
+            reader_thread_handle = Some(reader_spawn_handle);
             let update_tx_mid = update_tx.clone();
             let _echo_spooler = std::thread::Builder::new()
                 .name("takka-mid-run-echo".into())
@@ -2472,8 +2537,6 @@ impl Commands {
                     }
                 })
                 .expect("failed to spawn mid-run echo spooler");
-        } else {
-            steer_rx = None;
         }
         let runtime = self
             .connection
@@ -2771,6 +2834,13 @@ impl Commands {
         // follow-ups: text submitted mid-run in FollowUp mode is sent as
         // the next run (client-issued, depth-guarded loop). Both outcome
         // branches above converge here.
+        //
+        // Story-2.2 review fix: the mid-run reader joins FIRST — an Enter
+        // landing inside the stop-flag window cannot push a line past the
+        // drain (the "next run" promise stays literal).
+        if let Some(reader) = reader_thread_handle {
+            let _ = reader.join();
+        }
         self.drain_follow_ups().await?;
 
         Ok(())
@@ -2889,8 +2959,10 @@ impl Commands {
     }
 
     /// Text queued in FollowUp mode awaiting the next drain.
-    pub fn pending_follow_ups(&self) -> &std::collections::VecDeque<String> {
-        &self.pending_follow_ups
+    pub fn pending_follow_ups(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<String>> {
+        self.pending_follow_ups.lock().unwrap()
     }
 
     /// Programmatic entrypoint for user text typed while a run may be
@@ -2915,7 +2987,7 @@ impl Commands {
                 Ok(true)
             }
             QueueMode::FollowUp => {
-                self.pending_follow_ups.push_back(text);
+                self.pending_follow_ups.lock().unwrap().push_back(text);
                 Ok(true)
             }
         }
@@ -2947,7 +3019,9 @@ impl Commands {
     }
 
     async fn drain_follow_ups_loop(&mut self) -> Result<()> {
-        while let Some(next) = self.pending_follow_ups.pop_front() {
+        loop {
+            let next = self.pending_follow_ups.lock().unwrap().pop_front();
+            let Some(next) = next else { break };
             self.run(&next).await?;
         }
         Ok(())
@@ -6992,6 +7066,97 @@ mod e2e_tests {
         assert!(
             commands.test_final_print.lock().unwrap().is_empty(),
             "answer fully previewed; final print must be suffix-free"
+        );
+    }
+    /// Story 2.2 e2e: FollowUp mode (the CLI default) — typed keys mid-run
+    /// route into the client-side follow-up queue (visible via the hook
+    /// notice tap), and the existing depth-guarded drain executes the
+    /// queued line as the next run; the provider captures run 2's request
+    /// body carrying the queued text as its task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_followup_mode_queues_and_drains_visibly() {
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(2000),
+                "Second para\n\n".to_string(),
+            )]),
+            // Run 2 (the drained follow-up): a fresh single turn.
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "Follow-up done\n\n".to_string(),
+            )]),
+        ];
+        let (port, captured) =
+            spawn_scripted_sse_server_turns_with_capture(turns, Default::default());
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let notice_sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (key_tx, key_rx) = std::sync::mpsc::channel::<MidRunKey>();
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            // the DEFAULT mode — explicit for clarity
+            .with_queue_mode(QueueMode::FollowUp)
+            .with_mid_run_notice_sink(notice_sink.clone())
+            .with_mid_run_keys(key_rx);
+
+        // Inject keys inside turn 2's provider window; the queue's notice
+        // lands then, and the drain runs the line after the terminal event.
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("followup-driver".into())
+            .spawn(move || {
+                wait_for_tap_event_count(&tap, "ModelRequest", 2);
+                for ch in "later text more".chars() {
+                    key_tx.send(MidRunKey::Char(ch)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                key_tx.send(MidRunKey::Enter).unwrap();
+            })
+            .expect("followup driver thread");
+
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("followup driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+
+        // The queue notice was visible once (hook notice tap).
+        let notices = notice_sink.lock().unwrap().clone();
+        assert_eq!(
+            notices.len(),
+            1,
+            "queueing must report once via the hook notice: {notices:?}"
+        );
+        assert!(
+            notices[0].contains("queued for the next run")
+                && notices[0].contains("\"later text more\""),
+            "the notice must name the queued line: {notices:?}"
+        );
+        // Clear the notice sink (no check: the setter returns nothing).
+
+        // The queue drained: the follow-up run executed as run 2 — its
+        // provider request carried the queued line as the task.
+        let bodies = captured.lock().unwrap().clone();
+        let last = bodies.last().expect("run 2 must post a request");
+        assert!(
+            last.contains("later text more"),
+            "the follow-up run's provider request must carry the queued task: {last:?}"
+        );
+        assert!(
+            commands.test_final_print.lock().unwrap().is_empty(),
+            "run 2's answer fully previewed"
         );
     }
 }

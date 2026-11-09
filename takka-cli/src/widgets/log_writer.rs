@@ -107,6 +107,21 @@ pub fn write_notice_to_stderr(line: &[u8]) {
     }
 }
 
+pub struct NoticeSink(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+/// One notice write, optionally captured in a caller-supplied per-instance
+/// sink (story 2.2 cfg-test): the smokes record the exact notice lines the
+/// reader emits; production always posts to stderr through the log hook.
+/// (Non-test builds: the sink arg is a no-op.)
+#[allow(unused_variables)]
+pub fn write_notice_dispatch(line: String, caller_sink: Option<NoticeSink>) {
+    if let Some(sink) = caller_sink {
+        (sink.0).lock().unwrap().push(line);
+        return;
+    }
+    write_notice_to_stderr(line.as_bytes());
+}
+
 /// Line-buffered, spinner-aware stderr writer for the console tracing layer.
 ///
 /// A fresh instance is handed to the layer per event, so the buffered
