@@ -74,6 +74,59 @@ pub enum AppMessage {
     },
 }
 
+/// Which text buffer the dropdown engine currently reads and writes.
+///
+/// Idle keys edit `input` (cursor tracked in `cursor_pos`); mid-run keys
+/// edit `mid_run_input` (story 2.4, cursor always at the end). One
+/// dropdown engine serves both: every call derives the target from
+/// `is_loading` and views/writes the matching buffer.
+#[derive(Clone, Copy)]
+enum InputTarget {
+    Idle,
+    MidRun,
+}
+
+/// Find the byte position of the `@` trigger that the cursor is currently
+/// inside, in the given buffer view.
+///
+/// Returns Some(byte_pos) if:
+/// - There's an `@` at the start of the buffer or after whitespace
+/// - There's no whitespace between the `@` and the cursor
+/// - The cursor is at or after the `@`
+fn find_at_trigger(text: &str, cursor: usize) -> Option<usize> {
+    let before_cursor = &text[..cursor];
+
+    // Walk backwards from cursor looking for `@`
+    for (i, c) in before_cursor.char_indices().rev() {
+        match c {
+            '@' => {
+                // `@` must be at start of buffer or preceded by whitespace
+                let at_start = i == 0;
+                let after_space = i > 0 && text[..i].ends_with(char::is_whitespace);
+                if at_start || after_space {
+                    // Check no whitespace between @ and cursor
+                    let after_at = &before_cursor[i + 1..];
+                    if !after_at.contains(char::is_whitespace) {
+                        return Some(i);
+                    }
+                }
+                // If `@` is not valid trigger position, stop searching
+                // (we hit a non-whitespace char that isn't `@`)
+                return None;
+            }
+            w if w.is_whitespace() => {
+                // Hit whitespace going backwards — stop
+                return None;
+            }
+            _ => {
+                // Regular character, keep going back
+                continue;
+            }
+        }
+    }
+    None
+}
+
 /// Application state
 pub struct App {
     /// Input buffer
@@ -1117,167 +1170,216 @@ impl App {
         self.cursor_pos = self.input.len();
     }
 
-    // ── Dropdown: @ file search & / commands ────────────────
+    // ── Dropdown: @ file search & / commands ────────────────────
 
-    /// Update dropdown state based on current input and cursor position.
-    ///
-    /// Rules:
-    /// - If input starts with `/` and cursor is in the command part → command dropdown
-    /// - If cursor is right after or within an `@...` sequence → file dropdown
-    /// - Otherwise → no dropdown
-    fn update_dropdown(&mut self) {
-        // 1) Check for `/` command trigger
-        if self.input.starts_with('/') {
-            // Only show command dropdown if cursor is still in the command part
-            // (before any space — the command itself)
-            let before_cursor = &self.input[..self.cursor_pos];
-            if !before_cursor.contains(' ') {
-                let query = &self.input[1..self.cursor_pos];
-                self.dropdown = Some(Dropdown::new(DropdownType::Command, query.to_string()));
-                return;
+    /// The buffer the dropdown engine (and mid-run editing) targets.
+    fn active_target(&self) -> InputTarget {
+        if self.is_loading {
+            InputTarget::MidRun
+        } else {
+            InputTarget::Idle
+        }
+    }
+
+    /// (text, cursor) view of the target buffer. The mid-run buffer has no
+    /// stored cursor — it is always at the end (story 2.4 contract).
+    fn buffer_view(&self, target: InputTarget) -> (&str, usize) {
+        match target {
+            InputTarget::Idle => (self.input.as_str(), self.cursor_pos),
+            InputTarget::MidRun => (self.mid_run_input.as_str(), self.mid_run_input.len()),
+        }
+    }
+
+    /// Write (text, cursor) back to the target buffer. For the mid-run
+    /// buffer the cursor is always the end, so only the text is stored.
+    fn buffer_write_back(&mut self, target: InputTarget, text: String, cursor: usize) {
+        match target {
+            InputTarget::Idle => {
+                self.input = text;
+                self.cursor_pos = cursor;
             }
+            InputTarget::MidRun => {
+                self.mid_run_input = text;
+            }
+        }
+    }
 
-            // 1b) Check for `/models <partial>` or `/m <partial>` model trigger
-            if let Some(space_pos) = before_cursor.find(' ') {
-                let cmd = &self.input[1..space_pos];
+    /// Update dropdown state based on the active input buffer and cursor.
+    ///
+    /// The active buffer is the idle `input` while idle and the mid-run
+    /// `mid_run_input` while a run is loading, so completions work in both
+    /// states through the same engine (story 3.1).
+    fn update_dropdown(&mut self) {
+        let target = self.active_target();
+        // Copy the view out so `self` can be borrowed again below.
+        let (text, cursor) = {
+            let (t, c) = self.buffer_view(target);
+            (t.to_string(), c)
+        };
+        self.dropdown = Self::evaluate_dropdown(&text, cursor, || self.skill_pairs());
+    }
+
+    /// Pure dropdown evaluator over a (text, cursor) buffer view.
+    ///
+    /// Rules (mirrors the inline REPL, the reference contract):
+    /// - If the buffer starts with `/` and cursor is in the command part →
+    ///   command dropdown
+    /// - `/models <partial>` or `/m <partial>` → model dropdown
+    /// - `/skill <partial>` or `/sk <partial>` → skill follow-up dropdown:
+    ///   re-discovered and re-filtered per keystroke so an accepted
+    ///   `/skill `/`/sk ` survives narrowing (the recorded idle drift fix)
+    /// - If cursor is right after or within an `@...` sequence → file
+    ///   dropdown
+    /// - Otherwise → no dropdown
+    ///
+    /// `skill_pairs` is only invoked when a skill trigger needs the
+    /// discovery index, so ordinary typing never pays for discovery. An
+    /// empty result closes the dropdown: it renders nothing but would
+    /// otherwise intercept Enter / arrows it cannot serve (same guard as
+    /// the inline REPL).
+    fn evaluate_dropdown(
+        text: &str,
+        cursor: usize,
+        skill_pairs: impl FnOnce() -> Vec<(String, String)>,
+    ) -> Option<Dropdown> {
+        let mut next: Option<Dropdown> = None;
+
+        // 1) Check for `/` command trigger
+        if text.starts_with('/') {
+            let before_cursor = &text[..cursor];
+            if !before_cursor.contains(' ') {
+                // Only show command dropdown if cursor is still in the
+                // command part (before any space — the command itself)
+                let query = &text[1..cursor];
+                next = Some(Dropdown::new(DropdownType::Command, query.to_string()));
+            } else if let Some(space_pos) = before_cursor.find(' ') {
+                let cmd = &text[1..space_pos];
+                // 1b) Check for `/models <partial>` or `/m <partial>` model trigger
                 if cmd == "models" || cmd == "m" {
-                    let query = &self.input[space_pos + 1..self.cursor_pos];
-                    self.dropdown = Some(Dropdown::new(DropdownType::Model, query.to_string()));
-                    return;
+                    let query = &text[space_pos + 1..cursor];
+                    next = Some(Dropdown::new(DropdownType::Model, query.to_string()));
+                }
+                // 1c) Check for `/skill <partial>` or `/sk <partial>` skill
+                //     follow-up trigger. Discovery returning nothing keeps
+                //     the dropdown closed (no empty trap).
+                else if cmd == "skill" || cmd == "sk" {
+                    let pairs = skill_pairs();
+                    if !pairs.is_empty() {
+                        let query = &text[space_pos + 1..cursor];
+                        next = Some(Dropdown::new_skill(query.to_string(), pairs));
+                    }
                 }
             }
         }
 
         // 2) Check for `@` file trigger
-        if let Some(at_pos) = self.find_at_trigger() {
-            let query = &self.input[at_pos + 1..self.cursor_pos];
-            self.dropdown = Some(Dropdown::new(DropdownType::File, query.to_string()));
-            return;
-        }
-
-        // 3) No trigger found
-        self.dropdown = None;
-    }
-
-    /// Find the byte position of the `@` trigger that the cursor is currently inside.
-    ///
-    /// Returns Some(byte_pos) if:
-    /// - There's an `@` at the start of input or after whitespace
-    /// - There's no whitespace between the `@` and the cursor
-    /// - The cursor is at or after the `@`
-    fn find_at_trigger(&self) -> Option<usize> {
-        let before_cursor = &self.input[..self.cursor_pos];
-
-        // Walk backwards from cursor looking for `@`
-        for (i, c) in before_cursor.char_indices().rev() {
-            match c {
-                '@' => {
-                    // `@` must be at start of input or preceded by whitespace
-                    let at_start = i == 0;
-                    let after_space = i > 0 && self.input[..i].ends_with(char::is_whitespace);
-                    if at_start || after_space {
-                        // Check no whitespace between @ and cursor
-                        let after_at = &before_cursor[i + 1..];
-                        if !after_at.contains(char::is_whitespace) {
-                            return Some(i);
-                        }
-                    }
-                    // If `@` is not valid trigger position, stop searching
-                    // (we hit a non-whitespace char that isn't `@`)
-                    return None;
-                }
-                w if w.is_whitespace() => {
-                    // Hit whitespace going backwards — stop
-                    return None;
-                }
-                _ => {
-                    // Regular character, keep going back
-                    continue;
-                }
+        if next.is_none() {
+            if let Some(at_pos) = find_at_trigger(text, cursor) {
+                let query = &text[at_pos + 1..cursor];
+                next = Some(Dropdown::new(DropdownType::File, query.to_string()));
             }
         }
-        None
+
+        // 3) Commit, closing empty dropdowns so they cannot swallow keys
+        //    (e.g. a `/models <id> ` query matching no model must not eat
+        //    the Enter that submits the command).
+        next.filter(|dd| !dd.is_empty())
     }
 
-    /// Accept the currently selected dropdown item and insert it into input.
+    /// Accept the currently selected dropdown item and insert it into the
+    /// active input buffer: the idle buffer while idle, the mid-run buffer
+    /// while a run is loading (the cursor always lands at its end). Enter
+    /// with an open dropdown fills, never submits/steers.
     pub fn accept_dropdown(&mut self) {
-        let selected_text = match &self.dropdown {
-            Some(d) => d.selected_item().map(|s| s.to_string()),
-            None => None,
+        let target = self.active_target();
+
+        // Take the dropdown up front: every path below either closes it or
+        // re-opens it (directory / skill chaining).
+        let Some(dropdown) = self.dropdown.take() else {
+            return;
+        };
+        let Some(selected_text) = dropdown.selected_item().map(|s| s.to_string()) else {
+            return;
         };
 
         let mut is_dir = false;
+        // The /skill chain re-opens the dropdown after the fill.
+        let mut open_skills = false;
 
-        if let Some(text) = selected_text {
-            is_dir = text.ends_with('/');
-            if let Some(dropdown) = &self.dropdown {
-                match dropdown.dropdown_type {
-                    DropdownType::Command => {
-                        // Check if user selected a skill command → open skills dropdown
-                        let cmd = text.trim_start_matches('/');
-                        if cmd == "skill" || cmd == "sk" {
-                            self.open_skill_dropdown();
-                            return;
-                        }
-                        // Replace entire input with /command
-                        self.input = format!("/{} ", text);
-                        self.cursor_pos = self.input.len();
-                    }
-                    DropdownType::File => {
-                        // Replace from @ to cursor with the selected file path
-                        if let Some(at_pos) = self.find_at_trigger() {
-                            let before_at = &self.input[..at_pos];
-                            let after_cursor = &self.input[self.cursor_pos..];
+        let (mut buf, mut cursor) = {
+            let (t, c) = self.buffer_view(target);
+            (t.to_string(), c)
+        };
 
-                            // Add trailing space for files, keep slash for dirs
-                            let suffix = if is_dir {
-                                // Directory — keep it for further navigation
-                                ""
-                            } else {
-                                // File — add space after
-                                " "
-                            };
-
-                            self.input =
-                                format!("{}@{}{}{}", before_at, text, suffix, after_cursor);
-                            self.cursor_pos = at_pos + 1 + text.len() + suffix.len();
-                        }
-                    }
-                    DropdownType::Skill => {
-                        // Extract skill name from display and set input
-                        let skill_name = self
-                            .dropdown
-                            .as_ref()
-                            .and_then(|d| d.get_skill_name(&text))
-                            .unwrap_or_else(|| text.clone());
-                        self.input = format!("/skill {}", skill_name);
-                        self.cursor_pos = self.input.len();
-                    }
-                    DropdownType::Model => {
-                        // Extract model ID from display string (e.g. "gpt-4o 👁 [openai]" → "gpt-4o")
-                        let model_id = self
-                            .dropdown
-                            .as_ref()
-                            .and_then(|d| d.get_model_id(&text))
-                            .unwrap_or_else(|| text.clone());
-                        // Replace from after "/models " to cursor with model ID
-                        let space_pos = self.input.find(' ').unwrap_or(self.input.len());
-                        let prefix = self.input[..=space_pos].to_string(); // includes the space
-                        let after_cursor = self.input[self.cursor_pos..].to_string();
-                        self.input = format!("{}{} {}", prefix, model_id, after_cursor);
-                        self.cursor_pos = prefix.len() + model_id.len() + 1;
-                    }
+        match dropdown.dropdown_type {
+            DropdownType::Command => {
+                let cmd = selected_text.trim_start_matches('/');
+                if cmd == "skill" || cmd == "sk" {
+                    // Fill the command, then open the skills dropdown for
+                    // its argument (follow-up typing filters through
+                    // update_dropdown's skill trigger).
+                    buf = "/skill ".to_string();
+                    cursor = buf.len();
+                    open_skills = true;
+                } else {
+                    // Replace entire buffer with /command
+                    buf = format!("/{} ", selected_text);
+                    cursor = buf.len();
                 }
+            }
+            DropdownType::File => {
+                is_dir = selected_text.ends_with('/');
+                // Replace from @ to cursor with the selected file path
+                if let Some(at_pos) = find_at_trigger(&buf, cursor) {
+                    let before_at = buf[..at_pos].to_string();
+                    let after_cursor = buf[cursor..].to_string();
+
+                    // Add trailing space for files, keep slash for dirs
+                    let suffix = if is_dir {
+                        // Directory — keep it for further navigation
+                        ""
+                    } else {
+                        // File — add space after
+                        " "
+                    };
+
+                    buf = format!("{}@{}{}{}", before_at, selected_text, suffix, after_cursor);
+                    cursor = at_pos + 1 + selected_text.len() + suffix.len();
+                }
+            }
+            DropdownType::Skill => {
+                // Extract skill name from display and set buffer
+                let skill_name = dropdown
+                    .get_skill_name(&selected_text)
+                    .unwrap_or_else(|| selected_text.clone());
+                buf = format!("/skill {}", skill_name);
+                cursor = buf.len();
+            }
+            DropdownType::Model => {
+                // Extract model ID from display string (e.g. "gpt-4o 👁 [openai]" → "gpt-4o")
+                let model_id = dropdown
+                    .get_model_id(&selected_text)
+                    .unwrap_or_else(|| selected_text.clone());
+                // Replace from after "/models " to cursor with model ID
+                let space_pos = buf.find(' ').unwrap_or(buf.len());
+                let prefix = buf[..=space_pos].to_string(); // includes the space
+                let after_cursor = buf[cursor..].to_string();
+                buf = format!("{}{} {}", prefix, model_id, after_cursor);
+                cursor = prefix.len() + model_id.len() + 1;
             }
         }
 
-        // After accepting a file dropdown:
-        // - For directories: re-trigger dropdown to show contents of selected dir
-        // - For files/commands: close dropdown
-        if is_dir {
+        self.buffer_write_back(target, buf, cursor);
+
+        // After accepting:
+        // - The /skill chain: open the skills dropdown for its argument
+        // - Directories: re-trigger the dropdown to show contents of the
+        //   selected dir
+        // - Files/commands/models: close dropdown (already taken)
+        if open_skills {
+            self.open_skill_dropdown();
+        } else if is_dir {
             self.update_dropdown();
-        } else {
-            self.dropdown = None;
         }
     }
 
@@ -1300,8 +1402,11 @@ impl App {
         self.dropdown = None;
     }
 
-    /// Open a skill selection dropdown populated from the discovery index.
-    fn open_skill_dropdown(&mut self) {
+    /// Discover skill (name, description) pairs from the shared Commands
+    /// config. When commands are unavailable or the lock is contended
+    /// (mid-run the run task may hold it), discovery runs with the default
+    /// configuration.
+    fn skill_pairs(&self) -> Vec<(String, String)> {
         let discovery_config = self
             .commands
             .as_ref()
@@ -1310,16 +1415,32 @@ impl App {
             .unwrap_or_default();
         let index = takka_core::discover_skills(&discovery_config);
 
-        let skill_pairs: Vec<(String, String)> = {
-            let mut skills: Vec<_> = index.all().into_iter().collect();
-            skills.sort_by(|a, b| a.name().cmp(b.name()));
-            skills
-                .into_iter()
-                .map(|s| (s.name().to_string(), s.description().to_string()))
-                .collect()
-        };
+        let mut skills: Vec<_> = index.all().into_iter().collect();
+        skills.sort_by(|a, b| a.name().cmp(b.name()));
+        skills
+            .into_iter()
+            .map(|s| (s.name().to_string(), s.description().to_string()))
+            .collect()
+    }
 
-        self.dropdown = Some(Dropdown::new_skill(String::new(), skill_pairs));
+    /// Open a skill selection dropdown populated from the discovery index.
+    ///
+    /// Guard: with nothing discoverable (or discovery unavailable) the
+    /// dropdown stays closed — an empty dropdown would render nothing yet
+    /// still intercept Enter / arrows (the "empty dropdown trap").
+    fn open_skill_dropdown(&mut self) {
+        let pairs = self.skill_pairs();
+        self.open_skill_dropdown_with(pairs);
+    }
+
+    /// Injected-pairs variant of [`Self::open_skill_dropdown`] so the
+    /// guard is unit-testable without ambient discovery.
+    fn open_skill_dropdown_with(&mut self, pairs: Vec<(String, String)>) {
+        if pairs.is_empty() {
+            self.dropdown = None;
+            return;
+        }
+        self.dropdown = Some(Dropdown::new_skill(String::new(), pairs));
     }
 
     // ── History navigation ──────────────────────────────────
@@ -1381,6 +1502,8 @@ impl App {
             return;
         }
         self.mid_run_input.clear();
+        // The buffer is gone — the dropdown must not survive it.
+        self.dropdown = None;
 
         let Some(commands_arc) = self.commands.clone() else {
             return;
@@ -1406,6 +1529,17 @@ impl App {
 
     pub fn insert_mid_run_char(&mut self, c: char) {
         self.mid_run_input.push(c);
+        // Mid-run completions (story 3.1): the same dropdown engine that
+        // serves the idle buffer re-evaluates over the mid-run buffer.
+        self.update_dropdown();
+    }
+
+    /// Delete the last character of the mid-run buffer and re-evaluate the
+    /// dropdown — correction parity with the idle buffer, so an accepted
+    /// fill can be walked back (and its dropdown restored).
+    pub fn delete_mid_run_char(&mut self) {
+        self.mid_run_input.pop();
+        self.update_dropdown();
     }
 
     pub async fn submit(&mut self) {
@@ -1813,6 +1947,8 @@ impl App {
                     self.is_loading = false;
                     self.loading_started = None;
                     self.progress.stop();
+                    // A mid-run dropdown must not leak into the idle state.
+                    self.dropdown = None;
                     self.messages.push(Message {
                         role: MessageRole::Error,
                         content: format!(
@@ -1836,6 +1972,8 @@ impl App {
                         self.is_loading = false;
                         self.loading_started = None;
                         self.progress.stop();
+                        // A mid-run dropdown must not leak into the idle state.
+                        self.dropdown = None;
                         self.stats.messages_sent += 1;
 
                         let content = if self.current_response.is_empty() {
@@ -1854,6 +1992,8 @@ impl App {
                         self.is_loading = false;
                         self.loading_started = None;
                         self.progress.stop();
+                        // A mid-run dropdown must not leak into the idle state.
+                        self.dropdown = None;
                         self.current_response.clear();
 
                         // "Cancelled by user" (AgenticError::Cancelled —
@@ -2100,6 +2240,8 @@ async fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             if app.is_loading {
                 app.is_loading = false;
                 app.progress.stop();
+                // A mid-run dropdown must not leak into the idle state.
+                app.dropdown = None;
                 app.messages.push(Message {
                     role: MessageRole::System,
                     content: "Task cancelled.".into(),
@@ -2126,6 +2268,11 @@ async fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         }
         KeyCode::Backspace if !app.is_loading => {
             app.delete_char();
+        }
+        KeyCode::Backspace if app.is_loading => {
+            // Mid-run correction (story 3.1): trim the buffer and let the
+            // dropdown engine re-evaluate over it.
+            app.delete_mid_run_char();
         }
         KeyCode::Delete if !app.is_loading => {
             app.delete_char_forward();
@@ -2173,6 +2320,7 @@ async fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 mod tests {
     use super::*;
     use crate::commands::QueueMode;
+    use crossterm::event::KeyEvent;
     use takka_core::Config;
 
     /// Story 2.4 TUI smoke (FollowUp): mid-run text queues client-side;
@@ -2201,5 +2349,303 @@ mod tests {
         );
         // The mid-run buffer cleared.
         assert!(app.mid_run_input.is_empty());
+    }
+
+    // ── Story 3.1: mid-run completions & idle parity ──
+
+    /// FollowUp queue mode so mid-run submits queue client-side
+    /// (observable without a live run).
+    fn test_app() -> (App, Arc<Mutex<Commands>>) {
+        let commands = Arc::new(Mutex::new(
+            Commands::new(Config::fallback()).with_queue_mode(QueueMode::FollowUp),
+        ));
+        let app = App::new(commands.clone());
+        (app, commands)
+    }
+
+    fn type_mid_run(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.insert_mid_run_char(c);
+        }
+    }
+
+    fn type_idle(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.insert_char(c);
+        }
+    }
+
+    /// Mid-run `/` opens the command dropdown, filters like idle, and
+    /// Tab-accept fills `mid_run_input` — without steering anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_command_dropdown_fills_buffer_without_steering() {
+        let (mut app, commands) = test_app();
+        app.is_loading = true;
+
+        type_mid_run(&mut app, "/mod");
+
+        let dd = app
+            .dropdown
+            .as_ref()
+            .expect("command dropdown must open mid-run");
+        assert_eq!(dd.dropdown_type, DropdownType::Command);
+        assert_eq!(dd.query, "mod");
+        // Same filtering as the idle buffer (const command table).
+        assert_eq!(dd.items, vec!["models".to_string()]);
+
+        app.accept_dropdown();
+
+        // The fill landed in the mid-run buffer, dropdown closed.
+        assert_eq!(app.mid_run_input, "/models ");
+        assert!(app.dropdown.is_none());
+        // Nothing was steered: the queue is untouched.
+        let queued: Vec<String> = commands.lock().await.pending_follow_ups_snapshot();
+        assert!(queued.is_empty(), "accept must fill, not steer: {queued:?}");
+    }
+
+    /// Mid-run `@` opens the file dropdown and accept replaces from `@`
+    /// to the end of the mid-run buffer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_file_trigger_accept_replaces_from_at() {
+        let (mut app, _commands) = test_app();
+        app.is_loading = true;
+
+        type_mid_run(&mut app, "check @");
+        let dd = app
+            .dropdown
+            .as_ref()
+            .expect("file dropdown must open on @ mid-run");
+        assert_eq!(dd.dropdown_type, DropdownType::File);
+
+        // Pin a deterministic item (file discovery itself is
+        // environment-dependent and already covered in dropdown.rs).
+        app.dropdown.as_mut().unwrap().items = vec!["src/main.rs".to_string()];
+        app.accept_dropdown();
+
+        assert_eq!(app.mid_run_input, "check @src/main.rs ");
+        assert!(app.dropdown.is_none());
+    }
+
+    /// Dropdown navigation keys (Up/Down/Tab/Esc) work mid-run; Enter with
+    /// an open dropdown fills instead of steering; Enter with no dropdown
+    /// follows the exact story-2.4 path and the log gains the `↳` line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_enter_with_dropdown_fills_then_next_enter_steers() {
+        let (mut app, commands) = test_app();
+        app.is_loading = true;
+
+        type_mid_run(&mut app, "/");
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+
+        // Second command in the const table is `new` — the fill landed in
+        // the mid-run buffer, nothing was steered.
+        assert_eq!(app.mid_run_input, "/new ");
+        assert!(app.dropdown.is_none());
+        let queued: Vec<String> = commands.lock().await.pending_follow_ups_snapshot();
+        assert!(
+            queued.is_empty(),
+            "Enter on an open dropdown must fill: {queued:?}"
+        );
+
+        // Enter again (dropdown closed): exact story-2.4 path — the typed
+        // text is delivered per queue mode and the log surfaces the hand-over.
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).await;
+        let queued: Vec<String> = commands.lock().await.pending_follow_ups_snapshot();
+        assert_eq!(queued, vec!["/new".to_string()]);
+        assert!(app.mid_run_input.is_empty());
+        assert!(app.messages.iter().any(|m| m.role == MessageRole::System
+            && m.content.contains('\u{21b3}')
+            && m.content.contains("/new")));
+    }
+
+    /// Esc dismisses the dropdown but keeps the mid-run buffer; further
+    /// typing re-evaluates; Tab accepts; Up wraps the selection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_navigation_contract_esc_tab_up() {
+        let (mut app, _commands) = test_app();
+        app.is_loading = true;
+
+        type_mid_run(&mut app, "/mod");
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).await;
+        assert!(app.dropdown.is_none());
+        assert_eq!(app.mid_run_input, "/mod", "Esc must keep the buffer");
+
+        // Typing after Esc re-evaluates and re-opens.
+        app.insert_mid_run_char('e');
+        let dd = app.dropdown.as_ref().expect("typing must re-open");
+        assert_eq!(dd.dropdown_type, DropdownType::Command);
+        assert_eq!(dd.query, "mode");
+
+        // Tab accepts into the mid-run buffer.
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).await;
+        assert_eq!(app.mid_run_input, "/models ");
+
+        // Up from selection 0 wraps to the last command (const table).
+        app.mid_run_input.clear();
+        app.dropdown = None;
+        type_mid_run(&mut app, "/");
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).await;
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).await;
+        assert_eq!(app.mid_run_input, "/quit ");
+    }
+
+    /// Backspace corrects the mid-run buffer and the dropdown re-evaluates;
+    /// the idle buffer is untouched and empty-buffer backspace is safe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_backspace_corrects_buffer_and_dropdown() {
+        let (mut app, _commands) = test_app();
+        app.is_loading = true;
+
+        type_mid_run(&mut app, "/mo");
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await;
+        assert_eq!(app.mid_run_input, "/m");
+        let dd = app.dropdown.as_ref().expect("dropdown must re-evaluate");
+        assert_eq!(dd.dropdown_type, DropdownType::Command);
+        assert_eq!(dd.query, "m");
+        assert_eq!(dd.items, vec!["models".to_string(), "mcp".to_string()]);
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await;
+        assert_eq!(app.mid_run_input, "/");
+        assert!(app.dropdown.is_some(), "`/` alone still triggers");
+
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await;
+        assert!(app.mid_run_input.is_empty());
+        assert!(app.dropdown.is_none(), "no trigger, no dropdown");
+
+        // Backspace on an empty mid-run buffer is a no-op, and the idle
+        // buffer is never touched by the mid-run arm.
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .await;
+        assert!(app.mid_run_input.is_empty());
+        assert!(app.input.is_empty());
+    }
+
+    /// The model trigger works mid-run with the same construction as idle
+    /// (pure static registry); the empty guard keeps a matching-nothing
+    /// dropdown closed in both states.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_mid_run_model_trigger_parity() {
+        let (mut app, _commands) = test_app();
+        app.is_loading = true;
+
+        type_mid_run(&mut app, "/models gpt");
+        match app.dropdown.as_ref() {
+            Some(dd) => {
+                assert_eq!(dd.dropdown_type, DropdownType::Model);
+                assert_eq!(dd.query, "gpt");
+                assert!(dd.items.iter().all(|i| i.to_lowercase().contains("gpt")));
+            }
+            None => { /* no ambient models configured — guard kept it closed */ }
+        }
+
+        // A query matching nothing must not open an empty dropdown.
+        type_mid_run(&mut app, "zzz-no-match");
+        assert!(app.dropdown.is_none(), "empty dropdown must stay closed");
+    }
+
+    /// The skill guard: nothing discoverable → the dropdown stays closed;
+    /// with skills present it opens on an empty query.
+    #[test]
+    fn tui_open_skill_dropdown_guard() {
+        let (mut app, _commands) = test_app();
+
+        app.open_skill_dropdown_with(Vec::new());
+        assert!(app.dropdown.is_none(), "empty sources must stay closed");
+
+        app.open_skill_dropdown_with(vec![("writer".to_string(), "Writes".to_string())]);
+        let dd = app.dropdown.as_ref().expect("skills present must open");
+        assert_eq!(dd.dropdown_type, DropdownType::Skill);
+        assert_eq!(dd.items, vec!["writer — Writes".to_string()]);
+    }
+
+    /// Skill follow-up parity with the inline REPL: `/skill `/`/sk `
+    /// arguments re-trigger the skill dropdown filtered by the query;
+    /// empty/unavailable discovery and no-match queries stay closed.
+    #[test]
+    fn tui_skill_followup_retrigger_matches_repl() {
+        let pairs = vec![
+            ("navigation".to_string(), "Find routes".to_string()),
+            ("search".to_string(), "Search history".to_string()),
+        ];
+
+        // Follow-up on `/skill ` filters by the typed argument.
+        let dd = App::evaluate_dropdown("/skill na", 9, || pairs.clone())
+            .expect("skill follow-up must re-trigger");
+        assert_eq!(dd.dropdown_type, DropdownType::Skill);
+        assert_eq!(dd.items, vec!["navigation — Find routes".to_string()]);
+
+        // The `/sk ` alias behaves identically.
+        let dd = App::evaluate_dropdown("/sk na", 6, || pairs.clone()).unwrap();
+        assert_eq!(dd.dropdown_type, DropdownType::Skill);
+        assert_eq!(dd.items, vec!["navigation — Find routes".to_string()]);
+
+        // Right after accept (empty argument) the full list shows.
+        let dd = App::evaluate_dropdown("/skill ", 7, || pairs.clone()).unwrap();
+        assert_eq!(dd.items.len(), 2);
+
+        // Discovery unavailable / empty → stays closed (no empty trap).
+        assert!(App::evaluate_dropdown("/skill na", 9, Vec::new).is_none());
+        // Query matching nothing → closed as well.
+        assert!(App::evaluate_dropdown("/skill zzz", 10, || pairs.clone()).is_none());
+    }
+
+    /// Idle parity: the same triggers open the same dropdowns, the accept
+    /// chain fills the idle buffer with the cursor, and the skill chain
+    /// now fills `/skill ` like the inline REPL (the recorded drift fix).
+    #[test]
+    fn tui_idle_parity_and_skill_chain_fill() {
+        let (mut app, _commands) = test_app();
+
+        type_idle(&mut app, "/mod");
+        let dd = app.dropdown.as_ref().expect("idle command dropdown");
+        assert_eq!(dd.dropdown_type, DropdownType::Command);
+        assert_eq!(dd.items, vec!["models".to_string()]);
+        app.accept_dropdown();
+        assert_eq!(app.input, "/models ");
+        assert_eq!(app.cursor_pos, app.input.len());
+
+        // A query matching nothing must not open an empty dropdown idle
+        // either (same guard as the inline REPL — it would swallow Enter).
+        let (mut app, _commands) = test_app();
+        type_idle(&mut app, "/zzz");
+        assert!(
+            app.dropdown.is_none(),
+            "empty idle dropdown must stay closed"
+        );
+
+        // Selecting `skill` from the command list fills `/skill ` into the
+        // idle buffer (filter of `sk` is exactly ["skill"] — const table).
+        let (mut app, _commands) = test_app();
+        app.input = "/sk".into();
+        app.cursor_pos = 3;
+        app.dropdown = Some(Dropdown::new(DropdownType::Command, "sk".into()));
+        assert_eq!(
+            app.dropdown.as_ref().unwrap().items,
+            vec!["skill".to_string()]
+        );
+        app.accept_dropdown();
+        assert_eq!(app.input, "/skill ");
+        assert_eq!(app.cursor_pos, 7);
+        // The reopened dropdown is the skill list when discovery yields
+        // skills, closed otherwise (guard) — both valid here.
+        if let Some(dd) = app.dropdown.as_ref() {
+            assert_eq!(dd.dropdown_type, DropdownType::Skill);
+        }
     }
 }

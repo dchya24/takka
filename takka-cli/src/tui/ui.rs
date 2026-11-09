@@ -356,7 +356,16 @@ fn draw_progress(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw input area
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    let input_line = if app.input.is_empty() {
+    // While a run is loading, typed text lives in the mid-run buffer
+    // (story 2.4) — echo it so completion fills stay visible (story 3.1).
+    // Otherwise render the idle buffer, placeholder when empty.
+    let input_line = if app.is_loading {
+        if app.mid_run_input.is_empty() {
+            render_placeholder()
+        } else {
+            render_input(&app.mid_run_input, app.mid_run_input.len())
+        }
+    } else if app.input.is_empty() {
         render_placeholder()
     } else {
         render_input(&app.input, app.cursor_pos)
