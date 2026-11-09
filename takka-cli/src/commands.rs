@@ -7594,7 +7594,7 @@ mod daemon_smoke_tests {
         /// Spawn the real `takka-runtime --daemon` binary with explicit
         /// endpoints under a fresh tempdir. The info file is written after
         /// bind, so its existence means the listener is ready.
-        async fn spawn(tag: &str) -> Self {
+        async fn spawn(_tag: &str) -> Self {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
