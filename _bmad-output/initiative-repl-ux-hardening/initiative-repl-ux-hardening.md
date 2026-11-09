@@ -7,6 +7,7 @@ sources:
   - "CHANGELOG.md"
 companions: []
 risk: medium
+status: done
 ---
 
 # REPL/TUI UX hardening: live streaming, mid-run input, TUI completion parity
@@ -76,3 +77,4 @@ For takka's daily users and its own developers: the interactive surface (inline 
 - Decision: 2026-11-05 — user chose this initiative over "v0.6 release prep"; release-initiative remains the candidate next.
 - Decision: 2026-11-05 — branch rule for this initiative's work: direct commits on `dev` allowed for this session; a `feature/*` + PR flow applies from the next session onward (recorded in `AGENTS.md` Policy).
 - Decision: 2026-11-05 — no platform-baseline epic: the workspace, CI and e2e smoke suite already exist; Epic 1 opens with its tracer story (Tree check: 'or a Decision line saying why not').
+- Closure: 2026-11-09 — user-confirmed (2026-11-09 "Gas"). All three epics closed on implementation evidence: Epic 1 (streaming preview, 5/5 stories, commits c1a65f6..2286bf), Epic 2 (mid-run input, 5/5 stories, commits 0a3b057..13af47e + smoke verification plan), Epic 3 (TUI completions, story 3.1 built on `feature/tui-mid-run-completions`, 919b4ca..dce59b2: quick review triaged, 1 medium patched, all idle deltas fixed or recorded). Requirements coverage: R1 (Epic 2), R2 (Epic 1), R3 (Epic 3); Done-when: streaming readable + clean scrollback, mid-run steer/queue end-to-end both UIs, TUI completion parity idle+mid-run, full workspace checks green incl. e2e smoke suite (987 passed / 0 failed 2026-11-09). Boundaries respected — no protocol bump, no Windows transport, no SDK/scope creep. Next candidate per the 2026-11-05 decision: v0.6 release-prep.
