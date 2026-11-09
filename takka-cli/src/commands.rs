@@ -7599,11 +7599,17 @@ mod daemon_smoke_tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            // Path-length discipline: Unix socket paths must stay under
+            // SUN_LEN (104) — macOS runners' tempdir prefix is ~50 chars,
+            // so a long descriptive name + "test.sock" blew the limit
+            // ("path must be shorter than SUN_LEN", every macOS daemon
+            // smoke dead-on-arrival). Short unique dir keeps the socket
+            // path under the limit while pid + truncated nanos separate
+            // test instances; cleanup is per-dir.
             let dir = std::env::temp_dir().join(format!(
-                "takka-cli-daemon-{}-{}-{}",
+                "takka-da-{}-{}",
                 std::process::id(),
-                nanos,
-                tag
+                nanos % 91_000_000_000
             ));
             std::fs::create_dir_all(&dir).unwrap();
             let config_path = dir.join("config.json");
@@ -7867,9 +7873,9 @@ mod daemon_smoke_tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "takka-cli-autospawn-{}-{}",
+            "takka-au-{}-{}",
             std::process::id(),
-            nanos
+            nanos % 91_000_000_000
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.json");
