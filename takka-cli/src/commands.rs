@@ -7617,24 +7617,51 @@ mod daemon_smoke_tests {
                 let _g = crate::client::daemon_info_tests::ENV_LOCK.lock().unwrap();
                 crate::client::runtime_binary().expect("runtime binary for daemon smoke")
             };
-            let child = tokio::process::Command::new(&binary)
+            let mut child = tokio::process::Command::new(&binary)
                 .arg("--daemon")
                 .arg("--socket-path")
                 .arg(&socket_path)
                 .arg("--info-path")
                 .arg(&info_path)
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                // Evidence pinning: a failing start on a CI runner is
+                // invisible with null streams; park both in the fixture
+                // directory so a timeout failure can quote them.
+                .stdout(std::process::Stdio::from(
+                    std::fs::File::create(dir.join("daemon-stdout.log")).unwrap(),
+                ))
+                .stderr(std::process::Stdio::from(
+                    std::fs::File::create(dir.join("daemon-stderr.log")).unwrap(),
+                ))
                 .kill_on_drop(true) // a panicking test must not leak the daemon
                 .spawn()
                 .expect("spawn takka-runtime --daemon");
             let deadline = Instant::now() + POLL_TIMEOUT;
             while !info_path.exists() {
-                assert!(
-                    Instant::now() < deadline,
-                    "daemon info file did not appear within 10s"
-                );
+                if Instant::now() >= deadline {
+                    let child_status = match child.try_wait() {
+                        Ok(s) => match s {
+                            Some(code) => format!("exited with {code}"),
+                            None => "running".to_string(),
+                        },
+                        Err(e) => format!("wait error: {e}"),
+                    };
+                    // Quote the daemon's own last words, not just the
+                    // deadline: startup crashes so far printed nothing
+                    // anywhere, making every macOS CI failure a guess.
+                    let stderr =
+                        std::fs::read_to_string(dir.join("daemon-stderr.log")).unwrap_or_default();
+                    let stdout =
+                        std::fs::read_to_string(dir.join("daemon-stdout.log")).unwrap_or_default();
+                    panic!(
+                        "daemon info file did not appear within {:?}; binary {:?} alive={:?}; \\\n                         stderr: {}; stdout: {}",
+                        POLL_TIMEOUT,
+                        binary.display(),
+                        child_status,
+                        stderr,
+                        stdout,
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Self {
