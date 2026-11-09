@@ -6709,14 +6709,19 @@ mod e2e_tests {
             .with_cancel_flag(cancel_flag.clone());
 
         // Drive the cancel from a plain thread while the run holds
-        // `commands`: wait for the first delta to reach the client, give
-        // the renderer two 80 ms ticks to announce it live, then flip.
+        // `commands`: land the flag inside the inter-chunk gap so the
+        // client's between-event cancel check sees it while turn-1 is
+        // still streaming and the engine honours it at turn-1's boundary.
+        // The scripted provider paces chunk-2 ~120 ms after chunk-1, so
+        // 60 ms is safely inside that window; a later flip (e.g. past the
+        // tool boundary) would be forwarded while the loop idles in
+        // turn-2's scripted silence and never surface a Cancelled badge.
         let tap = commands.test_events.clone();
         let driver = std::thread::Builder::new()
             .name("cancel-driver".into())
             .spawn(move || {
                 wait_for_tap_event(&tap, "ModelChunk");
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::thread::sleep(std::time::Duration::from_millis(60));
                 cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             })
             .expect("cancel driver thread");
@@ -7556,7 +7561,10 @@ mod daemon_smoke_tests {
     use takka_core::runtime::protocol::InitOverrides;
 
     /// Bound for every poll so a regression can never hang the suite.
-    const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+    /// macOS CI runners have been observed needing >10s just to bring a
+    /// daemon up when the runner is loaded — the bound is fixture plumbing,
+    /// not the thing under test, so it only needs to be generous.
+    const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Hermetic provider config (same shape as `hermetic_runtime_config`):
     /// `127.0.0.1:9` fails fast and never leaves the machine.
