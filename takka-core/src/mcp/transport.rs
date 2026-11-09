@@ -170,6 +170,12 @@ impl McpTransport for HttpTransport {
 
 /// Async MCP transport — send JSON-RPC requests and receive responses
 /// without blocking the tokio runtime.
+///
+/// `#[allow]`: recent `clippy::double_must_use` builds flag the
+/// `async_trait`-generated wrappers (they expand to `#[must_use]` fns
+/// returning an already-`#[must_use]` `Result`); the trait itself adds no
+/// attribute, the warning originates purely in the macro expansion.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AsyncMcpTransport: Send + Sync {
     async fn send_and_recv(&mut self, request: JsonRpcRequest) -> Result<JsonRpcResponse, String>;
