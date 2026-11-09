@@ -1,0 +1,57 @@
+# epic-mid-run-input — entries in build order; tickets.py ignores unknown keys.
+# next_id = 6 # written by `tickets.py move`; the folder's counter never goes below it
+
+[[entry]]
+id = 1
+type = "story"
+title = "Tracer: typed text mid-run reaches the steer contract (inline, Interrupt)"
+description = "A spawned reader task inside `Commands::run` collects typed text while a run is active in the inline REPL; the first Enter delivers it per the client contract — in Interrupt mode it goes to the engine as `Request::Steer`, `SteerQueued` shows on screen, and the boundary drain puts the text into the LLM context + memory (persist) at the next tool/run boundary; `takka run` rides the same path."
+verify = "Against the scripted multi-turn provider, typing text during turn 2 (before its tool call) surfaces the steer acknowledgement on screen and the completed turn states the steered text; `takka run` accepts the same mid-run text."
+covers = ["R1"]
+after = ["epic-streaming-preview"]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 2
+type = "story"
+title = "FollowUp mode end-to-end (inline)"
+description = "Typed mid-run text in follow-up mode (the default) routes into the client-side follow-up queue instead of the engine, a log-hook notice acknowledges the queueing (single-writer discipline), and the existing post-run drain delivers it as the next run — verified through the drain depth guard and `/queue` mode switching."
+verify = "A scripted run with mid-run typed text in follow-up mode shows the queue notice, finishes, and the queued text runs visibly as the next run (client-issued, depth-guarded); `/queue interrupt` then steers instead."
+covers = ["R1"]
+after = [1]
+hitl = false
+risk = "low"
+
+[[entry]]
+id = 3
+type = "story"
+title = "Hand-over visibility and prompt-gate edges"
+description = "The hand-over is visible in the status line/timeline per mode (SteerQueued → status; steered text applied → boundary row; follow-up → the queue notice), text typed while a mid-run confirmation/question prompt owns stdin stays with the prompt, and text arriving after the last turn of a run becomes the first message of the next run (adopted design §steer semantics)."
+verify = "A scripted run with a confirmation gate shows the prompt owns the typed text; a steer after the run's terminal event lands as the first user message of the next run; status line/timeline show the hand-over markers."
+covers = ["R1"]
+after = [1, 2]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 4
+type = "story"
+title = "TUI mid-run input (both modes)"
+description = "The TUI un-gates text input while `is_loading`: typed text routes through the same client contract (steer or local queue per `/queue`), lands in the message log, and the shared client-side drain depth guard takes effect here too."
+verify = "A scripted run in the TUI accepts typed text in both queue modes; the message log shows the queueing/steering and the hand-over lands in the context like the inline path."
+covers = ["R1"]
+after = [1]
+hitl = false
+risk = "medium"
+
+[[entry]]
+id = 5
+type = "story"
+title = "Refactor sweep"
+description = "Cleanup only, scoped at its start from the plans and the review findings entries 1-4 deferred; anything pushed out of an entry here becomes a new story."
+verify = "Diff before/after touches only cleanup; full workspace checks stay green."
+covers = ["R1"]
+after = [1, 2, 3, 4]
+hitl = false
+risk = "low"

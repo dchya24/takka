@@ -4,7 +4,7 @@ title: "Talk to the agent mid-run"
 parent: "initiative-repl-ux-hardening"
 covers: ["R1"]
 after: ["epic-streaming-preview"]
-refined: false
+refined: true
 risk: medium
 ---
 
@@ -28,11 +28,13 @@ typed text visibly steering or queueing per mode in both UIs.
 
 ## Requirements
 
-<!-- Refinement fills these from parent R1 (initiative Requirements line 1: R1). -->
+- R1 (parent R1): Mid-run input takes effect — Given an agent run is active (streaming or executing tools), When the user types a message in the inline REPL or the TUI, Then the text is delivered per `/queue` mode — steered into the running task (Interrupt) or queued as the next run (FollowUp) — And it takes effect at the next tool/run boundary, visibly to the user.
 
 ## Constraints
 
-<!-- Refinement fills from the initiative's C2 (reuse the steer/queue contract; no new wire protocol), C1 (no second terminal writer), C3 (platforms); story-level ones beyond that go per ticket. -->
+- C1 (parent C1) — All live rendering stays on the single-writer render gate + status painter; no second terminal writer; this epic only consumes the streaming contract (epic-streaming-preview settled it).
+- C2 (parent C2) — Mid-run text reuses the engine steer/follow-up contract (`Request::Steer`, steering queue, follow-up queue, `--queue-mode`); no new wire protocol.
+- C3 (parent C3) — Linux, macOS and Windows (conhost) keep working; the inline REPL and TUI changes are verified on the modes they touch.
 
 ## Done when
 
@@ -61,4 +63,10 @@ typed text visibly steering or queueing per mode in both UIs.
 
 ## Notes
 
-- Waits on epic-streaming-preview because: its closing stories fix the live-run rendering contract (painter + gate) this epic builds on.
+- Waits on epic-streaming-preview because: its closing stories fix the live-run rendering contract (painter + gate) this epic builds on. (Gate met 2026-11-06 — that epic closed with all five stories built.)
+- Decision: 2026-11-06 — mid-run key reading for the inline path runs as ONE spawned crossterm-event reader task inside `Commands::run` for the run's lifetime; the TUI keeps its own loop and un-gates its loading-gated input instead (two surfaces, one client contract).
+- Decision: 2026-11-06 — slash commands typed mid-run are OUT of this epic: the engine's steering source only takes text (`Request::Steer`), the REPL idle loop owns slash commands, and the adopted design's `pending_commands` idea is not wired here. Anything that needs it later becomes a new story.
+- Decision: 2026-11-06 — queued (FollowUp) text is acknowledged locally through the log-writer hook notice (no engine event exists), while steered (Interrupt) text rides the engine's own `SteerQueued` event.
+- Decision: 2026-11-06 — the breakdown closes with the default "Refactor sweep" story (more than three entries); no separate end-to-end suite story (the e2e smoke suite already covers the assembled flow; per-entry runnable checks cover the rest).
+- Decision: 2026-11-06 — tracer bullet: story 2.1 is the thinnest path through every layer (reader task → client contract → engine steer → visible acknowledgement → boundary drain), verified end-to-end against the scripted provider; follow-up mode and TUI land after.
+- Open question: (none — the epic inherits R1's wording and the adopted design's semantics; the one ambiguity, "visibly effected" for a steered message, is covered by the engine's Steered/boundary events and pinned by story 2.3).
