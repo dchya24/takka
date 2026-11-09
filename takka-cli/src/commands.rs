@@ -515,6 +515,49 @@ impl QueueMode {
     }
 }
 
+/// One poll of the terminal's key events, mapped to the reader's key
+/// enum (story 2.1). Raw mode keeps SIGINT off; the reader is the
+/// cancel source, so `Ctrl+C` maps via [`MidRunKey::CtrlC`]. Plain
+/// characters and Enter drive the steer line; untracked keys fall
+/// through.
+#[cfg(not(test))]
+fn poll_crossterm_key() -> Option<MidRunKey> {
+    use crossterm::event::{Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
+    match crossterm::event::poll(std::time::Duration::from_millis(100)) {
+        Ok(true) => match crossterm::event::read() {
+            Ok(CtEvent::Key(key)) => {
+                let press = key.kind == KeyEventKind::Press;
+                if press
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('c')
+                {
+                    Some(MidRunKey::CtrlC)
+                } else if press && key.modifiers.is_empty() {
+                    match key.code {
+                        KeyCode::Char(ch) => Some(MidRunKey::Char(ch)),
+                        KeyCode::Enter => Some(MidRunKey::Enter),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// One mid-run reader key event (story 2.1): characters + Enter drive
+/// the steer path; Ctrl+C rides the story-1.4 two-stage cancel. The
+/// cfg(test) injection feeds these instead of the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MidRunKey {
+    Char(char),
+    Enter,
+    CtrlC,
+}
+
 /// Safety valve for the client-issued drain loop: each drained follow-up
 /// goes through the full `run()` path, which drains again on completion. In
 /// practice the queue is empty by the time nested drains run; the cap only
@@ -602,6 +645,14 @@ pub struct Commands {
     /// (story 1.3 e2e interleave assertion).
     #[cfg(test)]
     test_render_order: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Test tap (cfg(test)): the mid-run key injection source for story
+    /// 2.1 smokes — the reader takes this once instead of the keyboard.
+    #[cfg(test)]
+    test_mid_run_keys:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<MidRunKey>>>>,
+    /// Test tap (cfg(test)): the mid-run input echo frames (story 2.1).
+    #[cfg(test)]
+    test_input_echoes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// Test tap (cfg(test)): which terminal badge each run's Err branch
     /// rendered (story 1.4: "Cancelled by user" must surface as the
     /// cancel notice; everything else keeps the red error badge).
@@ -666,6 +717,10 @@ impl Commands {
             #[cfg(test)]
             test_notice: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
+            test_mid_run_keys: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_input_echoes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
             test_terminal_cleanup_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                 0,
             )),
@@ -698,6 +753,14 @@ impl Commands {
     /// global, so flipping it mid-run cannot cancel a concurrently
     /// running test's run (tests share one process; the process flag is
     /// process-global).
+    /// Inject the story-2.1 mid-run key source (cfg(test) only): the
+    /// reader thread's keyboard-feed replacement for deterministic smokes.
+    #[cfg(test)]
+    pub(crate) fn with_mid_run_keys(self, source: std::sync::mpsc::Receiver<MidRunKey>) -> Self {
+        *self.test_mid_run_keys.lock().unwrap() = Some(source);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_cancel_flag(
         mut self,
@@ -1882,6 +1945,10 @@ impl Commands {
             Chunk(String),
             /// A lifecycle event (tool row / thinking block / badges).
             Event(takka_core::Event),
+            /// The current mid-run input buffer (story 2.1): the
+            /// renderer draws it as one transient line above the status
+            /// row (empty string = the input row collapses).
+            InputEcho(String),
         }
 
         let (update_tx, update_rx) = std::sync::mpsc::channel::<RendererUpdate>();
@@ -1927,6 +1994,9 @@ impl Commands {
             /// smokes assert the story-1.3 interleave against this list.
             #[cfg(test)]
             render_order: Vec<String>,
+            /// cfg(test) only: the mid-run input echo frames (story 2.1).
+            #[cfg(test)]
+            input_echoes: Vec<String>,
         }
 
         let r_progress = progress.clone();
@@ -1951,10 +2021,6 @@ impl Commands {
                     let r_progress = r_progress.clone();
                     move || painter.lock().unwrap().redraw(&r_progress)
                 };
-                let consume_spinner = {
-                    let painter = painter.clone();
-                    move || painter.lock().unwrap().erase()
-                };
 
                 // Live-preview state (story 1.1 machinery, unchanged): the
                 // plain text of the lines already printed, the completed
@@ -1971,10 +2037,18 @@ impl Commands {
                 // prints itself, and re-arms the spinner, so the renderer's
                 // "spinner is the last line" invariant survives log output
                 // from other threads (config load, transport warnings, ...).
+                // Story-2.1 review fix: the hook consumes the whole
+                // transient band (status + the mid-run input row) — the
+                // input row is re-rendered by the reader's next echo frame.
+                // The transient input row's liveness: shared with every
+                // path whose erase must consume the whole band (hook,
+                // announces, event rows) — story-2.1 review fix.
+                let input_rows: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
                 let _log_hook_guard;
                 {
                     let hook_painter = painter.clone();
                     let hook_progress = r_progress.clone();
+                    let hook_input_rows = input_rows.clone();
                     let hook: crate::widgets::log_writer::SpinnerHook =
                         std::sync::Arc::new(move |bytes: &[u8]| {
                             // try_lock: the gate may already be held by us (a
@@ -1987,9 +2061,20 @@ impl Commands {
                                 return;
                             }
 
-                            let mut painter = hook_painter.lock().unwrap();
-                            painter.erase();
+                            let depth = 1 + hook_input_rows.load(Ordering::Relaxed);
+                            let mut s = std::io::stdout();
+                            {
+                                use crossterm::cursor::{MoveToColumn, MoveUp};
+                                use crossterm::terminal::{Clear, ClearType};
+                                use crossterm::ExecutableCommand;
+                                for _ in 0..depth {
+                                    let _ = s.execute(MoveUp(1));
+                                }
+                                let _ = s.execute(MoveToColumn(0));
+                                let _ = s.execute(Clear(ClearType::FromCursorDown));
+                            }
                             crate::widgets::log_writer::write_line_to_stderr(bytes);
+                            let mut painter = hook_painter.lock().unwrap();
                             painter.commit(&hook_progress);
                         });
                     _log_hook_guard = crate::widgets::log_writer::SpinnerHookGuard::install(hook);
@@ -2001,6 +2086,63 @@ impl Commands {
                 let mut updates_done = false;
                 // Tool call arguments keyed by call id, for the timeline rows.
                 let mut timeline = ToolTimeline::default();
+
+                // Mid-run input line state (story 2.1): the transient
+                // buffer row drawn between the scrollback and the status
+                // row. `active` = the row is currently on screen (or in
+                // the redraw band). Frame tap echoes ride the test taps.
+                // The row's liveness goes through `input_rows` (declared
+                // above the log-hook install), whose depth EVERY transient
+                // row erase consumes — story-2.1 review fix.
+                // Erase every transient row (status + input band) — the
+                // shared erase for announce rows, event rows and echo
+                // frames alike.
+                let erase_transient = {
+                    let input_rows = input_rows.clone();
+                    move || {
+                        use crossterm::cursor::{MoveToColumn, MoveUp};
+                        use crossterm::terminal::{Clear, ClearType};
+                        use crossterm::ExecutableCommand;
+                        let mut s = std::io::stdout();
+                        for _ in 0..(1 + input_rows.load(Ordering::Relaxed)) {
+                            let _ = s.execute(MoveUp(1));
+                        }
+                        let _ = s.execute(MoveToColumn(0));
+                        let _ = s.execute(Clear(ClearType::FromCursorDown));
+                    }
+                };
+                // The shared buffer slot so any announce/echo render can
+                // re-draw the CURRENT mid-run input row.
+                let input_buffer_shared: std::sync::Arc<std::sync::Mutex<String>> =
+                    Default::default();
+                let redraw_input_line_action = {
+                    let input_rows = input_rows.clone();
+                    let input_buffer_shared = input_buffer_shared.clone();
+                    move || {
+                        let buffer = input_buffer_shared.lock().unwrap().clone();
+                        if buffer.is_empty() {
+                            input_rows.store(0, Ordering::Relaxed);
+                            return;
+                        }
+                        let echo = RLine::from(vec![
+                            RSpan::styled(
+                                "  ↳ ".to_string(),
+                                RStyle::default().fg(RColor::Rgb(110, 110, 140)),
+                            ),
+                            RSpan::styled(
+                                format!("{}▏", buffer),
+                                RStyle::default().fg(RColor::Rgb(200, 200, 215)),
+                            ),
+                        ]);
+                        inline::print_line(&echo);
+                        input_rows.store(1, Ordering::Relaxed);
+                    }
+                };
+                let mut input_active = false;
+                #[allow(unused_assignments)]
+                let mut input_buffer = String::new();
+                #[cfg(test)]
+                let mut input_echoes: Vec<String> = Vec::new();
 
                 loop {
                     if updates_done {
@@ -2036,6 +2178,24 @@ impl Commands {
                     if !updates_done {
                         loop {
                             match update_rx.lock().unwrap().try_recv() {
+                                Ok(RendererUpdate::InputEcho(text)) => {
+                                    // Story 2.1: the transient input line.
+                                    input_buffer = text;
+                                    *input_buffer_shared.lock().unwrap() = input_buffer.clone();
+                                    if input_active || !input_buffer.is_empty() {
+                                        // Erase the transient band (status
+                                        // + prior input row) via the shared
+                                        // erase, redraw the input row (when
+                                        // a buffer exists), and commit the
+                                        // status below it.
+                                        erase_transient();
+                                        redraw_input_line_action();
+                                        input_active = !input_buffer.is_empty();
+                                        commit_spinner();
+                                        #[cfg(test)]
+                                        input_echoes.push(input_buffer.clone());
+                                    }
+                                }
                                 Ok(RendererUpdate::Chunk(chunk)) => {
                                     if !chunk.is_empty() {
                                         block_text.lock().unwrap().push_str(&chunk);
@@ -2050,7 +2210,8 @@ impl Commands {
                                         let block_guard = block_text.lock().unwrap();
                                         preview.announce(
                                             block_guard.as_str(),
-                                            &consume_spinner,
+                                            &erase_transient,
+                                            &redraw_input_line_action,
                                             &commit_spinner,
                                         );
                                         pending_text = false;
@@ -2078,17 +2239,24 @@ impl Commands {
                                             continue;
                                         }
                                     }
-                                    // Erase the status line first: the row
-                                    // (or a thinking block) must land where
-                                    // the spinner was, and `commit_spinner`
-                                    // re-arms it afterwards.
-                                    consume_spinner();
-                                    // Tool rows follow `show_tool_calls`; the
-                                    // reasoning block follows `show_thoughts`
-                                    // (which gates what the client receives)
-                                    // and is therefore independent of it.
+                                    // Erase the transient band first (story
+                                    // 2.1 review fix: the status + the
+                                    // mid-run input row — every row-print
+                                    // erase must consume the whole band, or
+                                    // the input row strands and the next
+                                    // echo destroys real scrollback).
+                                    erase_transient();
+                                    // Tool rows follow `show_tool_calls`; steered
+                                    // hand-over acks render regardless (they
+                                    // are the story's visible contract); the
+                                    // reasoning block follows `show_thoughts`.
                                     if render_panels
-                                        || matches!(event, takka_core::Event::Thinking { .. })
+                                        || matches!(
+                                            event,
+                                            takka_core::Event::Thinking { .. }
+                                                | takka_core::Event::SteerQueued { .. }
+                                                | takka_core::Event::Steered { .. }
+                                        )
                                     {
                                         render_event(&event, &mut timeline, timeline_detailed);
                                         // cfg(test): record what actually
@@ -2114,9 +2282,20 @@ impl Commands {
                                             {
                                                 preview.order.push("tool".to_string())
                                             }
+                                            takka_core::Event::SteerQueued { content } => preview
+                                                .order
+                                                .push(format!("steer-queued:{content}")),
+                                            takka_core::Event::Steered { content } => {
+                                                preview.order.push(format!("steered:{content}"))
+                                            }
                                             _ => {}
                                         }
                                     }
+                                    // Story 2.1 review fix: the input row
+                                    // re-draws BELOW every announced row and
+                                    // ABOVE the re-committed status line,
+                                    // keeping the status last.
+                                    redraw_input_line_action();
                                     commit_spinner();
                                 }
                                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -2132,7 +2311,12 @@ impl Commands {
                     // ticks without events).
                     if pending_text {
                         let block_guard = block_text.lock().unwrap();
-                        preview.announce(block_guard.as_str(), &consume_spinner, &commit_spinner);
+                        preview.announce(
+                            block_guard.as_str(),
+                            &erase_transient,
+                            &redraw_input_line_action,
+                            &commit_spinner,
+                        );
                     }
                 }
 
@@ -2147,6 +2331,8 @@ impl Commands {
                     preview_diverged: preview.diverged,
                     #[cfg(test)]
                     render_order: preview.order,
+                    #[cfg(test)]
+                    input_echoes,
                 }
             })
             .expect("failed to spawn renderer thread");
@@ -2161,6 +2347,134 @@ impl Commands {
         // press into the force-exit — reset it before the watcher's first
         // read.
         cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // ── Mid-run input (story 2.1, Interrupt mode) ────────────────
+        //
+        // While the run owns the terminal, ONE spawned reader thread
+        // collects typed characters, echoes them through the renderer's
+        // ordered queue (`RendererUpdate::InputEcho` — the single-writer
+        // discipline holds), and on Enter submits the line through
+        // `steer_tx` — `run_turn`'s watch loop forwards it to the engine
+        // as `Request::Steer`. Ctrl+C rides the story-1.4 two-stage
+        // cancel path from the same thread (raw mode hides SIGINT from
+        // the tokio signal task, so the key reader is the cancel source
+        // in the inline REPL). The reader ends when the run's stop flag
+        // flips. FollowUp mode (the default) is story 2.2: no reader
+        // spawns yet, so those runs stay byte-for-byte today's shape.
+        let steer_rx;
+        if matches!(self.queue_mode, QueueMode::Interrupt) {
+            let (steer_tx, steer_line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (echo_tx, echo_rx) = std::sync::mpsc::channel::<String>();
+            steer_rx = Some(steer_line_rx);
+            // No standing "input is live" badge: an Interrupt run with no
+            // typed text stays byte-for-byte today's output (story-2.1
+            // review fix, zero-residue rule).
+            // cfg(test) injection: the cancel smokes feed deterministic
+            // keys instead of the keyboard (story 1.4's cancel-driver
+            // pattern). `test_mid_run_keys` is a one-shot take.
+            #[cfg(test)]
+            let test_keys = self.test_mid_run_keys.clone();
+            let r_stop_reader = stop_flag.clone();
+            let cancel_reader = cancel_flag.clone();
+            std::thread::Builder::new()
+                .name("takka-mid-run-input".into())
+                .spawn(move || {
+                    let mut buffer = String::new();
+                    #[cfg(test)]
+                    let injected = test_keys.lock().unwrap().take();
+                    #[cfg(test)]
+                    if injected.is_none() {
+                        // No injection source configured: nothing keeps
+                        // this reader alive in test builds.
+                        let _ = echo_tx.send(String::new());
+                        return;
+                    }
+                    loop {
+                        if r_stop_reader.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // Story-2.1 review fix: while a confirmation/question
+                        // prompt owns stdin (cooked mode, dialoguer), the
+                        // reader must not race it for keystrokes — park.
+                        if crate::commands::INTERACTIVE_PROMPT_ACTIVE.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
+                        if r_stop_reader.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        #[cfg(test)]
+                        let key: Option<MidRunKey> = 'blk: {
+                            let Some(rx) = &injected else {
+                                break 'blk None;
+                            };
+                            use std::sync::mpsc::TryRecvError;
+                            match rx.try_recv() {
+                                Ok(key) => break 'blk Some(key),
+                                Err(TryRecvError::Empty) => {
+                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                    break 'blk None;
+                                }
+                                Err(TryRecvError::Disconnected) => break 'blk None,
+                            }
+                        };
+                        #[cfg(not(test))]
+                        let key: Option<MidRunKey> = poll_crossterm_key();
+                        match key {
+                            None => continue,
+                            Some(MidRunKey::CtrlC) => {
+                                // Two-stage cancel, reader parity with the
+                                // signal task (main.rs): the first press
+                                // requests the cooperative cancel, the
+                                // second force-exits at 130.
+                                if cancel_reader.swap(true, Ordering::SeqCst) {
+                                    crate::widgets::log_writer::write_notice_to_stderr(
+                                        "\n\u{26a0} Force-exiting on second Ctrl+C.".as_bytes(),
+                                    );
+                                    std::process::exit(130);
+                                }
+                                crate::widgets::log_writer::write_notice_to_stderr(
+                                    "\n\u{26a0} Cancel requested (press Ctrl+C again to force-exit).".as_bytes(),
+                                );
+                                buffer.clear();
+                                let _ = echo_tx.send(String::new());
+                            }
+                            Some(MidRunKey::Char(ch)) => {
+                                buffer.push(ch);
+                                let _ = echo_tx.send(buffer.clone());
+                            }
+                            Some(MidRunKey::Enter) => {
+                                let line = std::mem::take(&mut buffer);
+                                let _ = echo_tx.send(String::new());
+                                if !line.is_empty() {
+                                    let _ = steer_tx.send(line);
+                                }
+                            }
+                        }
+                    }
+                    let _ = echo_tx.send(String::new());
+                })
+                .expect("failed to spawn mid-run input reader");
+            // Spool the reader's echo frames into the renderer's single
+            // ordered queue (the renderer owns the terminal; the spooler
+            // is a plain forwarder, not a writer).
+            let update_tx_mid = update_tx.clone();
+            let _echo_spooler = std::thread::Builder::new()
+                .name("takka-mid-run-echo".into())
+                .spawn(move || {
+                    while let Ok(frame) = echo_rx.recv() {
+                        if update_tx_mid
+                            .send(RendererUpdate::InputEcho(frame))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .expect("failed to spawn mid-run echo spooler");
+        } else {
+            steer_rx = None;
+        }
         let runtime = self
             .connection
             .as_mut()
@@ -2299,6 +2613,7 @@ impl Commands {
                     _ => None,
                 },
                 cancel_flag,
+                steer_rx,
             )
             .await;
 
@@ -2313,6 +2628,7 @@ impl Commands {
             *self.test_preview.lock().unwrap() = render_final.preview_committed.clone();
             *self.test_preview_diverged.lock().unwrap() = render_final.preview_diverged;
             *self.test_render_order.lock().unwrap() = render_final.render_order.clone();
+            *self.test_input_echoes.lock().unwrap() = render_final.input_echoes.clone();
         }
         // The question handler only does its spinner consume/re-arm dance
         // while this flag is set, so it never touches the screen in modes
@@ -2547,6 +2863,7 @@ impl Commands {
                     _ => None,
                 },
                 cancel_flag,
+                None,
             )
             .await;
 
@@ -4147,8 +4464,17 @@ impl PreviewTracker {
     /// Announce newly completed streamed text as styled markdown above the
     /// status line, riding the console-log hook's erase → print → repaint
     /// cycle (the same atom for every printed item, so the status line is
-    /// always the last line).
-    fn announce(&mut self, block_text: &str, consume: &dyn Fn(), commit: &dyn Fn()) {
+    /// always the last line). `consume` erases ALL transient rows under it
+    /// (status + the story-2.1 input row when it is live), so the announced
+    /// lines never leave the input row stranded; the fly-by preview's next
+    /// frame re-renders the input row below itself.
+    fn announce(
+        &mut self,
+        block_text: &str,
+        consume: &dyn Fn(),
+        input_restored: &dyn Fn(),
+        commit: &dyn Fn(),
+    ) {
         if self.diverged {
             return;
         }
@@ -4160,8 +4486,23 @@ impl PreviewTracker {
             PreviewFlush::Print(new_lines) => {
                 self.flushed = completed.to_string();
                 if !new_lines.is_empty() {
+                    // The shared transient-band erase: status + the
+                    // story-2.1 input row (when it is live) — so the
+                    // announced rows land at the band top and the input
+                    // row is re-drawn below them before the status row
+                    // re-commits.
                     consume();
+                    // The announce's own input redraw needs the CURRENT
+                    // mid-run buffer; the caller supplies a callback that
+                    // reads the live state (this.story-2.1 review: an
+                    // inert announce would strand/destroy that row).
+                    // PreviewTracker doesn't hold the mid-run text, so
+                    // the closure receives nothing and the caller's
+                    // `redraw_input_line` reads it from shared state.
+                    let no_context = "";
+                    let _ = no_context;
                     inline::print_lines(&new_lines);
+                    input_restored();
                     commit();
                     #[cfg(test)]
                     self.order.extend(
@@ -4362,6 +4703,30 @@ fn render_event(event: &takka_core::Event, timeline: &mut ToolTimeline, detailed
                 inline::print_lines(&thinking_block_lines(content, THINKING_PREVIEW_LINES));
                 inline::print_line(&components::thinking_header(false));
             }
+        takka_core::Event::SteerQueued { content } => {
+            // Story 2.1: the steering hand-over is visible — ack above
+            // the (paused) input row, part of the run's scrollback.
+            let dim = RStyle::default().fg(RColor::Rgb(110, 110, 140));
+            inline::print_line(&RLine::from(vec![
+                RSpan::styled("  ↳ steered in: ".to_string(), dim),
+                RSpan::styled(
+                    format!("\"{content}\""),
+                    RStyle::default()
+                        .fg(RColor::Rgb(120, 180, 140)),
+                ),
+            ]));
+        }
+        takka_core::Event::Steered { content } => {
+            // The boundary drain applied the steer: hand-over marker.
+            let dim = RStyle::default().fg(RColor::Rgb(110, 110, 140));
+            inline::print_line(&RLine::from(vec![
+                RSpan::styled("  ↳ applied at the tool boundary: ".to_string(), dim),
+                RSpan::styled(
+                    format!("\"{content}\""),
+                    RStyle::default().fg(RColor::Rgb(120, 180, 140)),
+                ),
+            ]));
+        }
         takka_core::Event::Error { message } => {
             inline::print_line(&components::error_badge(message));
         }
@@ -5506,17 +5871,30 @@ mod e2e_tests {
     /// call whose result feeds POST 2 — a full agent loop against the
     /// OpenAI-compatible wire format, no real provider involved.
     fn spawn_scripted_sse_server_turns(turns: Vec<ScriptedTurn>) -> u16 {
+        spawn_scripted_sse_server_turns_with_capture(turns, Default::default()).0
+    }
+
+    /// Same scripted multi-turn server but also capturing the JSON
+    /// bodies of each request (story 2.1's context assertions: the
+    /// steered text must show up in the provider's next turn input).
+    fn spawn_scripted_sse_server_turns_with_capture(
+        turns: Vec<ScriptedTurn>,
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::Write;
 
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted SSE server");
         let port = listener.local_addr().expect("local addr").port();
         let turns = std::sync::Arc::new(std::sync::Mutex::new(turns));
+        let captured_for_thread = captured.clone();
         std::thread::Builder::new()
             .name("scripted-sse-server-turns".into())
             .spawn(move || {
                 let mut index = 0usize;
-                while let Some(mut stream) = accept_scripted_connection(&listener) {
+                while let Some(mut stream) =
+                    accept_scripted_connection_capture(&listener, &captured_for_thread)
+                {
                     let turn = {
                         let guard = turns.lock().unwrap();
                         guard.get(index).cloned()
@@ -5592,7 +5970,7 @@ mod e2e_tests {
                 }
             })
             .expect("spawn scripted SSE turns server");
-        port
+        (port, captured)
     }
 
     /// Accept one scripted server connection and drain its HTTP request
@@ -5600,6 +5978,16 @@ mod e2e_tests {
     /// and multi-turn SSE harnesses (review patch 2026-11-06: the drain
     /// logic must not live twice).
     fn accept_scripted_connection(listener: &std::net::TcpListener) -> Option<std::net::TcpStream> {
+        accept_scripted_connection_capture(listener, &Default::default())
+    }
+
+    /// Same accept+drain but recording each request's JSON body into
+    /// `captured` — story 2.1's context assertions look for the steered
+    /// text in the provider's next-turn input.
+    fn accept_scripted_connection_capture(
+        listener: &std::net::TcpListener,
+        captured: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Option<std::net::TcpStream> {
         use std::io::Read;
         let mut stream = listener.incoming().next()?.ok()?;
         stream
@@ -5628,6 +6016,10 @@ mod e2e_tests {
                             })
                             .unwrap_or(0);
                         if buf.len() >= head_end + content_length {
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&buf[head_end..]).into_owned());
                             break;
                         }
                     }
@@ -6500,6 +6892,108 @@ mod e2e_tests {
         // No re-render on the cancel path.
         assert!(commands.test_final_print.lock().unwrap().is_empty());
     }
+    /// Story 2.1 tracer e2e: the run is in Interrupt queue mode; typed
+    /// keys injected mid-run (turn 2's provider window) echo visually,
+    /// Enter submits through the steer contract (Request::Steer), the
+    /// engine's SteerQueued/Steered events render their acks, and the
+    /// next provider turn's request body carries the steered text in the
+    /// LLM context.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_typed_mid_run_steers_into_the_context() {
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            // Turn 2: long think (2 s behind its first delta) — the keys
+            // land inside this window; the tool call forces the
+            // iteration-3 boundary that drains the steer.
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(2000),
+                    "Second para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "Third para\n\n".to_string(),
+            )]),
+        ];
+        let (port, captured) =
+            spawn_scripted_sse_server_turns_with_capture(turns, Default::default());
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let (key_tx, key_rx) = std::sync::mpsc::channel::<MidRunKey>();
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_queue_mode(QueueMode::Interrupt)
+            .with_mid_run_keys(key_rx);
+
+        // Inject keys inside turn 2's provider window (the 2nd ModelRequest
+        // emitted = the boundary check ran, provider streaming).
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("steer-driver".into())
+            .spawn(move || {
+                wait_for_tap_event_count(&tap, "ModelRequest", 2);
+                for ch in "check the wix".chars() {
+                    key_tx.send(MidRunKey::Char(ch)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                key_tx.send(MidRunKey::Enter).unwrap();
+            })
+            .expect("steer driver thread");
+
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("steer driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+
+        // Engine events: SteerQueued on submit, Steered at the boundary.
+        let order = commands.test_render_order.lock().unwrap().clone();
+        assert!(
+            order
+                .iter()
+                .any(|m| m.starts_with("steer-queued:check the wix")),
+            "the submit must steer with an on-screen acknowledgement: {order:?}"
+        );
+        assert!(
+            order.iter().any(|m| m == "steered:check the wix"),
+            "the boundary drain must apply the steer: {order:?}"
+        );
+
+        // The typed echo was visible while typing.
+        let echoes = commands.test_input_echoes.lock().unwrap().clone();
+        assert!(
+            echoes.iter().any(|e| e.contains("check the wix")),
+            "the typed text must echo above the status line: {echoes:?}"
+        );
+
+        // The steered text reaches the next provider turn as user context.
+        let bodies = captured.lock().unwrap().clone();
+        assert!(
+            bodies
+                .iter()
+                .filter(|b| b.contains("check the wix"))
+                .count()
+                >= 1,
+            "a later provider request must carry the steered text: {bodies:?}"
+        );
+        assert!(
+            commands.test_final_print.lock().unwrap().is_empty(),
+            "answer fully previewed; final print must be suffix-free"
+        );
+    }
 }
 
 /// Core helpers for `takka config migrate`: plan, guard, and execute
@@ -6788,6 +7282,7 @@ mod daemon_smoke_tests {
                 // false for the whole test process (cancel smokes use
                 // their own injected flags).
                 crate::cancel_flag(),
+                None,
             ),
         )
         .await

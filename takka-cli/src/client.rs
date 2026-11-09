@@ -161,6 +161,7 @@ pub(crate) async fn send_and_wait_io(
 /// engine's cancel handle unwinds the run at its next turn boundary
 /// (`AgenticError::Cancelled` → the run's normal Err path — the cleanup
 /// the caller already owns).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_turn<C, E, R>(
     io: &mut impl ConnectionIo,
     task: String,
@@ -169,6 +170,7 @@ pub(crate) async fn run_turn<C, E, R>(
     mut on_event: E,
     mut responder: R,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut steer_lines: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 ) -> Result<String>
 where
     C: FnMut(&str),
@@ -188,8 +190,28 @@ where
             io.raw_send(Request::Cancel).await?;
             cancel_sent = true;
         }
+        // Mid-run typed text (story 2.1, Interrupt mode): drain everything
+        // the inline reader collected; each finished line goes to the
+        // engine's steer queue as `Request::Steer`. The receiver is kept
+        // for the run's lifetime — `.take()` once per pass would drop it
+        // and starve later lines.
+        if let Some(steer_lines) = &mut steer_lines {
+            while let Ok(line) = steer_lines.try_recv() {
+                io.raw_send(Request::Steer { content: line }).await?;
+            }
+        }
         let event = io.raw_next_event().await?;
         if event.request_id.as_deref() != Some(&request_id) {
+            // Steer hand-over events (story 2.1): the engine tags them
+            // with the STEER request's id, not the run's, so the id filter
+            // would swallow them — forward these unconditionally; the UI
+            // surfaces them wherever the run's other events land.
+            if matches!(
+                event.event,
+                takka_core::Event::SteerQueued { .. } | takka_core::Event::Steered { .. }
+            ) {
+                on_event(event.event);
+            }
             continue;
         }
         if let Some(response) = responder(&event) {
@@ -275,6 +297,7 @@ impl RuntimeClient {
         send_and_wait_io(self, request).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run<C, E, R>(
         &mut self,
         task: String,
@@ -283,6 +306,7 @@ impl RuntimeClient {
         on_event: E,
         responder: R,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        steer_lines: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Result<String>
     where
         C: FnMut(&str),
@@ -297,6 +321,7 @@ impl RuntimeClient {
             on_event,
             responder,
             cancel,
+            steer_lines,
         )
         .await
     }
@@ -712,6 +737,7 @@ impl AgentConnection {
         self.send(Request::Steer { content }).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run<C, E, R>(
         &mut self,
         task: String,
@@ -720,6 +746,7 @@ impl AgentConnection {
         on_event: E,
         responder: R,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        steer_lines: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Result<String>
     where
         C: FnMut(&str),
@@ -734,6 +761,7 @@ impl AgentConnection {
             on_event,
             responder,
             cancel,
+            steer_lines,
         )
         .await
     }
