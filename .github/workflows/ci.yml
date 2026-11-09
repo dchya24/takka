@@ -98,6 +98,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # gitleaks-action@v2 runs a partial scan (base..head) that needs
+          # history; the default shallow clone makes its git range fail
+          # (unknown revision -> "stderr is not empty" job error).
+          fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
