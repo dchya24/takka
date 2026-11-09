@@ -624,3 +624,59 @@ fn draw_session_view(frame: &mut Frame, app: &App, area: Rect) {
     )]));
     frame.render_widget(footer, footer_area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::Commands;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::sync::Arc;
+    use takka_core::Config;
+    use tokio::sync::Mutex;
+
+    /// Story 3.1 matrix row — mid-run echo: while a run is loading the
+    /// input pane shows `mid_run_input` (the buffer completions fill);
+    /// the idle pane keeps showing the idle buffer.
+    #[test]
+    fn draw_input_echoes_mid_run_buffer_while_loading() {
+        let commands = Arc::new(Mutex::new(Commands::new(Config::fallback())));
+        let mut app = App::new(commands);
+        app.input = "idle text".into();
+        app.mid_run_input = "/new ".into();
+
+        let area = Rect::new(0, 0, 40, 6);
+        let collect = |term: &Terminal<TestBackend>| {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        // Loading: the mid-run buffer is the pane's content, not the idle
+        // buffer.
+        app.is_loading = true;
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| draw_input(f, &app, area)).unwrap();
+        let shown = collect(&term);
+        assert!(
+            shown.contains("/new "),
+            "loading pane must echo mid_run_input: {shown:?}"
+        );
+        assert!(
+            !shown.contains("idle text"),
+            "loading pane must not show the idle buffer: {shown:?}"
+        );
+
+        // Idle: unchanged behavior — the idle buffer stays.
+        app.is_loading = false;
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| draw_input(f, &app, area)).unwrap();
+        let shown = collect(&term);
+        assert!(
+            shown.contains("idle text"),
+            "idle pane must show the idle buffer: {shown:?}"
+        );
+    }
+}
