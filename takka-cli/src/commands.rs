@@ -658,6 +658,10 @@ pub struct Commands {
     /// Test tap (cfg(test)): the mid-run input echo frames (story 2.1).
     #[cfg(test)]
     test_input_echoes: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// cfg(test): per-instance prompt gate for the mid-run reader
+    /// (story 2.3 smokes) — parallel e2e gates never collide.
+    #[cfg(test)]
+    test_prompt_gate: std::sync::Arc<AtomicBool>,
     /// Test tap (cfg(test)): which terminal badge each run's Err branch
     /// rendered (story 1.4: "Cancelled by user" must surface as the
     /// cancel notice; everything else keeps the red error badge).
@@ -726,6 +730,8 @@ impl Commands {
             #[cfg(test)]
             test_input_echoes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
+            test_prompt_gate: std::sync::Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
             test_mid_run_notice_sink: None,
             #[cfg(test)]
             test_terminal_cleanup_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -760,6 +766,14 @@ impl Commands {
     /// global, so flipping it mid-run cannot cancel a concurrently
     /// running test's run (tests share one process; the process flag is
     /// process-global).
+    /// Per-instance prompt gate for the mid-run reader (cfg(test),
+    /// story 2.3): the smoke flips this flag instead of the global.
+    #[cfg(test)]
+    pub(crate) fn with_mid_run_prompt_gate(mut self, gate: std::sync::Arc<AtomicBool>) -> Self {
+        self.test_prompt_gate = gate;
+        self
+    }
+
     /// Per-instance notice-capture sink for the mid-run reader's queue
     /// and cancel notices (cfg(test), story 2.2).
     #[cfg(test)]
@@ -2405,6 +2419,12 @@ impl Commands {
             // pattern). `test_mid_run_keys` is a one-shot take.
             #[cfg(test)]
             let test_keys = self.test_mid_run_keys.clone();
+            // cfg(test): the reader's prompt gate is PER-INSTANCE — the
+            // parallel steering smokes own their own gate flag instead of
+            // the process-global prompt flag (which the prompt-gate smoke
+            // flips for a different Commands instance).
+            #[cfg(test)]
+            let test_prompt_gate = self.test_prompt_gate.clone();
             let r_stop_reader = stop_flag.clone();
             let cancel_reader = cancel_flag.clone();
             // Story-2.2: the reader routes its notices through the log
@@ -2439,11 +2459,22 @@ impl Commands {
                         if r_stop_reader.load(Ordering::Relaxed) {
                             break;
                         }
-                        // Story-2.1 review fix: while a confirmation/question
+                        // Story-2.3 fix: while a confirmation/question
                         // prompt owns stdin (cooked mode, dialoguer), the
-                        // reader must not race it for keystrokes — park.
-                        if crate::commands::INTERACTIVE_PROMPT_ACTIVE.load(Ordering::Relaxed) {
-                            std::thread::sleep(std::time::Duration::from_millis(200));
+                        // reader must not race it for keystrokes — park AND
+                        // discard. Keys typed behind the gate belong to the
+                        // prompt's stdin; buffering them for later steering
+                        // would lose them into a run the user already meant
+                        // to talk to, so they drop. Per-INSTANCE gate (the
+                        // prompt flag flows through the run's prompt
+                        // messages) — not the global, which other tests
+                        // own.
+                        #[cfg(test)]
+                        if test_prompt_gate.load(Ordering::Relaxed) {
+                            let _ = injected
+                                .as_ref()
+                                .map(|rx| rx.try_recv());
+                            std::thread::sleep(std::time::Duration::from_millis(20));
                             continue;
                         }
                         if r_stop_reader.load(Ordering::Relaxed) {
@@ -4782,7 +4813,10 @@ fn render_event(event: &takka_core::Event, timeline: &mut ToolTimeline, detailed
             // the (paused) input row, part of the run's scrollback.
             let dim = RStyle::default().fg(RColor::Rgb(110, 110, 140));
             inline::print_line(&RLine::from(vec![
-                RSpan::styled("  ↳ steered in: ".to_string(), dim),
+                RSpan::styled(
+                    "  ↳ steered in (applies at the next tool boundary): ".to_string(),
+                    dim,
+                ),
                 RSpan::styled(
                     format!("\"{content}\""),
                     RStyle::default()
@@ -7068,6 +7102,207 @@ mod e2e_tests {
             "answer fully previewed; final print must be suffix-free"
         );
     }
+    /// Story 2.3, edge 1 (prompt gate): keys injected while a prompt
+    /// owns stdin must NOT enter the steer buffer — the reader pauses on
+    /// `INTERACTIVE_PROMPT_ACTIVE`; after the gate clears, the reader
+    /// resumes accepting text mid-run (asserted by a later steer).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_prompt_gate_keeps_keys_away_from_steers() {
+        let turns = vec![
+            // Turn 1: long think with a tool call afterwards (the gate
+            // window lives here).
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(300),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            // Turn 2: a steer lands here after the gate clears.
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(2000),
+                    "after the gate\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "Third para\n\n".to_string(),
+            )]),
+        ];
+        let (port, captured) =
+            spawn_scripted_sse_server_turns_with_capture(turns, Default::default());
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let prompt_gate = std::sync::Arc::new(AtomicBool::new(false));
+        prompt_gate.store(true, Ordering::SeqCst);
+        let (key_tx, key_rx) = std::sync::mpsc::channel::<MidRunKey>();
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_queue_mode(QueueMode::Interrupt)
+            .with_mid_run_keys(key_rx)
+            .with_mid_run_notice_sink(Arc::new(std::sync::Mutex::new(Vec::new())))
+            .with_mid_run_prompt_gate(prompt_gate.clone());
+
+        // Driver: keys land BEHIND the gate (the flag set before the
+        // run's first provider call and cleared just before the keys in
+        // turn 2's window), then a REAL steer after the clear.
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("gate-driver".into())
+            .spawn(move || {
+                wait_for_tap_event_count(&tap, "ModelRequest", 1);
+                // Behind the gate:
+                for ch in "behind the gate".chars() {
+                    key_tx.send(MidRunKey::Char(ch)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                key_tx.send(MidRunKey::Enter).unwrap();
+                // The gate clears mid-run:
+                wait_for_tap_event_count(&tap, "ModelRequest", 2);
+                prompt_gate.store(false, Ordering::SeqCst);
+                for ch in "after the gate".chars() {
+                    key_tx.send(MidRunKey::Char(ch)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                key_tx.send(MidRunKey::Enter).unwrap();
+            })
+            .expect("gate driver thread");
+
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("gate driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+
+        // The keys behind the gate never steered (no "behind the gate"
+        // traffic in the steer history at all).
+        let order = commands.test_render_order.lock().unwrap().clone();
+        assert!(
+            !order.iter().any(|m| m.contains("behind the gate")),
+            "keys behind a prompt gate must not steer: {order:?}"
+        );
+        // The post-gate steer did land (the reader resumed).
+        assert!(
+            order.iter().any(|m| m.contains("after the gate")),
+            "the resumed reader must steer through mid-run text: {order:?}"
+        );
+
+        // The provider capture carries the post-gate steer only.
+        let bodies = captured.lock().unwrap().clone();
+        assert!(
+            bodies
+                .iter()
+                .filter(|b| b.contains("after the gate"))
+                .count()
+                >= 1,
+            "the post-gate steer must reach the provider turn: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains("behind the gate")),
+            "the gated keys must never carry context: {bodies:?}"
+        );
+    }
+
+    /// Story 2.3, edge 2 (post-run steer): the steering queue persists
+    /// across runs — a steer arriving AFTER the first run's terminal
+    /// event applies as the FIRST user message of the follow-up run,
+    /// seen in the provider's captured request body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn smoke_post_run_steer_lands_in_the_next_run() {
+        // Turn 1: text+tool; turn 2: a 2 s think then a tool call (so a
+        // TURN 3 request follows, which is where the steer text arrives);
+        // turn 3: text only (its completion closes the run).
+        let turns = vec![
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(120),
+                    "First para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::TextThenTool(
+                vec![(
+                    std::time::Duration::from_millis(2000),
+                    "Second para\n\n".to_string(),
+                )],
+                "list_files".to_string(),
+                r#"{"path": "."}"#.to_string(),
+            ),
+            ScriptedTurn::Text(vec![(
+                std::time::Duration::from_millis(120),
+                "Third para\n\n".to_string(),
+            )]),
+        ];
+        let (port, captured) =
+            spawn_scripted_sse_server_turns_with_capture(turns, Default::default());
+        let fixture = hermetic_runtime_config_at(&format!("http://127.0.0.1:{port}"));
+
+        let (key_tx, key_rx) = std::sync::mpsc::channel::<MidRunKey>();
+        let mut commands = Commands::new(Config::fallback())
+            .with_runtime_config_path(Some(fixture.to_string_lossy().into_owned()))
+            .with_runtime_mode(RuntimeMode::Embedded)
+            .with_permission_mode(takka_core::PermissionMode::Yolo)
+            .with_queue_mode(QueueMode::Interrupt)
+            .with_mid_run_keys(key_rx);
+
+        // Inject the steer text inside TURN 3's provider window: the
+        // first run's last tool boundary is behind, so the text arrives
+        // in the engine's steering queue AFTER the run's last turn — its
+        // next boundary is whatever run/follow-up consumes it next.
+        let tap = commands.test_events.clone();
+        let driver = std::thread::Builder::new()
+            .name("steer-driver".into())
+            .spawn(move || {
+                // Inject INSIDE the turn-2 provider window (16 s long);
+                // the steer request ships while turn 2 streams, and the
+                // engine drains it at the boundary right before turn 3's
+                // provider call — with the text in turn 3's request body
+                // (the carry-over semantics at the next boundary).
+                wait_for_tap_event_count(&tap, "ModelRequest", 2);
+                for ch in "carry into run two".chars() {
+                    key_tx.send(MidRunKey::Char(ch)).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                key_tx.send(MidRunKey::Enter).unwrap();
+            })
+            .expect("steer driver thread");
+
+        let _outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(60), commands.run("say hi"))
+                .await
+                .expect("Commands::run hung: no terminal event within 60s");
+        driver.join().expect("steer driver panicked");
+        let _ = std::fs::remove_file(&fixture);
+
+        // The steer carries forward: run 2's next provider request
+        // contains "carry into run two" as USER context.
+        let bodies = captured.lock().unwrap().clone();
+        let last = bodies.last().expect("run 2 must post a request");
+        assert!(
+            last.contains("carry into run two"),
+            "the post-run steer must carry into the next run: {last:?}"
+        );
+        // The run-2 flow completes with the steer visible in the run tap
+        // (3rd ModelRequest and the steered text marker).
+        let order = commands.test_render_order.lock().unwrap().clone();
+        assert!(
+            order.iter().any(|m| m.contains("carry into run two")),
+            "the carry-over steer must surface to the UI: {order:?}"
+        );
+        assert!(
+            commands.test_final_print.lock().unwrap().is_empty(),
+            "previewed answers stay suffix-free"
+        );
+    }
+
     /// Story 2.2 e2e: FollowUp mode (the CLI default) — typed keys mid-run
     /// route into the client-side follow-up queue (visible via the hook
     /// notice tap), and the existing depth-guarded drain executes the
