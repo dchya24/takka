@@ -78,6 +78,9 @@ pub enum AppMessage {
 pub struct App {
     /// Input buffer
     pub input: String,
+    /// Story 2.4: the TUI mid-run typed buffer (the run's steering
+    /// contract routes it; this is only the TUI's echo).
+    pub mid_run_input: String,
     /// Cursor position (byte offset) in input
     pub cursor_pos: usize,
     /// Output/conversation history
@@ -197,6 +200,7 @@ impl App {
         let session = session::create(&cwd, &provider, &model);
         Self {
             input: String::new(),
+            mid_run_input: String::new(),
             cursor_pos: 0,
             messages: vec![Message {
                 role: MessageRole::System,
@@ -1367,6 +1371,43 @@ impl App {
     // ── Submit ──────────────────────────────────────────────
 
     /// Submit current input
+    /// Mid-run input (story 2.4): while a run is loading, typed text
+    /// accumulates in a separate mid-run buffer; Enter submits it through
+    /// the run's steering contract (`Commands::steer_text` — Interrupt
+    /// steers, FollowUp queues) and the message log surfaces the hand-over.
+    pub async fn submit_mid_run(&mut self) {
+        let input = self.mid_run_input.trim().to_string();
+        if input.is_empty() {
+            return;
+        }
+        self.mid_run_input.clear();
+
+        let Some(commands_arc) = self.commands.clone() else {
+            return;
+        };
+        let mode = commands_arc.lock().await.queue_mode_getter();
+        commands_arc.lock().await.steer_text(input.clone()).await;
+
+        let note = match mode {
+            crate::commands::QueueMode::Interrupt => {
+                format!("\u{21b3} steered in (applies at the next tool boundary): \"{input}\"")
+            }
+            crate::commands::QueueMode::FollowUp => {
+                format!("\u{21b3} queued for the next run: \"{input}\"")
+            }
+        };
+        self.messages.push(Message {
+            role: MessageRole::System,
+            content: note.clone(),
+            timestamp: chrono::Local::now(),
+        });
+        let _ = self.tx.send(AppMessage::Progress(note));
+    }
+
+    pub fn insert_mid_run_char(&mut self, c: char) {
+        self.mid_run_input.push(c);
+    }
+
     pub async fn submit(&mut self) {
         let input = self.input.trim().to_string();
         if input.is_empty() {
@@ -2074,8 +2115,14 @@ async fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Enter if !app.is_loading => {
             app.submit().await;
         }
+        KeyCode::Enter if app.is_loading => {
+            app.submit_mid_run().await;
+        }
         KeyCode::Char(c) if !app.is_loading => {
             app.insert_char(c);
+        }
+        KeyCode::Char(c) if app.is_loading => {
+            app.insert_mid_run_char(c);
         }
         KeyCode::Backspace if !app.is_loading => {
             app.delete_char();
@@ -2120,5 +2167,39 @@ async fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             app.close_dropdown();
         }
         _ => {}
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::QueueMode;
+    use takka_core::Config;
+
+    /// Story 2.4 TUI smoke (FollowUp): mid-run text queues client-side;
+    /// the message log gains the `↳ queued for the next run` system line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tui_submit_mid_run_queues_in_followup_mode() {
+        let commands = Arc::new(Mutex::new(
+            Commands::new(Config::fallback()).with_queue_mode(QueueMode::FollowUp),
+        ));
+        let mut app = App::new(commands.clone());
+        app.is_loading = true;
+        app.mid_run_input = "tui queued text".into();
+
+        app.submit_mid_run().await;
+
+        // The queue got the line.
+        let queued: Vec<String> = commands.lock().await.pending_follow_ups_snapshot();
+        assert_eq!(queued, vec!["tui queued text".to_string()]);
+        // The log surfaced the hand-over.
+        assert!(
+            app.messages.iter().any(|m| m.role == MessageRole::System
+                && m.content.contains("tui queued text")
+                && m.content.contains("queued for the next run")),
+            "the TUI must surface the queue ack: {:?}",
+            app.messages
+        );
+        // The mid-run buffer cleared.
+        assert!(app.mid_run_input.is_empty());
     }
 }

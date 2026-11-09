@@ -906,6 +906,28 @@ impl Commands {
         Ok(())
     }
 
+    /// Route mid-run typed text per queue mode (story 2.4, shared by
+    /// the TUI's key path and the inline reader): Interrupt → steer via
+    /// the runtime client; FollowUp → queue client-side.
+    pub async fn steer_text(&mut self, content: String) {
+        if content.is_empty() {
+            return;
+        }
+        match self.queue_mode {
+            QueueMode::Interrupt => {
+                self.ensure_connection()
+                    .await
+                    .expect("TUI steer_text requires a connection");
+                if let Some(runtime) = self.connection.as_mut() {
+                    let _ = runtime.steer(content).await;
+                }
+            }
+            QueueMode::FollowUp => {
+                self.pending_follow_ups.lock().unwrap().push_back(content);
+            }
+        }
+    }
+
     pub fn with_color(mut self, enabled: bool) -> Self {
         self.color_enabled = enabled;
         COLOR_ENABLED.store(enabled, Ordering::Relaxed);
@@ -2994,6 +3016,17 @@ impl Commands {
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<String>> {
         self.pending_follow_ups.lock().unwrap()
+    }
+
+    /// Snapshot of the pending follow-ups (story 2.4 tests): avoids a
+    /// live guard crossing an async boundary.
+    pub fn pending_follow_ups_snapshot(&self) -> Vec<String> {
+        self.pending_follow_ups
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Programmatic entrypoint for user text typed while a run may be
