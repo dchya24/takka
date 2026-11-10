@@ -93,7 +93,7 @@ Next: sisa Fase UX dari design yang sama sudah landed — streaming preview, mid
 
 ## Open work
 
-**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed. **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) juga sudah landed — berikutnya **Fase 3b: multiplexing multi-sesi (bump protokol berikutnya)** atau **Fase 4: SDK bahasa lain**.
+**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed. **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) juga sudah landed — berikutnya **Fase 4: ACP (Agent Client Protocol)** — keputusan 2026-11-10: ACP memprioritaskan pengganti rencana lama "SDK bahasa lain" (dibatalkan); **Fase 3b: multiplexing multi-sesi (bump protokol berikutnya)** menyusul belakangan. Revisi ACP: [agentclientprotocol.com](https://agentclientprotocol.com) (Zed; v1/v2, JSON-RPC over stdio, session setup/prompt turn/tool calls/terminals/agent plan/session modes). Urutan siklus: D housekeeping docs → Fase 4 ACP → issue #2 → issue #4; packaging (C) nanti.
 
 **Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`takka --runtime daemon` gagal dengan pesan aksi di Windows).
 
@@ -101,9 +101,13 @@ Next: sisa Fase UX dari design yang sama sudah landed — streaming preview, mid
 
 **CI (open):** daemon smoke test merah deterministik di `Test (macos-latest)` sejak Fase 3a landed — pre-existing, bukan regresi PR mana pun (Linux + Windows hijau; run berasal dari PR #1 dan rerun ×2). Diagnosa + arah investigasi: [#2](https://github.com/dchya24/takka/issues/2).
 
+**Test flaky (open):** env race `ENV_LOCK` + poisoning cascade ([#4](https://github.com/dchya24/takka/issues/4)); e2e timing-window windows lain turut diekspor di run CI (smoke_follow_up, plan_request).
+
 Sized by effort. Each item has its own home in
 [`../tasks/tasks-core-agentic.md`](../tasks/tasks-core-agentic.md) or
 [`../tasks/tasks-agentic-cli.md`](../tasks/tasks-agentic-cli.md).
+
+Prioritas saat ini (keputusan 2026-11-10): packaging/distribution di bawah ini ditunda; dulu housekeeping docs + ACP (Fase 4) + CI debt (#2, #4).
 
 ### Quick wins (under a day each)
 

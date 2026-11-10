@@ -5,6 +5,18 @@
 **Priority:** High  
 **Estimated Effort:** 2-3 weeks  
 
+> **⚠️ Audit status (2026-11-10, takka v0.6.0)** — dokumen ini sudah sebagian besar
+> basi. Yang SUDAH landed sejalan dengan bentuknya: dropdown completion untuk
+> `@` file, `/skill`, dan slash command (story 3.1, buffer-agnostic; interactive
+> + TUI), spinner/status line hidup, live streaming, usage nyata, toast/widget
+> stack baru (`widgets/toast.rs`, `widgets/spinner.rs`), serta verifikasi
+> overhaul. Yang BELUM ada dan tetap sebagai idea terbuka (prioritas rendah,
+> tidak terjadwalkan): theme system (kustom + predefined), error styling dengan
+> context/suggestion, fuzzy-match highlighting, dan perf-gate dropdown proyek
+> besar. Checkbox `- [ ]` internal (test checklist dsb.) menandai rencana saat
+> itu, bukan queue kerja aktif — jangan digunakan sebagai backlog. Daftar gap
+> aktif kini ada di `docs/tui-feature-gap.md` (audit baru) + `docs/ROADMAP.md`.
+
 ---
 
 ## 📋 Overview
