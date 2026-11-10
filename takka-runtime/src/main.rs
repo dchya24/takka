@@ -1,4 +1,5 @@
 mod acp;
+mod acp_permission;
 mod daemon;
 mod stdio_transport;
 
@@ -19,7 +20,19 @@ fn main() {
         // ACP agent (Fase 4): JSON-RPC over newline-delimited stdin/stdout.
         // Framed output ONLY on this mode; logs stay on stderr because the
         // client parses stdout strictly (see acp::serve doc).
-        match acp::serve() {
+        let config = parse_acp_flags(&args).unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(2);
+        });
+        // No capacity override on the command line: the plain entry,
+        // exactly as before T-07. Both entries apply the TEST-ONLY
+        // `TAKKA_TEST_ACP_CONFIG` pin (see acp::serve_with_config doc).
+        let result = if config.max_sessions == acp::DEFAULT_MAX_SESSIONS {
+            acp::serve()
+        } else {
+            acp::serve_with_config(config)
+        };
+        match result {
             Ok(()) => std::process::exit(0),
             Err(error) => {
                 eprintln!("acp error: {error}");
@@ -34,6 +47,31 @@ fn main() {
     // Legacy path: one run over stdin/stdout JSON Lines (unchanged).
     let mut engine = RuntimeEngine::new(StdioTransport::new());
     engine.run();
+}
+
+/// `--acp [--acp-max-sessions N]` — hand-parsed like the daemon flags
+/// (the runtime binary deliberately has no clap dependency). Portable:
+/// the ACP adapter is stdio, fully cross-platform.
+fn parse_acp_flags(args: &[String]) -> Result<acp::AcpConfig, String> {
+    let mut config = acp::AcpConfig::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--acp" => {}
+            "--acp-max-sessions" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --acp-max-sessions".to_owned())?;
+                config.max_sessions = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--acp-max-sessions expects a number, got {value}"))?;
+            }
+            other => return Err(format!("unknown acp flag: {other}")),
+        }
+        index += 1;
+    }
+    Ok(config)
 }
 
 /// `--daemon [--socket-path P] [--info-path P]` — hand-parsed (the
