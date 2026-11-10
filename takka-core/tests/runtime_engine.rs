@@ -393,9 +393,13 @@ fn plan_request_runs_creation_approval_and_execution() {
         ))
         .unwrap();
 
-    // Read events until the approval gate opens, then approve.
+    // Read events until the approval gate opens, then approve. Reads are
+    // bounded: an engine wedge must fail fast with context, never hang the
+    // suite (Windows CI burned a 6-hour job timeout on an unbounded wait
+    // right here).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let approval: Option<(String, Vec<PlanStepInfo>)> = loop {
-        let event = event_rx.recv().unwrap();
+        let event = recv_until(&event_rx, deadline);
         if event.request_id.as_deref() == Some("plan-1") {
             match &event.event {
                 Event::PlanApprovalRequest { plan_id, steps, .. } => {
@@ -421,7 +425,7 @@ fn plan_request_runs_creation_approval_and_execution() {
     let mut done = false;
     let mut saw_progress = false;
     while !done {
-        let event = event_rx.recv().unwrap();
+        let event = recv_until(&event_rx, deadline);
         if event.request_id.as_deref() != Some("plan-1") {
             continue;
         }
