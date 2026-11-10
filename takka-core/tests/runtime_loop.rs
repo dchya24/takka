@@ -31,6 +31,27 @@ fn scripted_orchestrator(responses: Vec<ChatResponse>) -> Orchestrator {
     orch
 }
 
+/// Join a spawned run thread with a hard wall-clock bound: the CI
+/// runtime_loop binary once sat for the job's full 6h timeout on a
+/// hang (Windows, run 42605939847) because a test never yielded. This
+/// turns any such hang into a named failure within ~a minute. A timed
+/// out worker thread is detached (it dies with the process anyway).
+fn join_bounded(
+    handle: std::thread::JoinHandle<Result<String, takka_core::AgenticError>>,
+) -> std::thread::Result<Result<String, takka_core::AgenticError>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = handle.join();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_secs(90)) {
+        Ok(joined) => joined,
+        Err(_) => panic!(
+            "runtime_loop worker did not finish within 90s - unbounded park or deadlock under test"
+        ),
+    }
+}
+
 /// The standard loop drives a real tool turn through the runtime.
 #[test]
 fn runtime_standard_loop_runs_tool_turn_end_to_end() {
@@ -167,7 +188,7 @@ fn pause_parks_loop_until_resumed() {
     assert_eq!(runtime.status().state, OrchestratorState::Created);
 
     runtime.resume();
-    let answer = handle.join().unwrap().unwrap();
+    let answer = join_bounded(handle).unwrap().unwrap();
     assert_eq!(answer, "after resume");
     assert!(!runtime.status().paused);
     assert_eq!(runtime.status().state, OrchestratorState::Completed);
@@ -186,7 +207,7 @@ fn cancel_releases_parked_loop_with_cancelled_error() {
     std::thread::sleep(Duration::from_millis(200));
     runtime.cancel();
 
-    let result = handle.join().unwrap();
+    let result = join_bounded(handle).unwrap();
     assert!(
         matches!(result, Err(takka_core::AgenticError::Cancelled)),
         "expected Cancelled, got {:?}",

@@ -7629,6 +7629,7 @@ mod daemon_smoke_tests {
                 .arg(&socket_path)
                 .arg("--info-path")
                 .arg(&info_path)
+                .env("RUST_LOG", "takka_runtime=debug,takka_core=debug")
                 .stdin(std::process::Stdio::null())
                 // Evidence pinning: a failing start on a CI runner is
                 // invisible with null streams; park both in the fixture
