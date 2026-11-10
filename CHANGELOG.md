@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] — 2026-11-10
 
 ### Added (REPL/TUI UX hardening)
 - **REPL: live streamed-answer preview** — while a run streams, the
@@ -324,10 +324,11 @@ No user-facing changes (internal release).
 - Memory management with context window
 - Streaming support
 
-[Unreleased]: https://github.com/dchya24/agentic/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/dchya24/agentic/compare/v0.4.2...v0.5.0
-[0.4.2]: https://github.com/dchya24/agentic/compare/v0.4.1...v0.4.2
-[0.4.1]: https://github.com/dchya24/agentic/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/dchya24/agentic/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/dchya24/agentic/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/dchya24/agentic/releases/tag/v0.2.0
+[0.6.0]: https://github.com/dchya24/takka/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/dchya24/takka/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/dchya24/takka/compare/v0.4.2...v0.5.0
+[0.4.2]: https://github.com/dchya24/takka/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/dchya24/takka/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/dchya24/takka/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/dchya24/takka/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/dchya24/takka/releases/tag/v0.2.0
