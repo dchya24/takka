@@ -1,7 +1,7 @@
 # Roadmap
 
 > Consolidated current-state + next-steps for the takka CLI + core library.
-> Last updated: 2026-08-05.
+> Last updated: 2026-11-10.
 
 This replaces the older `PLAN.md` / `IMPLEMENTATION_ROADMAP.md` /
 `QUICK_START_IMPLEMENTATION.md` triad
@@ -89,7 +89,7 @@ mentah streaming) / `Event::ToolOutput` diperkaya (`duration_ms`, `success`,
   oleh `tool_result_max_chars`; delta hanya observability.
 
 Spec: `docs/superpowers/specs/2026-08-06-interactive-live-progress-and-steering-design.md` (Fase 1).
-Next: **Fase 2b — steer/follow-up queue** sudah landed (engine + CLI); sisa **Fase UX — REPL non-blokir (input saat run)** (spec yang sama).
+Next: sisa Fase UX dari design yang sama sudah landed — streaming preview, mid-run input (REPL + TUI) dan TUI completion parity (initiative `initiative-repl-ux-hardening` ditutup 2026-11-09; 987 tests hijau).
 
 ## Open work
 
@@ -97,7 +97,9 @@ Next: **Fase 2b — steer/follow-up queue** sudah landed (engine + CLI); sisa **
 
 **Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`takka --runtime daemon` gagal dengan pesan aksi di Windows).
 
-**Fase UX (open):** input-during-run di REPL inline (non-blokir) belum diimplementasikan — steer/follow-up tersedia di engine/CLI, tapi REPL masih idle-only untuk `/queue`.
+**Fase UX (landed 2026-11-09):** inisiatif `initiative-repl-ux-hardening` selesai — (R2) streaming preview live di inline REPL, (R1) input-during-run steer/queue di REPL + TUI, (R3) TUI slash-command + `@`-file completion. Rincian di `CHANGELOG.md` bagian [Unreleased] "REPL/TUI UX hardening"; arsip di `_bmad-output/initiative-repl-ux-hardening/`.
+
+**CI (open):** daemon smoke test merah deterministik di `Test (macos-latest)` sejak Fase 3a landed — pre-existing, bukan regresi PR mana pun (Linux + Windows hijau; run berasal dari PR #1 dan rerun ×2). Diagnosa + arah investigasi: [#2](https://github.com/dchya24/takka/issues/2).
 
 Sized by effort. Each item has its own home in
 [`../tasks/tasks-core-agentic.md`](../tasks/tasks-core-agentic.md) or

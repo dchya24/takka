@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (REPL/TUI UX hardening)
+- **REPL: live streamed-answer preview** — while a run streams, the
+  accumulated answer text is now visible progressively in the inline REPL
+  (plain text; the completed answer still renders as the final styled
+  markdown pass). Multi-block answers interleave in arrival order, the
+  transient status line keeps its spot above the preview via the
+  single-writer render gate, and a mid-stream Ctrl+C leaves the scrollback
+  clean (the two-stage cancel semantics don't change).
+- **Mid-run input takes effect** — text typed while a run is active is no
+  longer silently dropped in the inline REPL or the TUI. Per the
+  `--queue-mode` selection it steers the live run (`interrupt` — engine
+  `Request::Steer`, announced as `Steered`) or queues it as the next run
+  (`follow-up`, default), takes effect at the next tool/run boundary and is
+  visibly announced. A queued `follow-up` starts as the next run after
+  the current one ends. Prompt-gate steers wait for visible confirmation
+  prompts to settle instead of stealing lines from the gate. The wire
+  contract is unchanged — no protocol bump.
+- **TUI completion parity** — the full-screen TUI now has the inline
+  REPL's completion conveniences: `/` opens the slash-command list, `@`
+  opens file completion, choices are navigable and accepting a choice
+  fills the input. Works idle and mid-run; completion rendering applies an
+  idle-only rule for plain arrow keys and Home/End so the mid-run typed-
+  text echo stays stable.
+
 ### Changed (BREAKING — rebrand)
 - **Renamed `agentic` → `takka`.** Binary is now `takka` (was `agentic`),
   runtime daemon `takka-runtime`, crates `takka-cli` / `takka-core` /
