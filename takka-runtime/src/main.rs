@@ -1,3 +1,4 @@
+mod acp;
 mod daemon;
 mod stdio_transport;
 
@@ -14,6 +15,18 @@ fn main() {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|argument| argument == "--acp") {
+        // ACP agent (Fase 4): JSON-RPC over newline-delimited stdin/stdout.
+        // Framed output ONLY on this mode; logs stay on stderr because the
+        // client parses stdout strictly (see acp::serve doc).
+        match acp::serve() {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("acp error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.iter().any(|argument| argument == "--daemon") {
         run_daemon(&args);
     }
