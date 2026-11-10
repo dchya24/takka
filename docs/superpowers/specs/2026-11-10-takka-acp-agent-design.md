@@ -47,6 +47,8 @@ on the takka v2 protocol that the CLI and daemon depend on).
 | D8 | Permission mapping | `ConfirmationRequest { action, description, risk_level }` becomes ONE ACP `session/request_permission`; options: `allow_once` ("Allow"), `reject_once` ("Reject"), plus `allow_always`/`reject_always` when the tool is on the `safety.auto_approve_commands` list type | ACP permission options are exactly y/n/always/never shaped; the pending-confirmation channel already blocks a tool boundary, so the answer slots straight into `ConfirmResponse` semantics. `question` tool stays mid-turn via v1 `elicitation` as phase-2 |
 | D9 | Modes | `default / plan / yolo` advertised as ACP v1 **session modes** (SessionMode `{ id, name, description }`; `session/set_mode` → `InitOverrides.permission_mode`); mode-change laws honored only at turn boundaries | Direct 1:1 with takka's PermissionMode; plan-mode restrictions already enforced engine-side |
 | D10 | No engine changes | `takka-core` untouched (engine, protocol, transports); adapter translates ACP ⇄ `MemoryTransport` events | Same discipline that landed daemon mode; no protocol bump, e2e smoke keeps green |
+| D11 | Per-session cwd | **Single-cwd adapter (option c):** `session/new.cwd` MUST equal the process cwd; a mismatch is rejected with an actionable error ("restart the agent from project directory X"); Zed/ACP Clients spawn one agent process per project, so this matches how Clients already work | Threading per-session cwd through all 16 path-resolving tools (option b) is the first engine-adjacent change since daemon mode — touches path sandbox, glob, grep, run_command; too big to smuggle into this phase. Silent tolerance (option a) would read/write the wrong directory — rejected as incorrect |
+| D12 | Turn-limit stop reasons | takka v2 protocol gains **additive** events: `Event::TurnLimitExceeded { kind: max_tokens | max_turn_requests }` emitted when the loop cap / token budget ends a turn (no version bump — mirrors how `SessionAdopted` and `Usage` were added); the ACP adapter maps them to ACP `stopReason: max_tokens` / `max_turn_requests`; non-ACP frontends may surface a notice | ACP exposes distinct reasons; silently degrading both to `end_turn` would hide the real cause (user decision 2026-11-10: "tambahkan saja event tambahan v2") |
 
 ## 3. Target architecture
 
@@ -111,8 +113,9 @@ updaters, mirroring daemon's slot/drain ideas but in stdio form.
 | engine panic | JSON-RPC `error` for prompt + session teardown | "runtime died" UX matches daemon |
 | `Usage` / tool timeline details | **not mapped in phase 1** | `_meta` extension candidate later |
 
-`stopReason` for `max_tokens`/`max_turn_request` unplanned until engine exposes those
-reasons; loop-cap turns end at `end_turn` with a notice today.
+`stopReason` for turn limits: with D12's additive `Event::TurnLimitExceeded`, the adapter
+maps `max_tokens` → `stopReason: max_tokens` and `max_turn_requests` →
+`stopReason: max_turn_requests` instead of degrading to `end_turn`.
 
 ## 5. Data flow
 
@@ -156,22 +159,33 @@ this phase — no `.github/` change is allowed without asking first).
 
 **Phase 2 backlog (tracked when phase 1 lands):**
 
+- Per-session cwd (option b): thread a per-session cwd base through tool path
+  resolution in takka-core (path sandbox, glob, grep, run_command), so one adapter
+  process may host sessions across projects — the real fix behind D11's phase-1
+  restriction
+- Turn-limit wiring (D12) into the CLI/TUI status line (the additive event may surface
+  as a notice only in non-ACP frontends at first)
 - `session/load` / `loadSession` (map the `.config/takka/sessions` store to ACP session IDs)
 - Client-provided `mcpServers` at `session/new` (takka-core already has an MCP client — wire config through)
 - `available_commands_update`: expose takka slash commands to the editor's "/" menu
 - v1 `elicitation` for the `question` tool (structured ask UI)
 - ACP v2 support behind explicit negotiation (per the v1+v2 side-by-side guide)
 - `Usage` details + context-compaction notifications via `_meta`/future ACP fields
-- ACP Registry listing
 
-**Open questions (answer before implementation):**
+**Not planned for now (decision 2026-11-10):** ACP Registry listing.
 
-1. **Per-session cwd:** sessions arrive with distinct `cwd`s, but process-relative tools
-   share one cwd. Options: (a) deny mismatches, (b) thread cwd into tool resolution in
-   takka-core (first genuine engine-adjacent change), (c) one adapter *process per cwd*.
-   Draft intent: (c) for phase 1 (Zed spawns per-project), revisit (b) later.
-2. `overlong-reason` stopReasons — worth a takka-v2 additive event?
-3. Does Zed ship an embedded registry entry workflow we should preregister for?
+## Resolved decisions (user, 2026-11-10)
+
+1. **Per-session cwd → option (c), single-cwd adapter** (D11). Phase 1 validates
+   `session/new.cwd == process.cwd()` and rejects mismatches with an actionable error;
+   option (b) (per-session cwd threading in takka-core) moves to the phase-2 backlog as
+   the real fix; option (a) (silent tolerance) is rejected outright — it would silently
+   operate in the wrong directory.
+2. **Turn-limit stop reasons → additive takka v2 events** (D12): the adapter maps the
+   real reasons (`max_tokens`, `max_turn_requests`) instead of degrading to `end_turn`.
+   See D12 for the event shape and the no-bump rationale.
+3. **ACP Registry listing → not planned for now** (explicit user decision; revisit only
+   if an ecosystem need appears).
 
 ## 8. Risks
 
