@@ -513,17 +513,36 @@ mod tests {
 
     /// Local tempdir (the `support` helpers live in takka-core's test
     /// tree; this crate has no cross-crate test dependency).
+    ///
+    /// The name is deliberately SHORT: `temp_dir()` on macOS runners is
+    /// already ~48 chars (`/var/folders/h5/…/T/`), and a unix socket path
+    /// must stay under `SUN_LEN` (104). A descriptive name plus a
+    /// `{tag}.sock` sibling blew that limit, so every daemon test in this
+    /// module failed with "path must be shorter than SUN_LEN" (the same
+    /// trap the CLI fixture hit; its fix never reached here).
     fn tempdir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // Two tag characters keep parallel instances readable without
+        // spending the path budget.
+        let short: String = tag
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(2)
+            .collect();
         let dir = std::env::temp_dir().join(format!(
-            "takka-daemon-test-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            tag
+            "td{}{}{}",
+            std::process::id() % 1000,
+            nanos % 1_000_000,
+            short
         ));
+        assert!(
+            dir.join("s.sock").as_os_str().len() < 100,
+            "socket path budget exceeded: {:?}",
+            dir.join("s.sock")
+        );
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -740,7 +759,7 @@ mod tests {
     ) {
         let dir = tempdir(tag);
         let config_path = write_hermetic_config(&dir);
-        let socket_path = dir.join(format!("{tag}.sock"));
+        let socket_path = dir.join("s.sock");
         let info_path = dir.join("daemon.json");
         let handle = spawn_serve(socket_path.clone(), info_path.clone());
         wait_for_info_file(&info_path);
@@ -791,7 +810,7 @@ mod tests {
     #[test]
     fn accepted_connections_are_forced_blocking() {
         let dir = tempdir("accept-mode");
-        let path = dir.join("mode.sock");
+        let path = dir.join("s.sock");
         let listener = UnixListener::bind(&path).expect("bind");
         listener
             .set_nonblocking(true)
