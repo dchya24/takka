@@ -17,6 +17,16 @@
 //! - Shutdown comes from the engine (`Request::Shutdown`); SIGTERM and
 //!   SIGINT are deliberately not handled — crash cleanup relies on the
 //!   next daemon's stale cleanup (documented in the design spec).
+//! - Publish order: the discovery file is the LAST startup step. Its
+//!   existence is the contract "this daemon accepts clients", so every
+//!   earlier step (engine thread, drain thread, non-blocking listener)
+//!   must already be in place. Publishing earlier let a client attach to
+//!   a half-started broker and observe EOF instead of a handshake reply
+//!   (the macOS CI signature in issue #2).
+//! - Visibility: the engine thread never dies silently. A panic is
+//!   caught, reported on stderr and turned into an orderly broker
+//!   shutdown, so a dead engine always looks like a shutdown — never
+//!   like a connection that just vanished.
 
 /// Single clearinghouse message for unsupported platforms (Windows:
 /// named pipes are a documented TODO). Used by `main` on non-unix
@@ -123,19 +133,28 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     let engine_handle = std::thread::Builder::new()
         .name("daemon-engine".into())
         .spawn(move || {
-            let mut engine = RuntimeEngine::new(MemoryTransport::new(req_rx, evt_tx));
-            engine.set_daemon_token(Some(engine_token));
-            engine.set_adopt_on_reinit(true);
-            engine.run();
+            // A panicking engine must never look like a vanished
+            // connection: catch it, report it, and stop the broker the
+            // same way a clean engine exit does.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut engine = RuntimeEngine::new(MemoryTransport::new(req_rx, evt_tx));
+                engine.set_daemon_token(Some(engine_token));
+                engine.set_adopt_on_reinit(true);
+                engine.run();
+            }));
+            if let Err(payload) = outcome {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                tracing::error!(panic = %detail, "daemon: engine thread panicked");
+            }
+            tracing::info!("daemon: engine thread finished");
             engine_shutdown.store(true, Ordering::SeqCst);
         })?;
 
-    // 4) Discovery info — written after bind, before the accept loop:
-    //    its existence means the listener is ready. Perms 0600: the
-    //    token is a shared secret.
-    write_info_file(&config, &token)?;
-
-    // 5) Permanent event drain: forwards engine events to whichever
+    // 4) Permanent event drain: forwards engine events to whichever
     //    writer is installed, discards while detached — the engine
     //    never blocks on a dead frontend. Exits when the engine (and
     //    its `MemoryTransport`) is dropped.
@@ -146,6 +165,19 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             let slot = slot.clone();
             move || {
                 while let Ok(event) = evt_rx.recv() {
+                    // The engine's startup `Ready` announces "the engine
+                    // loop started". No client can have seen it (it is
+                    // emitted before anyone attaches), so forwarding it
+                    // would only confuse the first client's handshake:
+                    // the drain loop usually discards it while the slot
+                    // is empty, but a client attaching in that window
+                    // used to receive it instead of `InitOk` (issue #2,
+                    // "unexpected initialization event: Ready"). Always
+                    // drop it here so the outcome never depends on
+                    // timing.
+                    if !should_forward(&event) {
+                        continue;
+                    }
                     let mut guard = slot.lock().unwrap();
                     if let Some((_, writer)) = guard.as_mut() {
                         if write_frame(writer, &event).is_err() {
@@ -157,8 +189,17 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             }
         })?;
 
-    // 6) Accept loop: nonblocking listener, shutdown flag poll.
+    // 5) Non-blocking accept loop is armed BEFORE the discovery file is
+    //    published: a client that sees the file must never find a
+    //    listener that is not accepting yet.
     listener.set_nonblocking(true)?;
+
+    // 6) Discovery info LAST — its existence means the whole broker
+    //    (engine thread, drain thread, armed listener) is up. Perms
+    //    0600: the token is a shared secret.
+    write_info_file(&config, &token)?;
+    tracing::info!(socket = %config.socket_path.display(), "daemon: listening");
+
     let mut readers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut connection_generation: u64 = 0;
     loop {
@@ -281,6 +322,18 @@ fn pump_requests(
     if matches!(guard.as_ref(), Some((owner, _)) if *owner == generation) {
         *guard = None;
     }
+}
+
+/// Whether an engine event may reach a socket client.
+///
+/// `Ready` is the engine's own startup announcement. In the daemon the
+/// engine starts before any client attaches, so `Ready` describes a
+/// moment no client can have observed — replaying it only breaks the
+/// first handshake (it lands where `InitOk` is expected). Everything
+/// else is forwarded as-is (detach is handled by the absent writer).
+#[cfg(unix)]
+fn should_forward(event: &ProtocolEvent) -> bool {
+    !matches!(event.event, Event::Ready { .. })
 }
 
 /// One JSON event frame per line (same framing as `StdioTransport`).
@@ -568,18 +621,20 @@ mod tests {
             }
         }
 
-        /// `Ready` is best-effort (the engine announces it before any
-        /// client is attached and the drain loop discards detached
-        /// events), so tests skip it and assert from `InitOk` on.
+        /// The broker must never forward the engine's startup `Ready`:
+        /// a client's first frame is its `Init` reply (`InitOk`). Any
+        /// `Ready` here is the timing-dependent leak from issue #2, so
+        /// it is a hard failure rather than a skip.
         fn expect_init_ok(&mut self, deadline: Instant, context: &str) -> ProtocolEvent {
-            loop {
-                let event = self.next_event(deadline);
-                match &event.event {
-                    Event::Ready { .. } => continue,
-                    Event::InitOk { .. } => return event,
-                    Event::Error { message } => panic!("{context}: got error frame: {message}"),
-                    other => panic!("{context}: unexpected frame: {other:?}"),
-                }
+            let event = self.next_event(deadline);
+            match &event.event {
+                Event::Ready { .. } => panic!(
+                    "{context}: broker forwarded the engine's startup Ready \
+                     (clients must only see InitOk) — the drain filter regressed"
+                ),
+                Event::InitOk { .. } => event,
+                Event::Error { message } => panic!("{context}: got error frame: {message}"),
+                other => panic!("{context}: unexpected frame: {other:?}"),
             }
         }
 
@@ -658,6 +713,38 @@ mod tests {
             .expect("info file carries the token")
             .to_string();
         (socket_path, PathBuf::from(config_path), token, handle)
+    }
+
+    /// The broker's forwarding rule, unit-tested without timing: the
+    /// engine's `Ready` is the only event a socket client must never
+    /// see; everything else keeps flowing.
+    #[test]
+    fn drain_filter_drops_only_the_startup_ready() {
+        let ready = ProtocolEvent::new(
+            None,
+            Event::Ready {
+                protocol: "takka".into(),
+                version: 2,
+            },
+        );
+        assert!(!should_forward(&ready));
+
+        let init_ok = ProtocolEvent::new(
+            Some("init-1".into()),
+            Event::InitOk {
+                protocol: "takka".into(),
+                version: 2,
+            },
+        );
+        assert!(should_forward(&init_ok));
+
+        let error = ProtocolEvent::new(
+            None,
+            Event::Error {
+                message: "boom".into(),
+            },
+        );
+        assert!(should_forward(&error));
     }
 
     /// Happy path: connect → Init (token + hermetic config) → InitOk →
