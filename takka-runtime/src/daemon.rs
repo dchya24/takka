@@ -233,6 +233,21 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// Accepted connections are explicitly made BLOCKING.
+///
+/// `accept()` on a non-blocking listener returns a socket that INHERITS
+/// `O_NONBLOCK` on macOS/BSD, while Linux clears it. With the flag set,
+/// the reader gets `WouldBlock` instead of waiting for the client's first
+/// frame, treats a healthy client as a detach, and closes the connection
+/// while the daemon keeps running — exactly the macOS CI signature of
+/// issue #2 (client sees EOF, daemon still alive, the engine never saw
+/// `Init`). Never rely on platform `accept` semantics.
+#[cfg(unix)]
+fn make_blocking(stream: UnixStream) -> io::Result<UnixStream> {
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 /// First rule of `handle_connection`: ONE active connection. A second
 /// attach gets a single `"daemon in use"` frame and a close — the
 /// active connection is never touched. Otherwise installs the writer
@@ -244,6 +259,16 @@ fn handle_connection(
     req_tx: &mpsc::Sender<ProtocolRequest>,
     slot: &WriterSlot,
 ) -> Option<std::thread::JoinHandle<()>> {
+    // BSD/macOS: the accepted socket may have inherited the listener's
+    // non-blocking flag. Clear it before anyone reads or writes.
+    let stream = match make_blocking(stream) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%error, "daemon: cannot make the connection blocking");
+            return None;
+        }
+    };
+
     if slot.lock().unwrap().is_some() {
         let mut writer = BufWriter::new(stream);
         let _ = write_frame(
@@ -315,6 +340,17 @@ fn pump_requests(
                     }
                 }
             },
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted =>
+            {
+                // Never a detach: a client that has not spoken yet is
+                // healthy. (Should be unreachable now that accepted
+                // streams are explicitly blocking, but a spin is worse
+                // than a short wait if a platform surprises us again.)
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             Err(_) => break, // read error → treat as detach
         }
     }
@@ -460,7 +496,7 @@ mod windows_guard_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, BufWriter, Write};
+    use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -745,6 +781,77 @@ mod tests {
             },
         );
         assert!(should_forward(&error));
+    }
+
+    /// The accept-mode invariant behind issue #2: whatever `accept()`
+    /// inherits from a non-blocking listener (macOS/BSD inherit
+    /// `O_NONBLOCK`, Linux clears it), a served connection must end up
+    /// blocking — otherwise the reader mistakes a silent client for a
+    /// detach and closes a healthy connection.
+    #[test]
+    fn accepted_connections_are_forced_blocking() {
+        let dir = tempdir("accept-mode");
+        let path = dir.join("mode.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+
+        let client = UnixStream::connect(&path).expect("connect");
+        let deadline = deadline();
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "accept did not complete");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        let mut accepted = make_blocking(accepted).expect("clear the non-blocking flag");
+        // No getter for the flag, so prove it by behaviour: a blocking
+        // stream with a read timeout WAITS for the timeout, while one
+        // that still carries O_NONBLOCK returns instantly.
+        accepted
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("set read timeout");
+        let started = Instant::now();
+        let mut probe = [0u8; 1];
+        assert!(
+            accepted.read(&mut probe).is_err(),
+            "an idle peer must not deliver a frame"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "a served connection must block, not return WouldBlock instantly \
+             (it still carries the listener's non-blocking flag); elapsed {:?}",
+            started.elapsed()
+        );
+        drop(client);
+    }
+
+    /// A client that connects and stays silent is normal (it may be slow
+    /// to send its `Init`). The broker must keep the connection open;
+    /// closing it here is the issue #2 failure mode verbatim.
+    #[test]
+    fn an_idle_connection_is_not_mistaken_for_a_detach() {
+        let (socket_path, config_path, token, serve_handle) = spawn_daemon("idle");
+
+        let mut client = TestConn::connect(&socket_path, deadline());
+        std::thread::sleep(Duration::from_millis(300)); // deliberately quiet
+
+        client.send(&init_frame(
+            "init-idle",
+            &token,
+            &config_path.to_string_lossy(),
+        ));
+        let event = client.expect_init_ok(deadline(), "init after an idle period");
+        assert_eq!(event.request_id.as_deref(), Some("init-idle"));
+
+        client.send(&shutdown_frame("down"));
+        drop(client);
+        wait_serve_exit(serve_handle);
     }
 
     /// Happy path: connect → Init (token + hermetic config) → InitOk →
