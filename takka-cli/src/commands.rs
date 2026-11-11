@@ -7692,7 +7692,37 @@ mod daemon_smoke_tests {
             }
         }
 
-        async fn connect(&self) -> AgentConnection {
+        /// The daemon's last words, gathered with a bounded grace period:
+        /// a child that is dying needs a moment before its stderr/stdout
+        /// files contain the panic/error line. Without this, a failing
+        /// attach on a CI runner quotes a log that is one beat too early
+        /// and the failure stays a guess (issue #2).
+        async fn evidence(&mut self) -> String {
+            const GRACE: Duration = Duration::from_secs(2);
+            let deadline = Instant::now() + GRACE;
+            let status = loop {
+                match self.child.try_wait() {
+                    Ok(Some(status)) => break format!("exited with {status}"),
+                    Ok(None) => {}
+                    Err(error) => break format!("wait error: {error}"),
+                }
+                if Instant::now() >= deadline {
+                    break format!("still running after {GRACE:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            let read = |name: &str| {
+                std::fs::read_to_string(self.dir.join(name))
+                    .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+            };
+            format!(
+                "daemon {status}; stderr: {}; stdout: {}",
+                read("daemon-stderr.log"),
+                read("daemon-stdout.log"),
+            )
+        }
+
+        async fn connect(&mut self) -> AgentConnection {
             match AgentConnection::connect_daemon_at(
                 &self.info_path,
                 self.init_overrides(),
@@ -7703,12 +7733,12 @@ mod daemon_smoke_tests {
             {
                 Ok(conn) => conn,
                 Err(error) => {
-                    // Quote the daemon's own log: a handshake refusal on a
-                    // CI runner otherwise dies silent (macOS failures were
-                    // a guess chain until the spawn evidence patch).
-                    let stderr = std::fs::read_to_string(self.dir.join("daemon-stderr.log"))
-                        .unwrap_or_default();
-                    panic!("daemon attach failed: {error}; daemon stderr: {}", stderr);
+                    // Quote the daemon's own logs and exit status: a
+                    // handshake refusal on a CI runner otherwise dies
+                    // silent (macOS failures were a guess chain until
+                    // the spawn evidence patch).
+                    let evidence = self.evidence().await;
+                    panic!("daemon attach failed: {error}; {evidence}");
                 }
             }
         }

@@ -17,6 +17,16 @@
 //! - Shutdown comes from the engine (`Request::Shutdown`); SIGTERM and
 //!   SIGINT are deliberately not handled — crash cleanup relies on the
 //!   next daemon's stale cleanup (documented in the design spec).
+//! - Publish order: the discovery file is the LAST startup step. Its
+//!   existence is the contract "this daemon accepts clients", so every
+//!   earlier step (engine thread, drain thread, non-blocking listener)
+//!   must already be in place. Publishing earlier let a client attach to
+//!   a half-started broker and observe EOF instead of a handshake reply
+//!   (the macOS CI signature in issue #2).
+//! - Visibility: the engine thread never dies silently. A panic is
+//!   caught, reported on stderr and turned into an orderly broker
+//!   shutdown, so a dead engine always looks like a shutdown — never
+//!   like a connection that just vanished.
 
 /// Single clearinghouse message for unsupported platforms (Windows:
 /// named pipes are a documented TODO). Used by `main` on non-unix
@@ -123,19 +133,28 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     let engine_handle = std::thread::Builder::new()
         .name("daemon-engine".into())
         .spawn(move || {
-            let mut engine = RuntimeEngine::new(MemoryTransport::new(req_rx, evt_tx));
-            engine.set_daemon_token(Some(engine_token));
-            engine.set_adopt_on_reinit(true);
-            engine.run();
+            // A panicking engine must never look like a vanished
+            // connection: catch it, report it, and stop the broker the
+            // same way a clean engine exit does.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut engine = RuntimeEngine::new(MemoryTransport::new(req_rx, evt_tx));
+                engine.set_daemon_token(Some(engine_token));
+                engine.set_adopt_on_reinit(true);
+                engine.run();
+            }));
+            if let Err(payload) = outcome {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                tracing::error!(panic = %detail, "daemon: engine thread panicked");
+            }
+            tracing::info!("daemon: engine thread finished");
             engine_shutdown.store(true, Ordering::SeqCst);
         })?;
 
-    // 4) Discovery info — written after bind, before the accept loop:
-    //    its existence means the listener is ready. Perms 0600: the
-    //    token is a shared secret.
-    write_info_file(&config, &token)?;
-
-    // 5) Permanent event drain: forwards engine events to whichever
+    // 4) Permanent event drain: forwards engine events to whichever
     //    writer is installed, discards while detached — the engine
     //    never blocks on a dead frontend. Exits when the engine (and
     //    its `MemoryTransport`) is dropped.
@@ -146,6 +165,19 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             let slot = slot.clone();
             move || {
                 while let Ok(event) = evt_rx.recv() {
+                    // The engine's startup `Ready` announces "the engine
+                    // loop started". No client can have seen it (it is
+                    // emitted before anyone attaches), so forwarding it
+                    // would only confuse the first client's handshake:
+                    // the drain loop usually discards it while the slot
+                    // is empty, but a client attaching in that window
+                    // used to receive it instead of `InitOk` (issue #2,
+                    // "unexpected initialization event: Ready"). Always
+                    // drop it here so the outcome never depends on
+                    // timing.
+                    if !should_forward(&event) {
+                        continue;
+                    }
                     let mut guard = slot.lock().unwrap();
                     if let Some((_, writer)) = guard.as_mut() {
                         if write_frame(writer, &event).is_err() {
@@ -157,8 +189,17 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             }
         })?;
 
-    // 6) Accept loop: nonblocking listener, shutdown flag poll.
+    // 5) Non-blocking accept loop is armed BEFORE the discovery file is
+    //    published: a client that sees the file must never find a
+    //    listener that is not accepting yet.
     listener.set_nonblocking(true)?;
+
+    // 6) Discovery info LAST — its existence means the whole broker
+    //    (engine thread, drain thread, armed listener) is up. Perms
+    //    0600: the token is a shared secret.
+    write_info_file(&config, &token)?;
+    tracing::info!(socket = %config.socket_path.display(), "daemon: listening");
+
     let mut readers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut connection_generation: u64 = 0;
     loop {
@@ -192,6 +233,21 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// Accepted connections are explicitly made BLOCKING.
+///
+/// `accept()` on a non-blocking listener returns a socket that INHERITS
+/// `O_NONBLOCK` on macOS/BSD, while Linux clears it. With the flag set,
+/// the reader gets `WouldBlock` instead of waiting for the client's first
+/// frame, treats a healthy client as a detach, and closes the connection
+/// while the daemon keeps running — exactly the macOS CI signature of
+/// issue #2 (client sees EOF, daemon still alive, the engine never saw
+/// `Init`). Never rely on platform `accept` semantics.
+#[cfg(unix)]
+fn make_blocking(stream: UnixStream) -> io::Result<UnixStream> {
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 /// First rule of `handle_connection`: ONE active connection. A second
 /// attach gets a single `"daemon in use"` frame and a close — the
 /// active connection is never touched. Otherwise installs the writer
@@ -203,6 +259,16 @@ fn handle_connection(
     req_tx: &mpsc::Sender<ProtocolRequest>,
     slot: &WriterSlot,
 ) -> Option<std::thread::JoinHandle<()>> {
+    // BSD/macOS: the accepted socket may have inherited the listener's
+    // non-blocking flag. Clear it before anyone reads or writes.
+    let stream = match make_blocking(stream) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(%error, "daemon: cannot make the connection blocking");
+            return None;
+        }
+    };
+
     if slot.lock().unwrap().is_some() {
         let mut writer = BufWriter::new(stream);
         let _ = write_frame(
@@ -274,6 +340,17 @@ fn pump_requests(
                     }
                 }
             },
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted =>
+            {
+                // Never a detach: a client that has not spoken yet is
+                // healthy. (Should be unreachable now that accepted
+                // streams are explicitly blocking, but a spin is worse
+                // than a short wait if a platform surprises us again.)
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             Err(_) => break, // read error → treat as detach
         }
     }
@@ -281,6 +358,18 @@ fn pump_requests(
     if matches!(guard.as_ref(), Some((owner, _)) if *owner == generation) {
         *guard = None;
     }
+}
+
+/// Whether an engine event may reach a socket client.
+///
+/// `Ready` is the engine's own startup announcement. In the daemon the
+/// engine starts before any client attaches, so `Ready` describes a
+/// moment no client can have observed — replaying it only breaks the
+/// first handshake (it lands where `InitOk` is expected). Everything
+/// else is forwarded as-is (detach is handled by the absent writer).
+#[cfg(unix)]
+fn should_forward(event: &ProtocolEvent) -> bool {
+    !matches!(event.event, Event::Ready { .. })
 }
 
 /// One JSON event frame per line (same framing as `StdioTransport`).
@@ -407,7 +496,7 @@ mod windows_guard_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, BufWriter, Write};
+    use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -424,17 +513,36 @@ mod tests {
 
     /// Local tempdir (the `support` helpers live in takka-core's test
     /// tree; this crate has no cross-crate test dependency).
+    ///
+    /// The name is deliberately SHORT: `temp_dir()` on macOS runners is
+    /// already ~48 chars (`/var/folders/h5/…/T/`), and a unix socket path
+    /// must stay under `SUN_LEN` (104). A descriptive name plus a
+    /// `{tag}.sock` sibling blew that limit, so every daemon test in this
+    /// module failed with "path must be shorter than SUN_LEN" (the same
+    /// trap the CLI fixture hit; its fix never reached here).
     fn tempdir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // Two tag characters keep parallel instances readable without
+        // spending the path budget.
+        let short: String = tag
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(2)
+            .collect();
         let dir = std::env::temp_dir().join(format!(
-            "takka-daemon-test-{}-{}-{}",
-            std::process::id(),
-            nanos,
-            tag
+            "td{}{}{}",
+            std::process::id() % 1000,
+            nanos % 1_000_000,
+            short
         ));
+        assert!(
+            dir.join("s.sock").as_os_str().len() < 100,
+            "socket path budget exceeded: {:?}",
+            dir.join("s.sock")
+        );
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -511,7 +619,6 @@ mod tests {
     /// public `UnixSocketTransport` has no event-reading API and its
     /// line reader lives in another crate — this is the same framing).
     struct TestConn {
-        sock: UnixStream,
         reader: BufReader<UnixStream>,
         writer: BufWriter<UnixStream>,
     }
@@ -521,10 +628,15 @@ mod tests {
             loop {
                 match UnixStream::connect(socket_path) {
                     Ok(stream) => {
+                        // Set the read bound ONCE: every wait in this
+                        // helper is covered by it, and repeating
+                        // SO_RCVTIMEO mid-test is a platform quirk magnet
+                        // (macOS returned EINVAL for an in-test value).
+                        stream
+                            .set_read_timeout(Some(POLL_TIMEOUT))
+                            .expect("set read timeout at connect");
                         let reader = BufReader::new(stream.try_clone().expect("clone reader half"));
-                        let sock = stream.try_clone().expect("clone timeout handle");
                         return Self {
-                            sock,
                             reader,
                             writer: BufWriter::new(stream),
                         };
@@ -544,10 +656,6 @@ mod tests {
         }
 
         fn next_event(&mut self, deadline: Instant) -> ProtocolEvent {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            self.sock
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
-                .expect("set read timeout");
             loop {
                 let mut line = String::new();
                 match self.reader.read_line(&mut line) {
@@ -561,25 +669,27 @@ mod tests {
                         if error.kind() == std::io::ErrorKind::WouldBlock
                             || error.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        panic!("timed out waiting for an event frame")
+                        panic!("timed out waiting for an event frame (deadline {deadline:?})")
                     }
                     Err(error) => panic!("read event frame failed: {error}"),
                 }
             }
         }
 
-        /// `Ready` is best-effort (the engine announces it before any
-        /// client is attached and the drain loop discards detached
-        /// events), so tests skip it and assert from `InitOk` on.
+        /// The broker must never forward the engine's startup `Ready`:
+        /// a client's first frame is its `Init` reply (`InitOk`). Any
+        /// `Ready` here is the timing-dependent leak from issue #2, so
+        /// it is a hard failure rather than a skip.
         fn expect_init_ok(&mut self, deadline: Instant, context: &str) -> ProtocolEvent {
-            loop {
-                let event = self.next_event(deadline);
-                match &event.event {
-                    Event::Ready { .. } => continue,
-                    Event::InitOk { .. } => return event,
-                    Event::Error { message } => panic!("{context}: got error frame: {message}"),
-                    other => panic!("{context}: unexpected frame: {other:?}"),
-                }
+            let event = self.next_event(deadline);
+            match &event.event {
+                Event::Ready { .. } => panic!(
+                    "{context}: broker forwarded the engine's startup Ready \
+                     (clients must only see InitOk) — the drain filter regressed"
+                ),
+                Event::InitOk { .. } => event,
+                Event::Error { message } => panic!("{context}: got error frame: {message}"),
+                other => panic!("{context}: unexpected frame: {other:?}"),
             }
         }
 
@@ -594,10 +704,6 @@ mod tests {
         }
 
         fn expect_eof(&mut self, deadline: Instant) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            self.sock
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
-                .expect("set read timeout");
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
                 Ok(0) => {}
@@ -606,7 +712,7 @@ mod tests {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    panic!("timed out waiting for EOF")
+                    panic!("timed out waiting for EOF (deadline {deadline:?})")
                 }
                 // Closing a socket that still holds unread input (our
                 // init frame was never read by the refusing daemon)
@@ -649,7 +755,7 @@ mod tests {
     ) {
         let dir = tempdir(tag);
         let config_path = write_hermetic_config(&dir);
-        let socket_path = dir.join(format!("{tag}.sock"));
+        let socket_path = dir.join("s.sock");
         let info_path = dir.join("daemon.json");
         let handle = spawn_serve(socket_path.clone(), info_path.clone());
         wait_for_info_file(&info_path);
@@ -658,6 +764,109 @@ mod tests {
             .expect("info file carries the token")
             .to_string();
         (socket_path, PathBuf::from(config_path), token, handle)
+    }
+
+    /// The broker's forwarding rule, unit-tested without timing: the
+    /// engine's `Ready` is the only event a socket client must never
+    /// see; everything else keeps flowing.
+    #[test]
+    fn drain_filter_drops_only_the_startup_ready() {
+        let ready = ProtocolEvent::new(
+            None,
+            Event::Ready {
+                protocol: "takka".into(),
+                version: 2,
+            },
+        );
+        assert!(!should_forward(&ready));
+
+        let init_ok = ProtocolEvent::new(
+            Some("init-1".into()),
+            Event::InitOk {
+                protocol: "takka".into(),
+                version: 2,
+            },
+        );
+        assert!(should_forward(&init_ok));
+
+        let error = ProtocolEvent::new(
+            None,
+            Event::Error {
+                message: "boom".into(),
+            },
+        );
+        assert!(should_forward(&error));
+    }
+
+    /// The accept-mode invariant behind issue #2: whatever `accept()`
+    /// inherits from a non-blocking listener (macOS/BSD inherit
+    /// `O_NONBLOCK`, Linux clears it), a served connection must end up
+    /// blocking — otherwise the reader mistakes a silent client for a
+    /// detach and closes a healthy connection.
+    #[test]
+    fn accepted_connections_are_forced_blocking() {
+        let dir = tempdir("accept-mode");
+        let path = dir.join("s.sock");
+        let listener = UnixListener::bind(&path).expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+
+        let client = UnixStream::connect(&path).expect("connect");
+        let deadline = deadline();
+        let accepted = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "accept did not complete");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        let mut accepted = make_blocking(accepted).expect("clear the non-blocking flag");
+        // No getter for the flag, so prove it by behaviour: a blocking
+        // stream with a read timeout WAITS for the timeout, while one
+        // that still carries O_NONBLOCK returns instantly.
+        accepted
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("set read timeout");
+        let started = Instant::now();
+        let mut probe = [0u8; 1];
+        assert!(
+            accepted.read(&mut probe).is_err(),
+            "an idle peer must not deliver a frame"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(350),
+            "a served connection must block, not return WouldBlock instantly \
+             (it still carries the listener's non-blocking flag); elapsed {:?}",
+            started.elapsed()
+        );
+        drop(client);
+    }
+
+    /// A client that connects and stays silent is normal (it may be slow
+    /// to send its `Init`). The broker must keep the connection open;
+    /// closing it here is the issue #2 failure mode verbatim.
+    #[test]
+    fn an_idle_connection_is_not_mistaken_for_a_detach() {
+        let (socket_path, config_path, token, serve_handle) = spawn_daemon("idle");
+
+        let mut client = TestConn::connect(&socket_path, deadline());
+        std::thread::sleep(Duration::from_millis(300)); // deliberately quiet
+
+        client.send(&init_frame(
+            "init-idle",
+            &token,
+            &config_path.to_string_lossy(),
+        ));
+        let event = client.expect_init_ok(deadline(), "init after an idle period");
+        assert_eq!(event.request_id.as_deref(), Some("init-idle"));
+
+        client.send(&shutdown_frame("down"));
+        drop(client);
+        wait_serve_exit(serve_handle);
     }
 
     /// Happy path: connect → Init (token + hermetic config) → InitOk →
