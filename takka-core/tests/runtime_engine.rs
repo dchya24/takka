@@ -1414,3 +1414,95 @@ fn daemon_wrong_token_is_unauthorized_before_adopt_branch() {
     }
     worker.join().unwrap();
 }
+
+/// D9 (`session/set_mode` surface): `Request::SetPermissionMode` on an
+/// initialized engine switches the orchestrator's permission mode and
+/// acks with `Event::PermissionModeChanged` carrying the same mode.
+#[test]
+fn set_permission_mode_switches_mode_and_acks() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::with_session(
+        MemoryTransport::new(request_rx, event_tx),
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "spm-1",
+            Request::SetPermissionMode {
+                mode: takka_core::safety::PermissionMode::Plan,
+            },
+        ))
+        .unwrap();
+    request_tx
+        .send(ProtocolRequest::new(
+            "spm-2",
+            Request::SetPermissionMode {
+                mode: takka_core::safety::PermissionMode::Yolo,
+            },
+        ))
+        .unwrap();
+    request_tx
+        .send(ProtocolRequest::new("bye", Request::Shutdown))
+        .unwrap();
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    let modes: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            Event::PermissionModeChanged { mode } => Some((*mode, event.request_id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        modes,
+        vec![
+            (
+                takka_core::safety::PermissionMode::Plan,
+                Some("spm-1".to_string())
+            ),
+            (
+                takka_core::safety::PermissionMode::Yolo,
+                Some("spm-2".to_string())
+            ),
+        ],
+        "expected one PermissionModeChanged ack per SetPermissionMode, got {modes:?}"
+    );
+}
+
+/// Before init the request is rejected like every other resource
+/// request: `Event::Error { message: "not initialized" }`.
+#[test]
+fn set_permission_mode_before_init_is_rejected() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut engine = RuntimeEngine::new(MemoryTransport::new(request_rx, event_tx));
+    let worker = std::thread::spawn(move || engine.run());
+
+    request_tx
+        .send(ProtocolRequest::new(
+            "spm-early",
+            Request::SetPermissionMode {
+                mode: takka_core::safety::PermissionMode::Yolo,
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        Event::Error { message } if message == "not initialized"
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, Event::PermissionModeChanged { .. })),
+        "no ack may be emitted when uninitialized"
+    );
+}

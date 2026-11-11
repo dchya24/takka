@@ -1249,3 +1249,160 @@ async fn streaming_run_emits_usage_event_from_final_chunk() {
     assert_eq!(usage.1, 7);
     assert_eq!(usage.2, Some(11));
 }
+
+// ---------------------------------------------------------------------------
+// D12: turn-limit stop reasons (`Event::TurnLimitExceeded`).
+// ---------------------------------------------------------------------------
+
+/// Forced finalization at the iteration cap must announce WHY the turn
+/// ended: exactly one `TurnLimitExceeded { kind: MaxTurnRequests }`.
+#[test]
+fn forced_finalization_emits_max_turn_requests_once() {
+    let provider: Arc<dyn LLMProvider> = Arc::new(support::RecordingProvider::new(vec![
+        support::tool_call_response("c1", "list_files", &serde_json::json!({"path": "."})),
+        support::tool_call_response("c2", "glob", &serde_json::json!({"pattern": "*.rs"})),
+        support::text_response("final answer"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(3);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    let answer = orch.run("go").expect("should finalize");
+    assert_eq!(answer, "final answer");
+
+    let captured = events.lock().unwrap();
+    let limit_events: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::TurnLimitExceeded { kind } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        limit_events,
+        vec![takka_core::events::TurnLimitKind::MaxTurnRequests],
+        "expected exactly one MaxTurnRequests event, got {limit_events:?}"
+    );
+}
+
+/// A provider token-cap stop (`finish_reason: "length"`) on a natural
+/// final answer must surface `TurnLimitExceeded { kind: MaxTokens }`.
+#[test]
+fn token_truncated_final_answer_emits_max_tokens() {
+    let mut response = support::text_response("partial answer, cut off mid");
+    response.finish_reason = Some("length".to_string());
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![response]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    let answer = orch.run("write long text").expect("run should succeed");
+    assert_eq!(answer, "partial answer, cut off mid");
+
+    let captured = events.lock().unwrap();
+    let limit_events: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::TurnLimitExceeded { kind } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        limit_events,
+        vec![takka_core::events::TurnLimitKind::MaxTokens],
+        "expected exactly one MaxTokens event, got {limit_events:?}"
+    );
+}
+
+/// A natural stop (`finish_reason: "stop"`) must NOT emit any
+/// `TurnLimitExceeded` event — the default answer path stays silent.
+#[test]
+fn natural_stop_emits_no_turn_limit_event() {
+    let provider: Arc<dyn LLMProvider> =
+        Arc::new(ScriptedProvider::new(vec![support::text_response("done")]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    orch.run("just answer").expect("run should succeed");
+
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::TurnLimitExceeded { .. })),
+        "a natural stop must not emit TurnLimitExceeded"
+    );
+}
+
+/// Streaming path: the final chunk's `finish_reason` decides the
+/// MaxTokens emission — same contract as the sync loop.
+#[tokio::test]
+async fn streaming_token_truncated_final_answer_emits_max_tokens() {
+    let mut response = support::text_response("streamed truncation");
+    response.finish_reason = Some("max_tokens".to_string());
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(StreamingScriptedProvider::new(vec![response]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    let out = orch
+        .run_stream("stream a long answer", |_| {})
+        .await
+        .expect("run_stream should succeed");
+    assert_eq!(out, "streamed truncation");
+
+    let captured = events.lock().unwrap();
+    let limit_events: Vec<_> = captured
+        .iter()
+        .filter_map(|e| match e {
+            Event::TurnLimitExceeded { kind } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        limit_events,
+        vec![takka_core::events::TurnLimitKind::MaxTokens],
+        "expected exactly one MaxTokens event on the stream path, got {limit_events:?}"
+    );
+}

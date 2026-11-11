@@ -58,6 +58,7 @@ use takka_core::runtime::protocol::{
     ConnectionCapabilities, InitOverrides, ProtocolEvent, ProtocolRequest, Request,
 };
 use takka_core::runtime::transport::MemoryTransport;
+use takka_core::PermissionMode;
 
 use crate::acp_permission;
 
@@ -83,6 +84,11 @@ pub const DEFAULT_MAX_SESSIONS: usize = 4;
 /// local (config read, skill discovery, prompt assembly) — 10s is ample;
 /// a hung boot must not wedge the framing loop.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on waiting for the engine's `PermissionModeChanged` ack of a
+/// `session/set_mode` (D9). The engine answers from its request loop, so a
+/// timeout means it is wedged/dead — never a slow turn.
+const MODE_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on the EOF teardown join (T-07). Cancelling is cooperative and
 /// an engine thread only exits after its active run winds down at the
@@ -527,9 +533,10 @@ impl AcpService {
                 }
             }
             (Some(SESSION_PROMPT), true) => self.session_prompt(frame),
-            // Mode switching is advertised (D9) but not switchable yet;
-            // the honest rejection beats pretending it worked.
-            (Some(SESSION_SET_MODE), true) => RouteOutcome::Error(set_mode_unsupported()),
+            // D9: mode switches apply at turn boundaries (safety is
+            // consulted per boundary), so a busy session is refused rather
+            // than silently deferred.
+            (Some(SESSION_SET_MODE), true) => self.session_set_mode(frame),
             // loadSession is not advertised (D7) — refuse honestly.
             (Some(SESSION_LOAD), true) => RouteOutcome::Error(load_unsupported()),
             // session/cancel is a notification in v1; if a client carries
@@ -692,6 +699,97 @@ impl AcpService {
         }
         spawn_engine_thread(name, req_rx, evt_tx)
             .map_err(|error| internal_error(format!("failed to spawn the session engine: {error}")))
+    }
+
+    /// `session/set_mode` (D9): switch the session's permission mode.
+    ///
+    /// The session's one turn slot must be free — mode laws are honored at
+    /// turn boundaries, so switching mid-turn is refused with `session busy`
+    /// instead of being silently deferred to an unknown later moment. The
+    /// engine acks with `Event::PermissionModeChanged`, which is awaited
+    /// (bounded) before replying so the client never sees a mode it did not
+    /// actually get.
+    fn session_set_mode(&self, frame: &Value) -> RouteOutcome {
+        let request = match parse_params::<acp::SetSessionModeRequest>(frame, SESSION_SET_MODE) {
+            Ok(request) => request,
+            Err(error) => return RouteOutcome::Error(error),
+        };
+        let session_id = request.session_id.to_string();
+        let session = {
+            let sessions = self.sessions.lock().expect("session registry lock");
+            sessions.get(&session_id).cloned()
+        };
+        let Some(session) = session else {
+            return RouteOutcome::Error(acp::Error::session_not_found(request.session_id));
+        };
+        if session.busy.load(Ordering::SeqCst) {
+            return RouteOutcome::Error(busy_error(&session.id));
+        }
+        let Some(mode) = permission_mode(request.mode_id.0.as_ref()) else {
+            return RouteOutcome::Error(unknown_mode_error(request.mode_id.0.as_ref()));
+        };
+
+        // Idle session: the event stream is parked and nobody else can take
+        // it (the busy gate above proves no turn is in flight, and a new
+        // prompt cannot be dispatched while this handler runs on the framing
+        // loop).
+        let receiver = match session.events.lock().expect("session events lock").take() {
+            Some(receiver) => receiver,
+            None => {
+                return RouteOutcome::Error(internal_error(
+                    "session engine stream is not available",
+                ))
+            }
+        };
+        let request_id = session.next_request_id("mode");
+        let sent = session.req_tx.send(ProtocolRequest::new(
+            request_id,
+            Request::SetPermissionMode { mode },
+        ));
+        if sent.is_err() {
+            *session.events.lock().expect("session events lock") = Some(receiver);
+            return RouteOutcome::Error(internal_error(
+                "runtime engine died before the mode switch",
+            ));
+        }
+
+        let deadline = Instant::now() + MODE_SWITCH_TIMEOUT;
+        let mut ack: Result<(), acp::Error> = Err(internal_error(
+            "session engine did not acknowledge the mode switch",
+        ));
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(remaining) {
+                Ok(event) => match &event.event {
+                    takka_core::Event::PermissionModeChanged { mode: applied } => {
+                        debug_assert_eq!(*applied, mode);
+                        ack = Ok(());
+                        break;
+                    }
+                    takka_core::Event::Error { message } => {
+                        ack = Err(internal_error(message.clone()));
+                        break;
+                    }
+                    // Stray events (a finished turn's tail, notices) are not
+                    // mode answers: keep waiting for the ack.
+                    _ => continue,
+                },
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    ack = Err(internal_error("runtime engine died during the mode switch"));
+                    break;
+                }
+            }
+        }
+        // Park the stream back so the next prompt can run.
+        *session.events.lock().expect("session events lock") = Some(receiver);
+        match ack {
+            Ok(()) => RouteOutcome::Reply(
+                serde_json::to_value(acp::SetSessionModeResponse::default())
+                    .expect("set mode response serializes"),
+            ),
+            Err(error) => RouteOutcome::Error(error),
+        }
     }
 
     /// `session/prompt`: map content blocks, gate on busy, then hand the
@@ -986,14 +1084,28 @@ fn run_prompt_turn(
 
     let mut translator = TranslatorState::new();
     let mut engine_died = false;
+    // D12: a turn that ends because a limit was hit must report the real
+    // reason instead of degrading to `end_turn`. The engine emits the limit
+    // event right before its terminator, so remember it here.
+    let mut turn_limit: Option<acp::StopReason> = None;
     let outcome: Result<acp::PromptResponse, acp::Error> = loop {
         // No overall deadline here (a legitimate coding turn can run for
         // minutes; the daemon drain has the same shape). A dead engine is
         // detected immediately via the disconnected channel.
         match receiver.recv() {
             Ok(event) => match &event.event {
+                takka_core::Event::TurnLimitExceeded { kind } => {
+                    turn_limit = Some(match kind {
+                        takka_core::events::TurnLimitKind::MaxTokens => acp::StopReason::MaxTokens,
+                        takka_core::events::TurnLimitKind::MaxTurnRequests => {
+                            acp::StopReason::MaxTurnRequests
+                        }
+                    });
+                }
                 takka_core::Event::Done { .. } => {
-                    break Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    break Ok(acp::PromptResponse::new(
+                        turn_limit.unwrap_or(acp::StopReason::EndTurn),
+                    ));
                 }
                 takka_core::Event::Error { message } => {
                     if session.cancel_requested.load(Ordering::SeqCst) {
@@ -1248,12 +1360,27 @@ fn load_unsupported() -> acp::Error {
 }
 
 /// D9: modes are advertised but not switchable yet (honest rejection).
-fn set_mode_unsupported() -> acp::Error {
+/// D9: ACP mode id -> takka's permission mode. `None` = not advertised.
+fn permission_mode(mode_id: &str) -> Option<PermissionMode> {
+    match mode_id {
+        "default" => Some(PermissionMode::Default),
+        "plan" => Some(PermissionMode::Plan),
+        "yolo" => Some(PermissionMode::Yolo),
+        _ => None,
+    }
+}
+
+fn unknown_mode_error(mode_id: &str) -> acp::Error {
     acp::Error::new(
-        i32::from(acp::ErrorCode::InvalidRequest),
-        "session/set_mode is not implemented yet (modes are advertised, switching lands with a later lane)",
+        i32::from(acp::ErrorCode::InvalidParams),
+        format!("unknown session mode: {mode_id}"),
     )
-    .data(serde_json::json!({ "method": SESSION_SET_MODE, "reason": "not implemented in phase 1" }))
+    .data(serde_json::json!({
+        "method": SESSION_SET_MODE,
+        "reason": "unknown session mode",
+        "requested": mode_id,
+        "available": ["default", "plan", "yolo"],
+    }))
 }
 
 /// Unwraps `params` and deserializes into a typed request body.
@@ -1468,6 +1595,9 @@ impl TranslatorState {
             | Event::CompactionStarted
             | Event::WaitingForUser
             | Event::SessionCompleted { .. } => None,
+            // D12/D9: consumed by the turn loop (stop reason) and the mode
+            // surface, never rendered as a stream update.
+            Event::TurnLimitExceeded { .. } | Event::PermissionModeChanged { .. } => None,
         }
     }
 }
@@ -1588,32 +1718,95 @@ mod tests {
         assert_eq!(response["protocolVersion"], serde_json::json!(1));
     }
 
-    /// T-03 removed the pre-T-03 stubs: `session/load` (loadSession is not
-    /// advertised, D7) and `session/set_mode` (modes advertised, not
-    /// switchable yet) are rejected with honest, phase-specific errors.
+    /// `session/load` stays a phase-2 gap (loadSession is not advertised,
+    /// D7) and is rejected with an honest, phase-specific error. An unknown
+    /// session additionally fails as not-found (no silent success).
     #[test]
-    fn session_load_and_set_mode_are_rejected_honestly() {
-        for method in [SESSION_LOAD, SESSION_SET_MODE] {
-            let frame = serde_json::json!({
-                "jsonrpc": "2.0", "id": 7, "method": method, "params": {}
-            });
-            let RouteOutcome::Error(error) = route(frame) else {
-                panic!("{method} must route to an error");
-            };
-            assert_eq!(i32::from(error.code), -32600, "{method}: invalid_request");
-            let text = format!(
-                "{} {}",
-                error.message,
-                serde_json::to_string(&error.data).expect("error data serializes")
+    fn session_load_is_rejected_honestly() {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": SESSION_LOAD, "params": {}
+        });
+        let RouteOutcome::Error(error) = route(frame) else {
+            panic!("session/load must route to an error");
+        };
+        assert_eq!(i32::from(error.code), -32600, "invalid_request");
+        let text = format!(
+            "{} {}",
+            error.message,
+            serde_json::to_string(&error.data).expect("error data serializes")
+        );
+        assert!(text.contains("phase 2"), "{text}");
+        assert!(text.contains("loadSession"), "{text}");
+        assert!(!text.contains("pre-T-03"), "stub wording must be gone");
+    }
+
+    /// D9: an unadvertised mode id is rejected as invalid params and names
+    /// the modes the client may actually use.
+    #[test]
+    fn session_set_mode_rejects_unknown_modes() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let session = new_session(&acp, 1);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_SET_MODE,
+            "params": { "sessionId": session, "modeId": "turbo" }
+        }));
+        let response = acp.response(2);
+        let error = &response["error"];
+        assert_eq!(error["code"], serde_json::json!(-32602), "{response}");
+        let data = &error["data"];
+        assert_eq!(
+            data["available"],
+            serde_json::json!(["default", "plan", "yolo"])
+        );
+        assert_eq!(data["requested"], serde_json::json!("turbo"));
+        acp.close_and_join();
+    }
+
+    /// D9: switching an idle session's mode reaches the engine and answers
+    /// with an empty result (the ACP `SetSessionModeResponse` shape).
+    #[test]
+    fn session_set_mode_switches_an_idle_session() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let session = new_session(&acp, 1);
+        for (id, mode) in [(2, "plan"), (3, "yolo"), (4, "default")] {
+            acp.send(serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": SESSION_SET_MODE,
+                "params": { "sessionId": session, "modeId": mode }
+            }));
+            let response = acp.response(id);
+            assert!(
+                response["error"].is_null(),
+                "set_mode({mode}) must succeed, got {}",
+                response["error"]
             );
-            assert!(!text.contains("pre-T-03"), "stub wording must be gone");
-            if method == SESSION_LOAD {
-                assert!(text.contains("phase 2"), "{method}: {text}");
-                assert!(text.contains("loadSession"), "{method}: {text}");
-            } else {
-                assert!(text.contains("not implemented yet"), "{method}: {text}");
-            }
+            assert!(response["result"].is_object(), "{response}");
         }
+        // The session survives the switches: a prompt still works.
+        send_prompt(&acp, 5, &session, text_prompt("still alive"));
+        let response = acp.response(5);
+        assert!(
+            response["result"].is_object() || response["error"].is_object(),
+            "the session must still answer after mode switches, got {response}"
+        );
+        acp.close_and_join();
+    }
+
+    /// D9: set_mode on a session that does not exist is not-found, never a
+    /// silent success (the client would believe the mode changed).
+    #[test]
+    fn session_set_mode_on_unknown_session_is_not_found() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_SET_MODE,
+            "params": { "sessionId": "sess-nope", "modeId": "plan" }
+        }));
+        let response = acp.response(2);
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(-32002),
+            "resource not found: {response}"
+        );
+        acp.close_and_join();
     }
 
     #[test]
@@ -2428,6 +2621,85 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // D12: turn-limit stop reasons.
+    // ------------------------------------------------------------------
+
+    /// Fake engine whose turns end at a limit: it emits
+    /// `Event::TurnLimitExceeded` right before the terminator, exactly like
+    /// the real loop does after `forced finalization` / a truncated answer.
+    fn d12_fake_engine(kind: Option<takka_core::events::TurnLimitKind>) -> FakeEngine {
+        Arc::new(
+            move |req_rx: std::sync::mpsc::Receiver<ProtocolRequest>,
+                  evt_tx: std::sync::mpsc::Sender<ProtocolEvent>| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => emit(takka_core::Event::InitOk {
+                            protocol: "takka".to_owned(),
+                            version: 2,
+                        }),
+                        Request::Run { .. } => {
+                            emit(takka_core::Event::AssistantDelta {
+                                content: "partial answer".to_owned(),
+                            });
+                            if let Some(kind) = kind {
+                                emit(takka_core::Event::TurnLimitExceeded { kind });
+                            }
+                            emit(takka_core::Event::Done {
+                                result: "partial answer".to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        )
+    }
+
+    /// D12: the engine's limit kinds map onto the ACP stop reasons instead
+    /// of degrading to `end_turn` (the whole point of the additive event).
+    #[test]
+    fn turn_limit_kinds_map_to_acp_stop_reasons() {
+        for (kind, expected) in [
+            (takka_core::events::TurnLimitKind::MaxTokens, "max_tokens"),
+            (
+                takka_core::events::TurnLimitKind::MaxTurnRequests,
+                "max_turn_requests",
+            ),
+        ] {
+            let (acp, _probe) =
+                TestAcp::spawn_with_fake(DEFAULT_MAX_SESSIONS, d12_fake_engine(Some(kind)));
+            let session = new_session(&acp, 1);
+            send_prompt(&acp, 2, &session, text_prompt("go"));
+            let response = acp.response(2);
+            assert_eq!(
+                response["result"]["stopReason"],
+                serde_json::json!(expected),
+                "limit {kind:?} must surface as stopReason {expected}, got {response}"
+            );
+            acp.close_and_join();
+        }
+    }
+
+    /// D12 negative: a turn with no limit event still ends `end_turn` — the
+    /// mapping must not invent a limit where none was reported.
+    #[test]
+    fn turn_without_a_limit_event_is_end_turn() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(DEFAULT_MAX_SESSIONS, d12_fake_engine(None));
+        let session = new_session(&acp, 1);
+        send_prompt(&acp, 2, &session, text_prompt("go"));
+        let response = acp.response(2);
+        assert_eq!(
+            response["result"]["stopReason"],
+            serde_json::json!("end_turn"),
+            "{response}"
+        );
+        acp.close_and_join();
     }
 
     // ------------------------------------------------------------------
