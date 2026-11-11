@@ -629,6 +629,13 @@ mod tests {
             loop {
                 match UnixStream::connect(socket_path) {
                     Ok(stream) => {
+                        // Set the read bound ONCE: every wait in this
+                        // helper is covered by it, and repeating
+                        // SO_RCVTIMEO mid-test is a platform quirk magnet
+                        // (macOS returned EINVAL for an in-test value).
+                        stream
+                            .set_read_timeout(Some(POLL_TIMEOUT))
+                            .expect("set read timeout at connect");
                         let reader = BufReader::new(stream.try_clone().expect("clone reader half"));
                         let sock = stream.try_clone().expect("clone timeout handle");
                         return Self {
@@ -652,10 +659,6 @@ mod tests {
         }
 
         fn next_event(&mut self, deadline: Instant) -> ProtocolEvent {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            self.sock
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
-                .expect("set read timeout");
             loop {
                 let mut line = String::new();
                 match self.reader.read_line(&mut line) {
@@ -669,7 +672,7 @@ mod tests {
                         if error.kind() == std::io::ErrorKind::WouldBlock
                             || error.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        panic!("timed out waiting for an event frame")
+                        panic!("timed out waiting for an event frame (deadline {deadline:?})")
                     }
                     Err(error) => panic!("read event frame failed: {error}"),
                 }
@@ -704,10 +707,6 @@ mod tests {
         }
 
         fn expect_eof(&mut self, deadline: Instant) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            self.sock
-                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
-                .expect("set read timeout");
             let mut line = String::new();
             match self.reader.read_line(&mut line) {
                 Ok(0) => {}
@@ -716,7 +715,7 @@ mod tests {
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || error.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    panic!("timed out waiting for EOF")
+                    panic!("timed out waiting for EOF (deadline {deadline:?})")
                 }
                 // Closing a socket that still holds unread input (our
                 // init frame was never read by the refusing daemon)
