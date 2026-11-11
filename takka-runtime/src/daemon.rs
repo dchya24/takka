@@ -619,7 +619,6 @@ mod tests {
     /// public `UnixSocketTransport` has no event-reading API and its
     /// line reader lives in another crate — this is the same framing).
     struct TestConn {
-        sock: UnixStream,
         reader: BufReader<UnixStream>,
         writer: BufWriter<UnixStream>,
     }
@@ -637,9 +636,7 @@ mod tests {
                             .set_read_timeout(Some(POLL_TIMEOUT))
                             .expect("set read timeout at connect");
                         let reader = BufReader::new(stream.try_clone().expect("clone reader half"));
-                        let sock = stream.try_clone().expect("clone timeout handle");
                         return Self {
-                            sock,
                             reader,
                             writer: BufWriter::new(stream),
                         };
