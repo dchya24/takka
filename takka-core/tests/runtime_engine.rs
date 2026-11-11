@@ -358,6 +358,97 @@ fn skill_activate_without_index_answers_negative() {
     assert!(message.unwrap().contains("no skills discovered"));
 }
 
+/// Regression for issue #4: the approval gate must install its reply
+/// channel BEFORE it announces `PlanApprovalRequest`.
+///
+/// With the inverted order, a frontend that answers the instant it sees
+/// the request could reach the engine while no sender was installed: the
+/// answer was dropped as "no confirmation response is pending" and the
+/// planner then blocked on a reply that had already arrived — a run that
+/// emits nothing at all until the caller's deadline (observed as a 10s
+/// `recv_until` timeout on CI).
+///
+/// The inversion cannot be forced from outside (it needs the planner
+/// thread to lose the CPU between two adjacent statements), so this
+/// hammers the immediate-answer path and asserts the observable
+/// invariant: the answer is never reported as unclaimed.
+#[test]
+fn plan_approval_answered_immediately_is_never_lost() {
+    for attempt in 0..25 {
+        let provider = support::ScriptedProvider::new(vec![
+            support::text_response(r#"[{"description": "Step A"}]"#),
+            support::text_response("executed"),
+        ]);
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut engine = RuntimeEngine::with_provider(
+            MemoryTransport::new(request_rx, event_tx),
+            std::sync::Arc::new(provider),
+        )
+        .with_capabilities(ConnectionCapabilities {
+            experimental_api: true,
+            opt_out_notify: vec![],
+        });
+        let worker = std::thread::spawn(move || engine.run());
+
+        request_tx
+            .send(ProtocolRequest::new(
+                "plan-1",
+                Request::Plan {
+                    goal: "do the thing".into(),
+                    require_approval: true,
+                },
+            ))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut answered = false;
+        let mut done = false;
+        let mut unclaimed = false;
+        while !done {
+            let event = recv_until(&event_rx, deadline);
+            if event.request_id.as_deref() != Some("plan-1") {
+                continue;
+            }
+            match &event.event {
+                // Answer the gate on sight: the fastest possible client.
+                Event::PlanApprovalRequest { .. } if !answered => {
+                    answered = true;
+                    request_tx
+                        .send(ProtocolRequest::new(
+                            "confirm-1",
+                            Request::ConfirmResponse {
+                                request_id: Some("plan-1".into()),
+                                approved: true,
+                            },
+                        ))
+                        .unwrap();
+                }
+                Event::Warning { message }
+                    if message.contains("no confirmation response is pending") =>
+                {
+                    unclaimed = true;
+                }
+                Event::Error { message } => panic!("attempt {attempt}: plan error: {message}"),
+                Event::Done { .. } => done = true,
+                _ => {}
+            }
+        }
+        assert!(
+            answered,
+            "attempt {attempt}: the approval gate never opened"
+        );
+        assert!(
+            !unclaimed,
+            "attempt {attempt}: the immediate approval answer was dropped — \
+             the reply channel is installed after the gate is announced"
+        );
+
+        drop(request_tx);
+        worker.join().unwrap();
+    }
+}
+
 /// `Request::Plan` full cycle: LLM plan creation → approval gate
 /// (PlanApprovalRequest answered via ConfirmResponse) → execution →
 /// Done, with planner lifecycle events streaming in between.
