@@ -4,6 +4,8 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::safety::PermissionMode;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -265,6 +267,33 @@ pub enum Event {
     #[serde(rename = "session_adopted")]
     #[serde(rename_all = "camelCase")]
     SessionAdopted { session_id: Option<String> },
+
+    // ------------------------------------------------------------------
+    // ACP Fase 4 (D12 / D9). Additive: no protocol bump — same precedent
+    // as `Usage` and `SessionAdopted` above.
+    // ------------------------------------------------------------------
+    /// Emitted right before a turn ends because a limit was reached, so
+    /// frontends can report the real cause instead of a plain end-of-turn.
+    /// ACP maps it to `stopReason: max_tokens` / `max_turn_requests`.
+    #[serde(rename = "turn_limit_exceeded")]
+    TurnLimitExceeded { kind: TurnLimitKind },
+
+    /// Ack of `Request::SetPermissionMode` (ACP `session/set_mode`, D9):
+    /// the session now runs in `mode`. Takes effect at the next turn
+    /// boundary (safety is checked per boundary).
+    #[serde(rename = "permission_mode_changed")]
+    PermissionModeChanged { mode: PermissionMode },
+}
+
+/// Which limit ended the turn (payload of [`Event::TurnLimitExceeded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnLimitKind {
+    /// The provider stopped the response at its output-token cap.
+    MaxTokens,
+    /// The agent loop hit `max_iterations`: one user turn is bounded to N
+    /// agent requests between user turns.
+    MaxTurnRequests,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,6 +361,8 @@ pub enum EventType {
     SteerQueued,
     Steered,
     SessionAdopted,
+    TurnLimitExceeded,
+    PermissionModeChanged,
 }
 
 impl Event {
@@ -377,6 +408,8 @@ impl Event {
             Event::SteerQueued { .. } => EventType::SteerQueued,
             Event::Steered { .. } => EventType::Steered,
             Event::SessionAdopted { .. } => EventType::SessionAdopted,
+            Event::TurnLimitExceeded { .. } => EventType::TurnLimitExceeded,
+            Event::PermissionModeChanged { .. } => EventType::PermissionModeChanged,
         }
     }
 }
@@ -584,5 +617,44 @@ mod tests {
         assert_eq!(json["type"], "session_adopted");
         let parsed: Event = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.event_type(), EventType::SessionAdopted);
+    }
+
+    #[test]
+    fn turn_limit_exceeded_serializes_with_wire_tag() {
+        // D12: both limit kinds must round-trip with the stable
+        // snake_case tag `turn_limit_exceeded` so non-Rust frontends
+        // (TUI/kanban/ACP) can consume the stream. The kind itself uses
+        // its snake_case wire spelling (`max_tokens` /
+        // `max_turn_requests`).
+        for (kind, wire) in [
+            (TurnLimitKind::MaxTokens, "max_tokens"),
+            (TurnLimitKind::MaxTurnRequests, "max_turn_requests"),
+        ] {
+            let event = Event::TurnLimitExceeded { kind };
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["type"], "turn_limit_exceeded");
+            assert_eq!(json["kind"], wire);
+            let parsed: Event = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.event_type(), EventType::TurnLimitExceeded);
+        }
+    }
+
+    #[test]
+    fn permission_mode_changed_serializes_with_wire_tag() {
+        // D9: mode switches must round-trip with the stable snake_case
+        // tag `permission_mode_changed` and the lowercase mode wire form
+        // (`default` / `plan` / `yolo`).
+        for (mode, wire) in [
+            (PermissionMode::Default, "default"),
+            (PermissionMode::Plan, "plan"),
+            (PermissionMode::Yolo, "yolo"),
+        ] {
+            let event = Event::PermissionModeChanged { mode };
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(json["type"], "permission_mode_changed");
+            assert_eq!(json["mode"], wire);
+            let parsed: Event = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.event_type(), EventType::PermissionModeChanged);
+        }
     }
 }

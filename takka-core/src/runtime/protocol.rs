@@ -96,6 +96,13 @@ pub enum Request {
     SearchMemory {
         query: String,
     },
+    /// Switch the running session's permission mode (ACP `session/set_mode`,
+    /// design D9). Additive: no protocol bump. The engine acks with
+    /// `Event::PermissionModeChanged`; safety checks run per boundary, so the
+    /// new mode governs the next turn.
+    SetPermissionMode {
+        mode: PermissionMode,
+    },
     /// Ask the daemon for its registered tool set (for `/tools`).
     ListTools,
     /// Activate a skill in the daemon's orchestrator (for `/skill`).
@@ -279,5 +286,27 @@ mod tests {
             experimental_api: true,
             opt_out_notify: vec![NotificationKind::Thinking],
         }));
+    }
+
+    #[test]
+    fn set_permission_mode_serializes_with_snake_case_tag_and_lowercase_mode() {
+        // D9 additive request: wire shape
+        // {"type":"set_permission_mode","mode":"plan"} — mode pakai
+        // bentuk lowercase dari `PermissionMode` (bukan default). Frame
+        // harus round-trip.
+        let req = ProtocolRequest::new(
+            "s1",
+            Request::SetPermissionMode {
+                mode: PermissionMode::Plan,
+            },
+        );
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["type"], "set_permission_mode");
+        assert_eq!(value["mode"], "plan");
+        let parsed: ProtocolRequest = serde_json::from_value(value).unwrap();
+        match parsed.request {
+            Request::SetPermissionMode { mode } => assert_eq!(mode, PermissionMode::Plan),
+            other => panic!("expected SetPermissionMode, got {other:?}"),
+        }
     }
 }

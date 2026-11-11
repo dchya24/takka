@@ -193,6 +193,10 @@ impl Orchestrator {
                     content_len = content.len(),
                     "Forced finalization at max_iterations"
                 );
+                // D12: the loop cap ended this turn - say so before the terminator.
+                self.events.emit(crate::events::Event::TurnLimitExceeded {
+                    kind: crate::events::TurnLimitKind::MaxTurnRequests,
+                });
                 self.clear_loop_detection();
                 self.memory
                     .lock()
@@ -256,6 +260,14 @@ impl Orchestrator {
                 // No tool calls - model produced a final answer
                 // Clear loop detection history for the next user turn
                 self.clear_loop_detection();
+
+                // D12: a provider that stopped at its output-token cap is a
+                // token limit, not a natural end of turn.
+                if is_token_truncated(response.finish_reason.as_deref()) {
+                    self.events.emit(crate::events::Event::TurnLimitExceeded {
+                        kind: crate::events::TurnLimitKind::MaxTokens,
+                    });
+                }
 
                 self.memory
                     .lock()
@@ -418,6 +430,9 @@ impl Orchestrator {
             // Providers report usage on the final chunk only (and not all of
             // them do) — remember the last non-empty report of this call.
             let mut stream_usage: Option<crate::providers::ChatUsage> = None;
+            // D12: the final chunk of a stream carries the provider's stop
+            // reason; remember it so a token-cap stop can be reported.
+            let mut stream_finish_reason: Option<String> = None;
 
             match self.provider.chat_stream(request) {
                 Ok(mut stream) => {
@@ -433,6 +448,9 @@ impl Orchestrator {
                                 }
                                 if chunk.usage.is_some() {
                                     stream_usage = chunk.usage.clone();
+                                }
+                                if chunk.finish_reason.is_some() {
+                                    stream_finish_reason = chunk.finish_reason.clone();
                                 }
                                 for tc in chunk.tool_calls {
                                     let entry =
@@ -497,6 +515,10 @@ impl Orchestrator {
                     content_len = content_buf.len(),
                     "Forced finalization at max_iterations (stream)"
                 );
+                // D12: the loop cap ended this turn - say so before the terminator.
+                self.events.emit(crate::events::Event::TurnLimitExceeded {
+                    kind: crate::events::TurnLimitKind::MaxTurnRequests,
+                });
                 self.clear_loop_detection();
                 self.memory
                     .lock()
@@ -547,6 +569,14 @@ impl Orchestrator {
             // No tool calls - model produced a final answer
             // Clear loop detection history for the next user turn
             self.clear_loop_detection();
+
+            // D12: a provider that stopped at its output-token cap is a
+            // token limit, not a natural end of turn.
+            if is_token_truncated(stream_finish_reason.as_deref()) {
+                self.events.emit(crate::events::Event::TurnLimitExceeded {
+                    kind: crate::events::TurnLimitKind::MaxTokens,
+                });
+            }
 
             self.memory
                 .lock()
@@ -743,5 +773,45 @@ impl Orchestrator {
              no longer call tools. Using only what you have already learned, \
              provide your best final answer to the user now.",
         )
+    }
+}
+
+/// Does the provider's stop reason mean "cut off at the output-token cap"?
+///
+/// D12 (ACP Fase 4): such a stop is a turn limit, not a natural end of turn,
+/// so the loop announces it via `Event::TurnLimitExceeded`. Providers spell
+/// it differently - OpenAI `length`, Anthropic `max_tokens`, Google
+/// `MAX_TOKENS` / `max_output_tokens` - hence the case-insensitive compare.
+fn is_token_truncated(finish_reason: Option<&str>) -> bool {
+    match finish_reason.map(str::to_ascii_lowercase) {
+        Some(reason) => matches!(
+            reason.as_str(),
+            "length" | "max_tokens" | "max_output_tokens"
+        ),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_token_truncated;
+
+    #[test]
+    fn token_truncation_matches_all_provider_spellings() {
+        // OpenAI uses `length`, Anthropic `max_tokens`, Google
+        // `MAX_TOKENS` - all three must be recognized as a token-cap stop
+        // (case-insensitive).
+        assert!(is_token_truncated(Some("length")));
+        assert!(is_token_truncated(Some("max_tokens")));
+        assert!(is_token_truncated(Some("MAX_TOKENS")));
+        assert!(is_token_truncated(Some("max_output_tokens")));
+    }
+
+    #[test]
+    fn natural_stops_are_not_token_truncation() {
+        assert!(!is_token_truncated(Some("stop")));
+        assert!(!is_token_truncated(Some("end_turn")));
+        assert!(!is_token_truncated(Some("tool_calls")));
+        assert!(!is_token_truncated(None));
     }
 }

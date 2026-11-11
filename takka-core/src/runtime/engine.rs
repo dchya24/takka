@@ -459,6 +459,23 @@ impl<T: Transport> RuntimeEngine<T> {
                     self.handle_plan(request.id, goal, require_approval);
                 }
                 Request::Shutdown => break,
+                // ACP `session/set_mode` (D9): switch the permission mode of
+                // the running session. Safety is consulted per boundary, so
+                // the new mode governs the next turn.
+                Request::SetPermissionMode { mode } => {
+                    if let Some(orchestrator) = self.orchestrator.as_ref() {
+                        orchestrator.set_permission_mode(mode);
+                        self.current_overrides.permission_mode = Some(mode);
+                        self.emit(Some(request.id), Event::PermissionModeChanged { mode });
+                    } else {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                    }
+                }
                 Request::QuestionResponse { answers, .. } => {
                     if let Some(sender) = self.pending_question.lock().unwrap().take() {
                         let _ = sender.send(answers);
