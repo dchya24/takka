@@ -767,6 +767,20 @@ impl<T: Transport> RuntimeEngine<T> {
                             description: step.description.clone(),
                         })
                         .collect();
+                    // Install the reply channel BEFORE announcing the
+                    // gate. The frontend answers as soon as it sees
+                    // `PlanApprovalRequest`, and the engine thread
+                    // forwards `ConfirmResponse` into whatever sender is
+                    // installed at that instant. Announcing first left a
+                    // window where a fast reply found no sender, was
+                    // dropped as "no confirmation response is pending",
+                    // and the planner then waited for an answer that had
+                    // already arrived (issue #4: a run that wedges until
+                    // the test deadline with no events). Same order as
+                    // `install_confirmation_handler` and the question
+                    // handler.
+                    let (sender, receiver) = mpsc::channel();
+                    *pending.lock().unwrap() = Some(sender);
                     sink.send(
                         current_request_id.lock().unwrap().clone(),
                         Event::PlanApprovalRequest {
@@ -775,8 +789,6 @@ impl<T: Transport> RuntimeEngine<T> {
                             steps,
                         },
                     );
-                    let (sender, receiver) = mpsc::channel();
-                    *pending.lock().unwrap() = Some(sender);
                     receiver.recv().unwrap_or(false)
                 });
             }
