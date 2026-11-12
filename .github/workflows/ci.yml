@@ -46,6 +46,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets
 
+  # T-08 (ACP design spec §6): CI sanity for the ACP adapter — the
+  # hermetic 14-check conformance run over `takka-runtime --acp` on the
+  # POSIX runners. Windows compilation ("no new cfg faces") stays
+  # covered by the `test` matrix above; the script's FIFO transport is
+  # POSIX-only by design.
+  acp-conformance:
+    name: ACP conformance
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/acp-conformance.sh
+
   installers:
     name: Installer scripts
     strategy:
