@@ -401,12 +401,12 @@ fn plan_approval_answered_immediately_is_never_lost() {
             ))
             .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let quiet = std::time::Duration::from_secs(10);
         let mut answered = false;
         let mut done = false;
         let mut unclaimed = false;
         while !done {
-            let event = recv_until(&event_rx, deadline);
+            let event = recv_until(&event_rx, quiet);
             if event.request_id.as_deref() != Some("plan-1") {
                 continue;
             }
@@ -488,9 +488,9 @@ fn plan_request_runs_creation_approval_and_execution() {
     // bounded: an engine wedge must fail fast with context, never hang the
     // suite (Windows CI burned a 6-hour job timeout on an unbounded wait
     // right here).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let quiet = std::time::Duration::from_secs(10);
     let approval: Option<(String, Vec<PlanStepInfo>)> = loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         if event.request_id.as_deref() == Some("plan-1") {
             match &event.event {
                 Event::PlanApprovalRequest { plan_id, steps, .. } => {
@@ -516,7 +516,7 @@ fn plan_request_runs_creation_approval_and_execution() {
     let mut done = false;
     let mut saw_progress = false;
     while !done {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         if event.request_id.as_deref() != Some("plan-1") {
             continue;
         }
@@ -831,16 +831,18 @@ fn golden_event_stream_text_only_run() {
 
 // ── Steering (Fase 2b, Task 2): Request::Steer + engine queue ───────
 
-/// Hard-deadline event read: test tidak pernah menggantung — setiap
-/// baca dibatasi waktu, deadline lewat = panic dengan konteks.
+/// Quiet-window event read (issue #4): test tidak pernah menggantung,
+/// dan deadline-nya berbasis aktivitas — setiap pemanggilan menunggu
+/// satu event sampai `quiet` berlalu tanpa event. Run yang tetap
+/// memancarkan event di runner yang sibuk tidak akan gagal; hanya
+/// aliran yang benar-benar diam yang panic, dengan konteks.
 fn recv_until(
     event_rx: &std::sync::mpsc::Receiver<ProtocolEvent>,
-    deadline: std::time::Instant,
+    quiet: std::time::Duration,
 ) -> ProtocolEvent {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    event_rx
-        .recv_timeout(remaining)
-        .expect("event stream must produce events before the deadline")
+    event_rx.recv_timeout(quiet).unwrap_or_else(|err| {
+        panic!("event stream stalled: no event for {quiet:?} ({err})")
+    })
 }
 
 const STEER_TEXT: &str = "use the lake theme instead";
@@ -881,11 +883,11 @@ fn steer_during_run_injects_at_next_boundary() {
         ))
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let quiet = std::time::Duration::from_secs(10);
 
     // Tunggu sampai run terbukti in-flight: ToolStarted terlihat.
     loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         match event.event {
             Event::ToolStarted { .. } => break,
             Event::Done { .. } | Event::Error { .. } => {
@@ -911,7 +913,7 @@ fn steer_during_run_injects_at_next_boundary() {
     let mut steer_queued_ids = Vec::new();
     let mut steered = Vec::new();
     loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         match &event.event {
             Event::SteerQueued { content } => {
                 assert_eq!(content, STEER_TEXT);
@@ -1068,9 +1070,9 @@ fn steers_consume_fifo_order() {
         ))
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let quiet = std::time::Duration::from_secs(10);
     loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         match event.event {
             Event::ToolStarted { .. } => break,
             Event::Done { .. } | Event::Error { .. } => {
@@ -1097,7 +1099,7 @@ fn steers_consume_fifo_order() {
     let mut queued = Vec::new();
     let mut steered_contents = Vec::new();
     loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         match &event.event {
             Event::SteerQueued { content } => {
                 queued.push((event.request_id.clone().unwrap(), content.clone()));
@@ -1160,10 +1162,10 @@ fn steer_during_pending_confirmation_gate_is_queued_and_consumed_after_gate() {
         ))
         .unwrap();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let quiet = std::time::Duration::from_secs(10);
     // Tunggu gate terbuka — run thread memblokir menunggu approval.
     loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         match event.event {
             Event::ConfirmationRequest { .. } => break,
             Event::Done { .. } | Event::Error { .. } => panic!(
@@ -1197,7 +1199,7 @@ fn steer_during_pending_confirmation_gate_is_queued_and_consumed_after_gate() {
     let mut saw_queued = false;
     let mut steered = Vec::new();
     loop {
-        let event = recv_until(&event_rx, deadline);
+        let event = recv_until(&event_rx, quiet);
         match &event.event {
             Event::SteerQueued { content } => {
                 assert_eq!(content, "steer at the gate");
@@ -1456,10 +1458,10 @@ fn non_daemon_engine_ignores_init_token() {
         .unwrap();
     drop(request_tx);
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let ready = recv_until(&event_rx, deadline);
+    let quiet = std::time::Duration::from_secs(2);
+    let ready = recv_until(&event_rx, quiet);
     assert!(matches!(ready.event, Event::Ready { .. }));
-    let event = recv_until(&event_rx, deadline);
+    let event = recv_until(&event_rx, quiet);
     match &event.event {
         Event::InitOk { .. } => {}
         other => panic!("expected InitOk on non-daemon engine, got {other:?}"),
@@ -1495,10 +1497,10 @@ fn daemon_wrong_token_is_unauthorized_before_adopt_branch() {
         .unwrap();
     drop(request_tx);
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let ready = recv_until(&event_rx, deadline);
+    let quiet = std::time::Duration::from_secs(2);
+    let ready = recv_until(&event_rx, quiet);
     assert!(matches!(ready.event, Event::Ready { .. }));
-    let event = recv_until(&event_rx, deadline);
+    let event = recv_until(&event_rx, quiet);
     match &event.event {
         Event::Error { message } => assert_eq!(message, "unauthorized"),
         other => panic!("expected unauthorized error before adopt branch, got {other:?}"),
