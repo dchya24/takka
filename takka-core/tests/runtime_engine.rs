@@ -840,9 +840,9 @@ fn recv_until(
     event_rx: &std::sync::mpsc::Receiver<ProtocolEvent>,
     quiet: std::time::Duration,
 ) -> ProtocolEvent {
-    event_rx.recv_timeout(quiet).unwrap_or_else(|err| {
-        panic!("event stream stalled: no event for {quiet:?} ({err})")
-    })
+    event_rx
+        .recv_timeout(quiet)
+        .unwrap_or_else(|err| panic!("event stream stalled: no event for {quiet:?} ({err})"))
 }
 
 const STEER_TEXT: &str = "use the lake theme instead";
