@@ -796,21 +796,29 @@ mod tests {
     /// Save HOME/USERPROFILE and restore them on drop. Every test that
     /// mutates HOME must hold one of these (which also locks the shared
     /// ENV_LOCK) so no test leaks a HOME-less process state to the next
-    /// test.
+    /// test. The lock is held internally and declared LAST so its guard
+    /// drops after the env restore (env must never be mutated while the
+    /// lock is already released).
     struct HomeGuard {
         home: Option<std::ffi::OsString>,
         #[cfg(windows)]
         userprofile: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl HomeGuard {
-        fn hold() -> (Self, std::sync::MutexGuard<'static, ()>) {
-            let guard = Self {
+        fn hold() -> Self {
+            Self {
                 home: std::env::var_os("HOME"),
                 #[cfg(windows)]
                 userprofile: std::env::var_os("USERPROFILE"),
-            };
-            (guard, crate::test_env_lock::ENV_LOCK.lock().unwrap())
+                // unwrap_or_else: one env test's failure poisons the shared
+                // mutex; later tests must still serialize instead of
+                // cascading PoisonErrors (issue #4).
+                _lock: crate::test_env_lock::ENV_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            }
         }
     }
 
@@ -847,7 +855,7 @@ mod tests {
 
     #[test]
     fn config_dir_points_at_takka_under_home() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         let home = temp_home("dirs");
         set_home(&home);
         assert_eq!(
@@ -870,7 +878,7 @@ mod tests {
 
     #[test]
     fn load_falls_back_to_legacy_config() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         let home = temp_home("fallback");
         let legacy = home.join(".config").join("agentic");
         write_provider_config(&legacy, "legacy");
@@ -894,7 +902,7 @@ mod tests {
 
     #[test]
     fn load_prefers_new_config_over_legacy() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         let home = temp_home("prefer_new");
         let new = home.join(".config").join("takka");
         let legacy = home.join(".config").join("agentic");
@@ -910,7 +918,7 @@ mod tests {
 
     #[test]
     fn effective_config_path_is_new_when_nothing_exists() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         let home = temp_home("fresh");
         set_home(&home);
         let (path, is_legacy) = Config::effective_config_path();
@@ -920,7 +928,7 @@ mod tests {
 
     #[test]
     fn sessions_dir_falls_back_to_legacy_sessions() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         let home = temp_home("sessions");
 
         // Neither exists → new dir is the answer (fresh layout).
@@ -943,7 +951,7 @@ mod tests {
 
     #[test]
     fn resolve_env_prefers_new_name() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         std::env::set_var("TAKKA_TEST_PRIMARY", "new-value");
         std::env::set_var("TAKKA_TEST_LEGACY", "legacy-value");
         let (value, warned) = resolve_env("TAKKA_TEST_PRIMARY", "TAKKA_TEST_LEGACY");
@@ -955,7 +963,7 @@ mod tests {
 
     #[test]
     fn resolve_env_falls_back_to_legacy_with_warned_flag() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         std::env::remove_var("TAKKA_TEST_PRIMARY");
         std::env::set_var("TAKKA_TEST_LEGACY", "legacy-value");
         let (value, warned) = resolve_env("TAKKA_TEST_PRIMARY", "TAKKA_TEST_LEGACY");
@@ -966,7 +974,7 @@ mod tests {
 
     #[test]
     fn resolve_env_none_when_both_unset() {
-        let (_home, _g) = HomeGuard::hold();
+        let _home = HomeGuard::hold();
         std::env::remove_var("TAKKA_TEST_PRIMARY");
         std::env::remove_var("TAKKA_TEST_LEGACY");
         let (value, warned) = resolve_env("TAKKA_TEST_PRIMARY", "TAKKA_TEST_LEGACY");

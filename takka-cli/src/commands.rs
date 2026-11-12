@@ -6638,23 +6638,34 @@ mod e2e_tests {
         needle: &str,
         count: usize,
     ) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Issue #4: a wall-clock deadline from test start fails on busy
+        // runners even while the run is making progress. Deadline resets
+        // on every new matching event; only a quiet window with no
+        // progress fails, with the last count in the message.
+        let quiet = std::time::Duration::from_secs(10);
+        let mut saw = 0;
+        let mut deadline = std::time::Instant::now() + quiet;
         loop {
-            let saw = tap
+            let now_saw = tap
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|e| e.contains(needle))
                 .count();
-            if saw >= count {
+            if now_saw >= count {
                 return;
             }
             // Checked after the satisfied condition: a starved poll thread
             // that woke up past the deadline with the condition already
             // met must not fail spuriously (story 1.4 review).
+            if now_saw > saw {
+                // Progress: grant a fresh quiet window.
+                saw = now_saw;
+                deadline = std::time::Instant::now() + quiet;
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "event tap never saw {count}× {needle}"
+                "event tap stalled: saw {saw}/{count}× {needle} with no new events for {quiet:?}"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -7620,7 +7631,9 @@ mod daemon_smoke_tests {
                 // Same lock as client.rs's env-compat tests: a transient
                 // TAKKA_/AGENTIC_RUNTIME_BIN value must never leak into
                 // the runtime binary resolution here.
-                let _g = crate::client::daemon_info_tests::ENV_LOCK.lock().unwrap();
+                let _g = crate::client::daemon_info_tests::ENV_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 crate::client::runtime_binary().expect("runtime binary for daemon smoke")
             };
             let mut child = tokio::process::Command::new(&binary)

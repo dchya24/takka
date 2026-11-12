@@ -192,7 +192,12 @@ mod tests {
     /// (`TAKKA_MEMORY_PATH`, `HOME`, etc), so they hold the crate-wide
     /// env lock to stay serialized against other env-sensitive tests.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::test_env_lock::ENV_LOCK.lock().unwrap()
+        // unwrap_or_else: a panicking test poisons the shared mutex; later
+        // tests must still serialize instead of cascading PoisonErrors
+        // (issue #4).
+        crate::test_env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     fn tmp_dir(name: &str) -> PathBuf {

@@ -605,12 +605,15 @@ description: Just enough
     /// while holding the crate-wide ENV_LOCK so parallel tests that
     /// mutate env don't race. Mirrors `config.rs` `HomeGuard`.
     struct HomeEnvGuard {
-        /// Held for the whole test body; released after `drop` restores env.
-        _lock: std::sync::MutexGuard<'static, ()>,
         home: Option<std::ffi::OsString>,
         #[cfg(windows)]
         userprofile: Option<std::ffi::OsString>,
         xdg_config_home: Option<std::ffi::OsString>,
+        /// Held for the whole test body; declared LAST so this field's
+        /// guard drops after `drop` restores env (fields drop in
+        /// declaration order — lock must release only after the env
+        /// restore, issue #4).
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl HomeEnvGuard {
