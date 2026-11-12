@@ -7620,7 +7620,9 @@ mod daemon_smoke_tests {
                 // Same lock as client.rs's env-compat tests: a transient
                 // TAKKA_/AGENTIC_RUNTIME_BIN value must never leak into
                 // the runtime binary resolution here.
-                let _g = crate::client::daemon_info_tests::ENV_LOCK.lock().unwrap();
+                let _g = crate::client::daemon_info_tests::ENV_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
                 crate::client::runtime_binary().expect("runtime binary for daemon smoke")
             };
             let mut child = tokio::process::Command::new(&binary)

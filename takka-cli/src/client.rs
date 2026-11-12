@@ -1310,7 +1310,7 @@ pub(crate) mod daemon_info_tests {
     /// wins when both are set (the legacy name must never shadow it).
     #[test]
     fn runtime_binary_env_prefers_takka_name() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("TAKKA_RUNTIME_BIN", "/tmp/takka-runtime-new");
         std::env::set_var("AGENTIC_RUNTIME_BIN", "/tmp/takka-runtime-legacy");
         assert_eq!(
@@ -1326,7 +1326,7 @@ pub(crate) mod daemon_info_tests {
     /// warning emitted by `runtime_binary`).
     #[test]
     fn runtime_binary_env_falls_back_to_agentic_name() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("TAKKA_RUNTIME_BIN");
         std::env::set_var("AGENTIC_RUNTIME_BIN", "/tmp/takka-runtime-legacy");
         assert_eq!(
