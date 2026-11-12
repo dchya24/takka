@@ -1,6 +1,8 @@
 # Steer & Queue (Fase 2b) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Agent bisa "dibimbing" mid-run — `Request::Steer` di engine (injeksi user message di iteration boundary, drain FIFO, gate-safe) + client-side `QueueMode` (`interrupt` via steer, `follow-up` via antrian lokal client yang mengirim `Run` berikutnya sendiri) + `AgentConnection::steer()` fire-and-forget + flag `--queue-mode` + slash `/queue`.
 
@@ -50,7 +52,7 @@
   ```
   Drain dilakukan SATU KALI per boundary — source mengembalikan seluruh antrian yang siap (FIFO); orchestrator tidak mem-pesan ulang/retain.
 
-- [ ] **Step 1: Tulis test gagal (orchestrator level)**
+- [x] **Step 1: Tulis test gagal (orchestrator level)**
 
 Kebutuhan test: provider ter-script yang MENGHARUSKAN satu tool call terlebih dahulu, lalu satu jawaban final — supaya run tak selesai di iterasi pertama dan ada boundary kedua untuk injeksi. Gunakan pola `support::ScriptedProvider` + `support::tool_call_response` dari `core-agentic/tests/support/` dan pola test yang ada di `orchestrator_loop.rs`. Tambahkan di `core-agentic/tests/orchestrator_loop.rs` (ikuti import yang ada):
 
@@ -109,12 +111,12 @@ fn run_without_steering_source_has_no_Steered_events() {
 }
 ```
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p core-agentic --test orchestrator_loop`
 Expected: COMPILE ERROR — `set_steering_source` / `Event::Steered` belum ada.
 
-- [ ] **Step 3: Implementasi (event + hook + poll)**
+- [x] **Step 3: Implementasi (event + hook + poll)**
 
 1. `events.rs`: tambahkan dua varian ke `Event` (letakkan dekat grup lifecycle events):
 ```rust
@@ -129,12 +131,12 @@ Expected: COMPILE ERROR — `set_steering_source` / `Event::Steered` belum ada.
    - Field: `steering_source: Option<Box<dyn Fn() -> Vec<String> + Send + Sync>>` + `set_steering_source` setter (pola setter lain).
    - Run-loop poll: di guard cluster cancel/pause (temukan dengan grep) — SEBELUM call model berikutnya; drain SATU kali; untuk tiap teks: add user message (pakai API memory yang ada) + emit `Steered`.
 
-- [ ] **Step 4: Jalankan test → verify pass + workspace green**
+- [x] **Step 4: Jalankan test → verify pass + workspace green**
 
 Run: `cargo test -p core-agentic` lalu `cargo build --workspace && cargo test -p agentic-cli`
 Expected: semua pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/events.rs core-agentic/src/orchestrator core-agentic/tests
@@ -156,7 +158,7 @@ git commit -m "feat(core): steering source hook + Steered event at iteration bou
   - `Request::Steer { content: String }` — engine arm mengirim SteerQueued reply + error strict.
   - Engine otomatis menghubungkan antrian ke orchestrator pada semua constructor yang membuat orchestrator (`initialize`, `with_provider`, `with_session`): closure source drain dari `steer_queue` engine; satu `Arc` queue digunakan bersama.
 
-- [ ] **Step 1: Tulis test gagal di `runtime_engine.rs`**
+- [x] **Step 1: Tulis test gagal di `runtime_engine.rs`**
 
 Skenario utama (end-to-end engine, run + steer + boundary):
 
@@ -209,12 +211,12 @@ fn steer_when_no_run_active_is_rejected() {
 fn steers_consume_fifo_order() { /* 3 steer saat boundary → Steered berurutan a,b,c */ }
 ```
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p core-agentic --test runtime_engine`
 Expected: COMPILE ERROR — `Request::Steer` tidak ada.
 
-- [ ] **Step 3: Implementasi**
+- [x] **Step 3: Implementasi**
 
 1. `protocol.rs` — variant baru:
 ```rust
@@ -255,12 +257,12 @@ Expected: COMPILE ERROR — `Request::Steer` tidak ada.
 
 3. Catat: string error persis mengikuti Global Constraints; allowlist `NotificationKind` TIDAK ditambah.
 
-- [ ] **Step 4: Jalankan test → verify pass 2 kali (workspace)**
+- [x] **Step 4: Jalankan test → verify pass 2 kali (workspace)**
 
 Run: `cargo test -p core-agentic` lalu `cargo build --workspace && cargo test -p agentic-cli`
 Expected: semua pass; smoke CLI matriks (embedded+spawned) tetap hijau.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/runtime core-agentic/tests/runtime_engine.rs
@@ -286,7 +288,7 @@ git commit -m "feat(runtime): Request::Steer with engine queue, SteerQueued repl
   - `Commands::with_queue_mode(...)`, `Commands::queue_mode_getter`; state `pending_follow_ups: VecDeque<String>`
   - Slash: `/queue` (tampilkan mode + isi antrian), `/queue interrupt` / `/queue follow-up` (ganti mode; isi antrian tampil) — pola handler slash yang ada di interactive.rs.
 
-- [ ] **Step 1: client `steer()` (TDD kecil)**
+- [x] **Step 1: client `steer()` (TDD kecil)**
 
 Test + implementasi di client.rs:
 ```rust
@@ -307,7 +309,7 @@ Test + implementasi di client.rs:
 ```
 )
 
-- [ ] **Step 2: QueueMode + follow-up queue di Commands**
+- [x] **Step 2: QueueMode + follow-up queue di Commands**
 
 1. Type + state + builder di commands.rs:
 ```rust
@@ -364,13 +366,13 @@ pub enum QueueMode {
 ```
    + `QueueModeArg` konversi; wiring di main.rs `.with_queue_mode(cli.queue_mode.into())`.
 
-- [ ] **Step 3: `/queue` slash command minimal di interactive.rs**
+- [x] **Step 3: `/queue` slash command minimal di interactive.rs**
 
 - `/queue` (tanpa arg) → tampilkan mode aktif + isi antrian (index + potongan 80 char).
 - `/queue interrupt` / `/queue follow-up` → switch mode runtime (setter di Commands) + konfirmasi single line.
 - Bangun dengan pola handler slash `/mode`/`/provider` yang sudah ada. (Input-during-run tetap out of scope: command dipanggil saat REPL idle.)
 
-- [ ] **Step 4: e2e smoke untuk flow follow-up (both transports)**
+- [x] **Step 4: e2e smoke untuk flow follow-up (both transports)**
 
 Tambah ke e2e matrix mod di commands.rs: dari runtime mode embedded/spawned × QueueMode:
 - Jalankan run pertama (mock hermetic unreachable provider → run selesai gagal dengan 1 tour).
@@ -378,12 +380,12 @@ Tambah ke e2e matrix mod di commands.rs: dari runtime mode embedded/spawned × Q
 - galat: client-issued garanti: Total request Run count == jumlah item antrian + 1.
 Dalam praktik yang dipinjamkan dari smoke e2e hermetic provider fixture yang persis (127.0.0.1:9).
 
-- [ ] **Step 5: Full test + gates**
+- [x] **Step 5: Full test + gates**
 
 Run: `cargo test --workspace`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: semua hijau.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add agentic-cli/src
@@ -399,7 +401,7 @@ git commit -m "feat(cli): QueueMode (interrupt steer / follow-up queue) + steer(
 - Modify: `docs/BENCHMARK_CODEX.md` (Fase 2b landed: item 4 antrian; Tabel "Antrian saat streaming" ✅; COMPARISON doc tak disentuh)
 - Modify: `docs/ROADMAP.md` (Fase 2b landed; berikutnya = Fase 3 daemon)
 
-- [ ] **Step 1: CHANGELOG** — di `## [Unreleased]` → `### Added`:
+- [x] **Step 1: CHANGELOG** — di `## [Unreleased]` → `### Added`:
 
 ```markdown
 - Runtime: **steer & queue** (Fase 2b) — the agent can now be steered
@@ -413,14 +415,14 @@ git commit -m "feat(cli): QueueMode (interrupt steer / follow-up queue) + steer(
   version stays 1.
 ```
 
-- [ ] **Step 2: BENCHMARK_CODEX.md** — tandai Fase 2b landed:
+- [x] **Step 2: BENCHMARK_CODEX.md** — tandai Fase 2b landed:
 
 - Judul: `### Fase 2 — Protocol hardening gaya codex ✅ (landed 2026-11)` — titip setelah Fase 2a: tambahkan sub-catatan `#### Fase 2b — Antrian steer/follow-up ✅ (landed 2026-11)` yang menjelaskan split ala pi (steer di engine, follow-up client-side).
 - Tabel: baris `Antrian saat streaming | ... | 🔜 backlogged` → `Request::Steer antrian engine + follow-up client-side | ✅ ala pi (split shell/core)`.
 
-- [ ] **Step 3: ROADMAP.md** — update open-work catatan: Fase 2b landed; berikutnya Fase 3 (daemon long-lived). Tambahkan catatan: input-during-run inline REPL (Fase UX) masih open.
+- [x] **Step 3: ROADMAP.md** — update open-work catatan: Fase 2b landed; berikutnya Fase 3 (daemon long-lived). Tambahkan catatan: input-during-run inline REPL (Fase UX) masih open.
 
-- [ ] **Step 4: Gates + full test**
+- [x] **Step 4: Gates + full test**
 
 Run:
 ```bash
@@ -430,7 +432,7 @@ cargo test --workspace
 ```
 Perbaiki sampai bersih; commit hasil (jika failing code fixes diperlukan, buat satu commit "fix: polish steering wiring" dan laporkan).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add CHANGELOG.md docs/BENCHMARK_CODEX.md docs/ROADMAP.md agentic-cli/src core-agentic/src core-agentic/tests

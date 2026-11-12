@@ -1,6 +1,8 @@
 # Protocol Hardening (Fase 2a) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Harden protokol runtime gaya codex: `Init` wajib tepat sekali dengan error semantik (`not initialized` / `already initialized`), capability negotiation di handshake (`Request::Plan` menjadi API eksperimental pertama), notification opt-out via allowlist tertutup, dan pemisahan doc-contract tipe wire vs internal — semua additive di `PROTOCOL_VERSION = 1`.
 
@@ -35,7 +37,7 @@
   - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)] #[serde(rename_all = "snake_case")] pub enum NotificationKind { Thinking, AssistantDelta, Warning, TodoChanged }`
   - `Request::Init { overrides: InitOverrides, capabilities: ConnectionCapabilities }` — dengan `#[serde(default)] capabilities`.
 
-- [ ] **Step 1: Tulis test gagal untuk serde default + frame reject**
+- [x] **Step 1: Tulis test gagal untuk serde default + frame reject**
 
 Tambahkan ke `mod tests` di `core-agentic/src/runtime/protocol.rs`:
 
@@ -77,12 +79,12 @@ Tambahkan ke `mod tests` di `core-agentic/src/runtime/protocol.rs`:
     }
 ```
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p core-agentic --lib protocol`
 Expected: COMPILE ERROR — `ConnectionCapabilities` / `NotificationKind` tidak ditemukan.
 
-- [ ] **Step 3: Implementasi tipe + field + doc contract**
+- [x] **Step 3: Implementasi tipe + field + doc contract**
 
 Di `core-agentic/src/runtime/protocol.rs`:
 
@@ -148,12 +150,12 @@ pub enum NotificationKind {
     },
 ```
 
-- [ ] **Step 4: Jalankan test → verify pass**
+- [x] **Step 4: Jalankan test → verify pass**
 
 Run: `cargo test -p core-agentic --lib protocol`
 Expected: semua pass (termasuk 3 test baru).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/runtime/protocol.rs
@@ -175,7 +177,7 @@ git commit -m "feat(protocol): ConnectionCapabilities + NotificationKind allowli
   - 7 request resource wajib init; `Plan` khususnya juga gated `experimental_api`.
   - semua penulisan event lewat `EventSink` (filter opt-out).
 
-- [ ] **Step 1: Tulis test gagal di `core-agentic/tests/runtime_engine.rs`**
+- [x] **Step 1: Tulis test gagal di `core-agentic/tests/runtime_engine.rs`**
 
 Tambahkan di akhir file (pattern sama dengan test yang ada: `MemoryTransport` + thread worker + channel mpsc; likankan sesuaikan import — file sudah meng-import yang dibutuhkan):
 
@@ -347,12 +349,12 @@ mod sink_tests {
 
 > Catatan penyesuaian kecil yang boleh (dan diharapkan) dilakukan implementer: `EventSink::new(transport, opt_outs)` menerima `Arc<Mutex<HashSet<NotificationKind>>>`; helper `make_sink` di atas menulis `Default::default()` untuk itu. Jika field struct `Event` asli berbeda sedikit dari snippet (mis. `TodoChanged` field lain), sesuaikan literal test — yang WAJIB dijaga: 4 kind di-filter, request + gates tidak, dan jumlah event persis.
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p core-agentic --test runtime_engine`
 Expected: COMPILE ERROR atau FAIL — engine belum punya `EventSink` export, `Request::Init` masih 1 field, dan error belum sesuai.
 
-- [ ] **Step 3: Implementasi engine**
+- [x] **Step 3: Implementasi engine**
 
 Di `core-agentic/src/runtime/engine.rs`:
 
@@ -503,12 +505,12 @@ impl<T: Transport> std::ops::Deref for EventSink<T> {
    - Test lain yang mengirim `Request::Init { overrides }` (grep) → tambahkan `capabilities: Default::default()`.
    - Test `protocol.rs` lama yang membuat `Request::Init` → idem.
 
-- [ ] **Step 4: Jalankan test core → verify pass**
+- [x] **Step 4: Jalankan test core → verify pass**
 
 Run: `cargo test -p core-agentic`
 Expected: semua pass. (Ada 3 test baru + 3 test sink + engine tests lama.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/runtime/engine.rs core-agentic/tests/runtime_engine.rs core-agentic/src/runtime/protocol.rs
@@ -532,7 +534,7 @@ git commit -m "feat(engine): strict init, experimental_api gate for Plan, opt-ou
   - `AgentConnection::connect(mode, overrides, caps)`, `InProcessClient::start(overrides, caps)`, `RuntimeClient::spawn(overrides, caps)` / `spawn_binary(binary, overrides, caps)`.
   - `perform_handshake(io, overrides, caps)` — Init frame membawa caps ini.
 
-- [ ] **Step 1: Update handshake + client constructors**
+- [x] **Step 1: Update handshake + client constructors**
 
 Di `agentic-cli/src/client.rs`:
 
@@ -553,7 +555,7 @@ pub const CLI_CAPABILITIES: ConnectionCapabilities = ConnectionCapabilities {
 };
 ```
 
-- [ ] **Step 2: Wiring `ensure_connection`**
+- [x] **Step 2: Wiring `ensure_connection`**
 
 `agentic-cli/src/commands.rs` — `ensure_connection` (grep `AgentConnection::connect`):
 
@@ -568,7 +570,7 @@ pub const CLI_CAPABILITIES: ConnectionCapabilities = ConnectionCapabilities {
         );
 ```
 
-- [ ] **Step 3: Update test client yang memanggil constructor**
+- [x] **Step 3: Update test client yang memanggil constructor**
 
 Grep mod test `client.rs` yang memanggil `InProcessClient::start(...)` / `AgentConnection::connect(...)` dengan satu argumen → tambah `CLI_CAPABILITIES` sebagai argumen terakhir (test `agent_connection_connects_in_both_modes`, `in_process_handshake_and_list_tools_round_trip`, dan lainnya bila ada).
 
@@ -591,16 +593,16 @@ Pola (di mod `in_process_tests`): frame handshake pada jalur spawned tidak bisa 
     }
 ```
 
-- [ ] **Step 4: Run seluruh test CLI**
+- [x] **Step 4: Run seluruh test CLI**
 
 Run: `cargo test -p agentic-cli`
 Expected: semua pass — termasuk smoke matriks 4 test (client kini mengirim caps; engine gating kini aktif).
 
-- [ ] **Step 5: `scripts/protocol-demo.js`**
+- [x] **Step 5: `scripts/protocol-demo.js`**
 
 Baca file. Jika memakai `Request::Plan` → tambahkan `capabilities: { experimentalApi: true }` ke object Init-nya. Jika tidak → tidak ada perubahan (Init tanpa caps = serde default, tetap valid). Laporkan keputusannya.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add agentic-cli/src/client.rs agentic-cli/src/commands.rs scripts/protocol-demo.js
@@ -616,7 +618,7 @@ git commit -m "feat(cli): send ConnectionCapabilities (experimental opt-in) at h
 - Modify: `docs/BENCHMARK_CODEX.md`
 - Modify: `docs/ROADMAP.md` (open work: tandai Fase 2a landed, Fase 2b = steer queue open)
 
-- [ ] **Step 1: CHANGELOG**
+- [x] **Step 1: CHANGELOG**
 
 Di bawah `## [Unreleased]` → `### Added`:
 
@@ -629,15 +631,15 @@ Di bawah `## [Unreleased]` → `### Added`:
   Semua additive; `PROTOCOL_VERSION` tetap 1.
 ```
 
-- [ ] **Step 2: BENCHMARK_CODEX.md — tandai Fase 2a**
+- [x] **Step 2: BENCHMARK_CODEX.md — tandai Fase 2a**
 
 Ubah judul section `### Fase 2 — Protocol hardening gaya codex` → tambahkan `✅ (landed 2026-11, kecuali antrian steer → Fase 2b)` dan tandai item 1–3 done, item 4 (antrian steer) tetap open → Fase 2b. Update juga baris tabel `Handshake | ... | cek tunggal | ⚠️ cukup untuk v1` → `capabilities + opt-out | ✅ setara`.
 
-- [ ] **Step 3: ROADMAP.md**
+- [x] **Step 3: ROADMAP.md**
 
 Di bagian "Open work" (atau section atas): tambah catatan satu baris — Fase 2a (capabilities+strict init+opt-out) landed; **Fase 2b: steer/follow-up queue** (terdokumentasi di BENCHMARK_CODEX + COMPARISON_PI_VS_AGENTIC) adalah item protocol berikutnya.
 
-- [ ] **Step 4: fmt + clippy + full test**
+- [x] **Step 4: fmt + clippy + full test**
 
 Run:
 ```bash
@@ -647,7 +649,7 @@ cargo test --workspace
 ```
 Expected: fmt bersih, clippy 0 warning, semua test pass (~800). Perbaiki hingga bersih.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add CHANGELOG.md docs/BENCHMARK_CODEX.md docs/ROADMAP.md agentic-cli/src core-agentic/src

@@ -1,6 +1,8 @@
 # Daemon Mode Exclusive (Fase 3a) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Daemon long-lived di Unix socket (satu engine, satu sesi aktif): `agentic-runtime --daemon` (broker socket ⇄ MemoryTransport, engine tak berubah), discovery via `daemon.json` + token `/dev/urandom`, attach kedua ditolak `"daemon in use"`, re-attach mengadopsi sesi (`SessionAdopted`), `agentic attach` + `--shutdown`, auto-spawn dari CLI; Windows menerima error actionable (named pipe = TODO).
 
@@ -42,7 +44,7 @@
   - `Event::SessionAdopted { session_id: Option<String> }` — wire `session_adopted` (serde rename, pola Task 1 Fase 2b)
   - `InitOverrides: PartialEq` derive + `ConnectionCapabilities`: `compatible_caps(&self, requested: &Self) -> bool` (= `!requested.experimental_api || self.experimental_api`)
 
-- [ ] **Step 1: Tulis test gagal**
+- [x] **Step 1: Tulis test gagal**
 
 Di `core-agentic/src/runtime/transport.rs`, module test `(cfg(unix))` + (file-level serialization tests masuk di protocol.rs/engine tests):
 
@@ -114,12 +116,12 @@ fn socket_transport_round_trips_frames() {
 }
 ```
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p core-agentic`
 Expected: COMPILE ERROR — field/signature tak ada (`daemon_token`, `SessionAdopted`, `set_daemon_token`, `UnixSocketTransport`, `compatible_caps`).
 
-- [ ] **Step 3: Implementasi**
+- [x] **Step 3: Implementasi**
 
 1. `transport.rs`: duplikasi struktur BufReader/Mutex seperti `StdioTransport`, tapi atas `UnixStream`:
 ```rust
@@ -192,12 +194,12 @@ pub struct SocketConnectionTransport { /* field sama; ctor `new(stream: UnixStre
    ```
    > Implementer WAJIB menjaga arm lain (Run/Plan dst.) tidak tersentuh, dan seluruh strings persis.
 
-- [ ] **Step 4: Jalankan test → verify pass 2 lapis**
+- [x] **Step 4: Jalankan test → verify pass 2 lapis**
 
 Run: `cargo test -p core-agentic` lalu `cargo test -p agentic-cli`
 Expected: semua pass (termasuk test regresi `strict_already_initialized_still_default_without_adopt_flag`). Smoke laras embedded/spawned tetap hijau.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic
@@ -223,7 +225,7 @@ git commit -m "feat(core): unix-socket transports, daemon token, adopt-on-re-ini
   - token 32 hex random dari `/dev/urandom` (`read 16`)
   - Windows: `pub fn not_supported_error() -> &'static str` clearinghouse pesan tunggal yang dipakai main (unit test Windows-level tapi compiles di CI unix также)
 
-- [ ] **Step 1: Broker sketch (net `serve`)**
+- [x] **Step 1: Broker sketch (net `serve`)**
 
 ```rust
 pub struct DaemonConfig { pub socket_path: PathBuf, pub info_path: PathBuf }
@@ -255,7 +257,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
    - `handle_connection` aturan pertama: SATU koneksi aktif. Simpan `Arc<Mutex<Option<WriterHandle>>>`; koneksi baru saat ada yang aktif → tulis `ProtocolEvent::new(None, Event::Error { message: "daemon in use" })` lalu tutup. Koneksi aktif: thread pembaca frame → `req_tx.send`; drain loop menulis frame dari `evt_rx.recv()` ke SocketWriter, atau discard saat detached (writer drop → set slot jadi None).
    - Saat detached: engine tidak pernah block (req channel unbounded; evt drain terus berjalan).
 
-- [ ] **Step 2: main.rs flag dispatch**
+- [x] **Step 2: main.rs flag dispatch**
 
 ```rust
 let args: Vec<String> = std::env::args().skip(1).collect();
@@ -270,7 +272,7 @@ if args.iter().any(|a| a == "--daemon") {
 ```
    (Implementer dapat menata helper parse; tangibles: Windows message HANYA satu baris yang itu.)
 
-- [ ] **Step 3: Tests**
+- [x] **Step 3: Tests**
 
 Di `daemon.rs` mod tests (semuanya `#[cfg(unix)]`):
 ```rust
@@ -296,12 +298,12 @@ Di `daemon.rs` mod tests (semuanya `#[cfg(unix)]`):
 ```
    Implementer menambah worker helper sendiri (channel→tempdir per test). Batas waktu 10s di semua poll.
 
-- [ ] **Step 4: Build + gates cepat**
+- [x] **Step 4: Build + gates cepat**
 
 Run: `cargo build --workspace && cargo test -p agentic-runtime && cargo test -p core-agentic && cargo test -p agentic-cli`
 Expected: semua pass; CLI smoke lama tetap hijau (binary baru mampu CLI still works — runtime binary yang dibedah oleh T tests disk cover has `--daemon` flag optional).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add agentic-runtime
@@ -333,7 +335,7 @@ git commit -m "feat(runtime): unix-socket daemon broker with token, in-use refus
   - `Commands::attach_daemon(shutdown: bool) -> Result<()>`: connect spawn_if_missing=false → shutdown? `send_and_wait(Request::Shutdown)` + bye : else REPL biasa (route via connection sama).
   - e2e smoke (commands.rs): `daemon_lifecycle_smoke` (spawn daemon binary dengan `--info-path/--socket-path` tempdir + config fixture hermetic; jalankan run sepanjang connection; assert `SessionStarted`→ terminal); `in_use_refusal_smoke`; `adopt_smoke` (disconnect → reconnect → `SessionAdopted`).
 
-- [ ] **Step 1: Tulis test gagal**
+- [x] **Step 1: Tulis test gagal**
 
 1. client.rs unit (linting `RuntimeMode::Daemon` data):
 ```rust
@@ -348,19 +350,19 @@ git commit -m "feat(runtime): unix-socket daemon broker with token, in-use refus
 ```
 2. e2e smoke (pola sama dengan smoke embedded/spawned): matriks tambah mode `daemon` (spawn daemon binary memakai helper test CLI yang sudah spawn runtime binary, argumen tambahan `--daemon`).
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p agentic-cli`
 Expected: COMPILE ERROR — `RuntimeMode::Daemon`/`DaemonConnection`/`parse_daemon_info` tak ada.
 
-- [ ] **Step 3: Implementasi** (ikut sketch; implementer boleh membuat beberapa sub-commit selama akhirnya satu task rapat — yang WAJIB: seluruh isi task jadi sebelum lanjut)
+- [x] **Step 3: Implementasi** (ikut sketch; implementer boleh membuat beberapa sub-commit selama akhirnya satu task rapat — yang WAJIB: seluruh isi task jadi sebelum lanjut)
 
-- [ ] **Step 4: gates + matriks**
+- [x] **Step 4: gates + matriks**
 
 Run: `cargo test -p agentic-cli` dan `cargo test --workspace`
 Expected: hijau semua; smoke matriks minimal: daemon-lifecycle + in-use-refusal + adopt, semuanya lewat spawn dari CLI.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add agentic-cli
@@ -374,7 +376,7 @@ git commit -m "feat(cli): RuntimeMode::Daemon with discovery, auto-spawn, attach
 **Files:**
 - Modify: `CHANGELOG.md`, `docs/BENCHMARK_CODEX.md` (Fase 3 landed sebagai 3a; Fase 3b = multiplexing open), `docs/ROADMAP.md` (update open-work), `README.md` (Known limitations: Windows daemon TODO; `agentic attach` Quick Start snippet)
 
-- [ ] **Step 1: CHANGELOG** — `## [Unreleased]` → `### Added`:
+- [x] **Step 1: CHANGELOG** — `## [Unreleased]` → `### Added`:
 
 ```markdown
 - Runtime: **daemon mode (Fase 3a)** — `agentic-runtime --daemon` hosts a
@@ -388,18 +390,18 @@ git commit -m "feat(cli): RuntimeMode::Daemon with discovery, auto-spawn, attach
   daemon mode and named-pipe transport are planned (TODO).
 ```
 
-- [ ] **Step 2: BENCHMARK_CODEX.md** — `### Fase 3 — Daemon mode ✅ (landed 2026-11, sebagai 3a: satu sesi aktif; 3b multi-session open)`; term health: `Daemon long-lived` row `🔜 fase lanjut` → `✅ (3a: unix socket, satu attach)`; `SDK bahasa lain` stays 🔜. Tambah 3b subsection dengan gap list (session id routing, protokol v2, SQ/EQ).
+- [x] **Step 2: BENCHMARK_CODEX.md** — `### Fase 3 — Daemon mode ✅ (landed 2026-11, sebagai 3a: satu sesi aktif; 3b multi-session open)`; term health: `Daemon long-lived` row `🔜 fase lanjut` → `✅ (3a: unix socket, satu attach)`; `SDK bahasa lain` stays 🔜. Tambah 3b subsection dengan gap list (session id routing, protokol v2, SQ/EQ).
 
-- [ ] **Step 3: ROADMAP.md** — Next: Fase 3a landed; berikutnya = Fase 3b multiplexing (protokol v2) atau Fase 4 SDK. Tandai: Windows named pipe + input-during-run (Fase UX) masih open.
+- [x] **Step 3: ROADMAP.md** — Next: Fase 3a landed; berikutnya = Fase 3b multiplexing (protokol v2) atau Fase 4 SDK. Tandai: Windows named pipe + input-during-run (Fase UX) masih open.
 
-- [ ] **Step 4: README.md** — Tabel/section Known Limitations: daemon mode not yet on Windows; Quick Start snippet `agentic attach` satu blok yang menyebut takia `--runtime daemon`.
+- [x] **Step 4: README.md** — Tabel/section Known Limitations: daemon mode not yet on Windows; Quick Start snippet `agentic attach` satu blok yang menyebut takia `--runtime daemon`.
 
-- [ ] **Step 5: gates + full test**
+- [x] **Step 5: gates + full test**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Perbaiki hingga bersih.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add CHANGELOG.md README.md docs/BENCHMARK_CODEX.md docs/ROADMAP.md

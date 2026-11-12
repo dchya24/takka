@@ -1,6 +1,8 @@
 # Fase 1 — Tool Lifecycle & Live Output Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Buat per-tool progress live di interactive/`run` mode: orchestrator emit `ToolStart`/`ToolDelta`/`ToolOutput`(diperkaya), dan `run_command`/`run_script` di-streaming output-kandaya, dirender inline.
 
@@ -32,7 +34,7 @@
 **Exports:**
 - Produces: `Event::ToolStart { tool_call_id: String, tool_name: String, arguments: Value }`, `Event::ToolDelta { tool_call_id: String, tool_name: String, delta: String }`, dan `Event::ToolOutput { tool_name, output, error, tool_call_id, duration_ms, success, truncated }`. `EventType` bertambah `ToolStart`, `ToolDelta`.
 
-- [ ] **Step 1: Write failing test**
+- [x] **Step 1: Write failing test**
 
 ```rust
 // dibawah di #cfg[test)] mod tests di events.rs
@@ -64,12 +66,12 @@ fn new_lifecycle_variants_serialize_and_map_to_type() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p core-agentic events::tests::new_lifecycle_variants_serialize_and_map_to_type`
 Expected: compile error — `Event::ToolStart` / `EventType::ToolStart` tidak ada.
 
-- [ ] **Step 3: Add the variants**
+- [x] **Step 3: Add the variants**
 
 Edit `core-agentic/src/events.rs`:
 
@@ -125,12 +127,12 @@ Update `Event::event_type()`:
 
 Colokkan `#[serde(rename_all = "camelCase")]` di atas enum `ToolOutput` variant tersebut (jangan di enum induk karena `#[serde(tag = "type")]`).
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p core-agentic events::tests::new_lifecycle_variants_serialize_and_map_to_type`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/events.rs
@@ -148,7 +150,7 @@ git commit -m "feat(core): add ToolStart/ToolDelta events + enrich ToolOutput"
 **Interfaces:**
 - Produces: `Tool::execute_streaming(&self, args: serde_json::Value, on_progress: &dyn Fn(&str)) -> ToolResult<serde_json::Value>` dengan default impl memanggil `self.execute(args)` (mengabaikan `on_progress`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[cfg(test)]
@@ -186,12 +188,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p core-agentic tool::tests::execute_streaming_defaults_to_execute`
 Expected: FAIL — method `execute_streaming` tidak ada di trait.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `core-agentic/src/tool.rs`, di dalam `pub trait Tool`:
 
@@ -211,12 +213,12 @@ Add to `core-agentic/src/tool.rs`, di dalam `pub trait Tool`:
     }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p core-agentic tool::tests::execute_streaming_defaults_to_execute`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/tool.rs
@@ -237,7 +239,7 @@ git commit -m "feat(core): add Tool::execute_streaming with execute fallback; -p
 **Interfaces:**
 - Produces: `ToolRegistry::execute_streaming_by_name(&self, name: &str, args: &serde_json::Value, on_progress: &dyn Fn(&str)) -> Result<serde_json::Value, ToolError>`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     // A tool that overrides execute_streaming to emit two deltas; the
@@ -277,12 +279,12 @@ git commit -m "feat(core): add Tool::execute_streaming with execute fallback; -p
     }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p core-agentic registry_forwards_streaming_deltas`
 Expected: compile error — method `execute_streaming_by_name` not found.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
     /// Execute a tool by name, streaming progress deltas through
@@ -302,12 +304,12 @@ Expected: compile error — method `execute_streaming_by_name` not found.
     }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p core-agentic registry_forwards_streaming_deltas`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/tool_registry.rs
@@ -326,7 +328,7 @@ git commit -m "feat(core): add ToolRegistry::execute_streaming_by_name"
 - Consumes: `Tool::execute_streaming` (Task 2).
 - Produces: `RunCommandTool` meng-override `execute_streaming`; JSON output TIDAK berubah.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[cfg(test)]
@@ -354,14 +356,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p core-agentic run_command::tests::run_command_streams_and_keeps_json`
 Expected: PASS of the OLD impl may already pass (because fallback path streams nothing?). The default calls execute: deltas stays empty → assert fails → must implement streaming. If it errors elsewhere fix accordingly imbalance.
 
 Actually will produce as old behavior: result JSON same, deltas empty → assertion `!deltas...is_empty()` FAILS. Good, red.
 
-- [ ] **Step 3: Implement `execute_streaming`**
+- [x] **Step 3: Implement `execute_streaming`**
 
 Replace `cmd.output()`-based body with a piped incremental read. Keep `execute` as the atomic path. Add:
 
@@ -430,17 +432,17 @@ Replace `cmd.output()`-based body with a piped incremental read. Keep `execute` 
 
 Catatan: pendekatan ini streaming stdout, lalu stderr (berurutan, tidak interleave dua stream). Di Fase 1 cukup (ke-2 jarang dipakai bersamaan); interleave stdout/stderr bisa disempurnakan nanti via `read_line` pada dua thread. Jangan ubah `execute` — biarkan sebagai path atomik yang lama.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p core-agentic run_command::tests::run_command_streams_and_keeps_json`
 Expected: PASS.
 
-- [ ] **Step 5: Confirm existing atomic tests still pass**
+- [x] **Step 5: Confirm existing atomic tests still pass**
 
 Run: `cargo test -p core-agentic -- run_command`
 Expected: PASS (seluruh test module run_command, lama + baru).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add core-agentic/src/tools/run_command.rs
@@ -459,7 +461,7 @@ git commit -m "feat(core): stream run_command output via execute_streaming"
 - Consumes: `Tool::execute_streaming` default.
 - Produces: `RunScriptTool` overrides `execute_streaming`; contraction also honors its 64KB truncation for stdout/stderr (jangan diregressi).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     #[test]
@@ -479,9 +481,9 @@ git commit -m "feat(core): stream run_command output via execute_streaming"
     }
 ```
 
-- [ ] **Step 2: Run to verify fail** (`cargo test -p core-agentic run_script_streams_lines`) — deltas empty in default.
+- [x] **Step 2: Run to verify fail** (`cargo test -p core-agentic run_script_streams_lines`) — deltas empty in default.
 
-- [ ] **Step 3: Implement `execute_streaming`**
+- [x] **Step 3: Implement `execute_streaming`**
 
 Refactor: extract the interpreter-spawn + read into a shared helper that takes an `on_progress` option. Turn `run_script` atomic `execute` path calls with `None`; `execute_streaming` calls with `Some(on_progress)`.
 
@@ -514,8 +516,8 @@ Update `execute` to call `run_interpreter_streaming(..., None)`; add:
 
 Keep the 64KB truncation for stdout/stderr intact in `run_interpreter_streaming` (extract `truncate_64k(&str) -> String`).
 
-- [ ] **Step 4: Verify new test passes + old tests** (`cargo test -p core-agentic run_script`)
-- [ ] **Step 5: Commit**
+- [x] **Step 4: Verify new test passes + old tests** (`cargo test -p core-agentic run_script`)
+- [x] **Step 5: Commit**
 
 ```bash
 git add core-agentic/src/tools/run_script.rs
@@ -537,7 +539,7 @@ git commit -m "feat(core): stream run_script via execute_streaming"
 - Sync path (`handle_tool_calls`) executes in scoped threads, can borrow `&self.events` for direct emit.
 - Async path (`handle_tool_calls_parallel`) uses `spawn_blocking` ('static) → needs an `Arc<EventEmitter>` to a forwarder. Only batch-of-one streams (run_command/run_script), so forwarder trivial.
 
-- [ ] **Step 1: Small helper — DeltaThrottler**
+- [x] **Step 1: Small helper — DeltaThrottler**
 
 New module `core-agentic/src/orchestrator/progress.rs`:
 
@@ -606,7 +608,7 @@ impl DeltaThrottler {
 
 Export from `orchestrator/mod.rs` (`mod progress;`).
 
-- [ ] **Step 2: Make `events` shared (`Arc<EventEmitter>`)**
+- [x] **Step 2: Make `events` shared (`Arc<EventEmitter>`)**
 
 In `orchestrator/mod.rs` — change the field type:
 
@@ -616,7 +618,7 @@ In `orchestrator/mod.rs` — change the field type:
 
 and initialization `events: Arc::new(EventEmitter::new())`. Rely on `Deref` for existing `self.events.on/emit` calls (no call-site changes needed elsewhere). Add a note in the struct doc. Run `cargo build -p core-agentic` to ensure nothing breaks.
 
-- [ ] **Step 3: Add execution helper in tool_exec.rs**
+- [x] **Step 3: Add execution helper in tool_exec.rs**
 
 Add a private method:
 
@@ -646,7 +648,7 @@ Add a private method:
 
 Update existing `execute_tool` usages (the sync one) to call a shared path.
 
-- [ ] **Step 4: Emit ToolStart/ToolDelta/ToolOutput in `handle_tool_calls` (sync)**
+- [x] **Step 4: Emit ToolStart/ToolDelta/ToolOutput in `handle_tool_calls` (sync)**
 
 **Struktur data bersama untuk kedua path.** Ganti `Vec<Option<(String, String, String)>>` menjadi `Vec<Option<SlotOutcome>>` dengan struct (tambahkan di atas `impl Orchestrator` dalam `tool_exec.rs`):
 
@@ -737,7 +739,7 @@ if matches!(slots[idx], Slot::Pending { .. }) {
 }
 ```
 
-- [ ] **Step 5: Async path `handle_tool_calls_parallel`**
+- [x] **Step 5: Async path `handle_tool_calls_parallel`**
 
 Pola sama; bedanya `spawn_blocking` butuh `'static`, jadi delta dikirim lewat channel + forwarder thread:
 
@@ -770,7 +772,7 @@ let fwd = std::thread::Builder::new()
 
 Perhatikan: `EventEmitter` sudah `Sync` (handler di dalam `Mutex`), jadi `emitter.emit` aman dari thread forwarder. `Event::ToolDelta` memerlukan `tool_call_id`/`tool_name` — untuk batch-of-one (run_command/run_script) nilainya tunggal; simpan di variabel luar closure sebelum spawn dan clone ke forwarder.
 
-- [ ] **Step 6: Integration test**
+- [x] **Step 6: Integration test**
 
 Append to `core-agentic/tests/orchestrator_loop.rs`:
 
@@ -811,12 +813,12 @@ fn tool_lifecycle_events_emitted_in_order() {
 }
 ```
 
-- [ ] **Step 7: Run the test suite**
+- [x] **Step 7: Run the test suite**
 
 Run: `cargo test -p core-agentic`
 Expected: seluruh suite core-agentic pass, termasuk test lifecycle baru dan semua test `orchestrator_loop.rs` existing.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add core-agentic/src/orchestrator/mod.rs core-agentic/src/orchestrator/tool_exec.rs core-agentic/src/orchestrator/progress.rs core-agentic/src/orchestrator/messages.rs core-agentic/tests/orchestrator_loop.rs
@@ -841,7 +843,7 @@ git commit -m "feat(core): emit tool lifecycle events + wire streaming execution
 
 **Catatan testing:** renderer menulis ke stdout; untuk unit-test, pindahkan logika format delta ke fungsi murni `fn render_tool_delta(tool_name: &str, delta: &str) -> Vec<RLine>` dan test fungsi itu (bukan stdout capture).
 
-- [ ] **Step 1: Render `ToolStart` / `ToolDelta` di `render_event`**
+- [x] **Step 1: Render `ToolStart` / `ToolDelta` di `render_event`**
 
 Di `render_event`, tambahkan match arm:
 
@@ -893,11 +895,11 @@ core_agentic::Event::ToolOutput {
 }
 ```
 
-- [ ] **Step 2: Forward `ToolDelta` in the interrupt coordinator**
+- [x] **Step 2: Forward `ToolDelta` in the interrupt coordinator**
 
 The event forwarding at `commands.rs:1650` currently skips `Thought` and passes everything else. Add same pass-through (no filter) because `ToolDelta` must reach renderer. Verify it already passes through (only Thought filtered). Leave as-is; confirm.
 
-- [ ] **Step 3: TUI app.rs render new events**
+- [x] **Step 3: TUI app.rs render new events**
 
 At `tui/app.rs:877` and `:1399`, add arms in both `match`es to append ToolStart (running marker) + latest ToolDelta into the tool activity log (reuse an existing render helper if present; otherwise append wrapped text `[⟳ tool] delta-line`). Enriched ToolOutput already handled; add a duration maybe later — minimal now:
 
@@ -910,7 +912,7 @@ core_agentic::Event::ToolDelta { delta, .. } => {
 
 Keep it small, gated by the same `show_tool_calls` toggle if present.
 
-- [ ] **Step 4+: Build + manual smoke test**
+- [x] **Step 4+: Build + manual smoke test**
 
 Run: `cargo build -p agentic-cli`
 Run a manual smoke test:
@@ -921,7 +923,7 @@ Expected: a `⟳` header, the `line1`/`line2` deltas dim, then `✓ run_command 
 
 Also test interactive quickly: `agentic interactive`, submit a prompt that uses `run_command` with a grep/ls to see the header + evidence before vs after.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add agentic-cli/src/commands.rs agentic-cli/src/tui/app.rs
@@ -938,10 +940,10 @@ git commit -m "feat(cli): render live tool deltas + enriched output inline & TUI
 - Modify: `tasks/tasks-agentic-cli.md`
 - Modify: `docs/COMPARISON_PI_VS_AGENTIC.md`
 
-- [ ] **Step 1: Update docs**: mark Fase 1 landed (mark Fasev1 done; note lingering open items for Fase 2 steering + Fase 3).
-- [ ] **Step 2: Update task files**: add/complete Fase 1 subtasks with checkboxes `- [x]`.
-- [ ] **Step 3: Update the comparison doc**: strike the "event granularity" and "per-tool progress" entries to done-in-fase-1; note steering still pending (Fase 2).
-- [ ] **Step 4: Commit**
+- [x] **Step 1: Update docs**: mark Fase 1 landed (mark Fasev1 done; note lingering open items for Fase 2 steering + Fase 3).
+- [x] **Step 2: Update task files**: add/complete Fase 1 subtasks with checkboxes `- [x]`.
+- [x] **Step 3: Update the comparison doc**: strike the "event granularity" and "per-tool progress" entries to done-in-fase-1; note steering still pending (Fase 2).
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/ROADMAP.md tasks/tasks-core-agentic.md tasks/tasks-agentic-cli.md docs/COMPARISON_PI_VS_AGENTIC.md

@@ -1,7 +1,7 @@
 # Roadmap
 
 > Consolidated current-state + next-steps for the takka CLI + core library.
-> Last updated: 2026-11-10.
+> Last updated: 2026-11-12.
 
 This replaces the older `PLAN.md` / `IMPLEMENTATION_ROADMAP.md` /
 `QUICK_START_IMPLEMENTATION.md` triad
@@ -93,21 +93,23 @@ Next: sisa Fase UX dari design yang sama sudah landed — streaming preview, mid
 
 ## Open work
 
-**Protocol:** Fase 2a (capabilities + strict init + notification opt-out) dan **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`; terdokumentasi di [BENCHMARK_CODEX.md](BENCHMARK_CODEX.md) + [COMPARISON_PI_VS_AGENTIC.md](COMPARISON_PI_VS_AGENTIC.md)) sudah landed. **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) juga sudah landed — berikutnya **Fase 4: ACP (Agent Client Protocol)** — keputusan 2026-11-10: ACP memprioritaskan pengganti rencana lama "SDK bahasa lain" (dibatalkan); **Fase 3b: multiplexing multi-sesi (bump protokol berikutnya)** menyusul belakangan. Revisi ACP: [agentclientprotocol.com](https://agentclientprotocol.com) (Zed; v1/v2, JSON-RPC over stdio, session setup/prompt turn/tool calls/terminals/agent plan/session modes). Urutan siklus: D housekeeping docs → Fase 4 ACP → issue #2 → issue #4; packaging (C) nanti.
+**Protocol:** Fase 2a (capabilities + strict init + notification opt-out), **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`), dan **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) sudah landed. **Fase 4: ACP juga landed (2026-11-11, PR #10–#15)** — keputusan 2026-11-10: ACP menggantikan rencana lama "SDK bahasa lain" (dibatalkan). `takka-runtime --acp` melayani ACP v1 (JSON-RPC over stdio, permukaan integrasi Zed): sesi multi (bounded), prompt streaming, mode, cancel, turn-limit; conformance hermetik 14-check (`scripts/acp-conformance.sh`) kini gate CI ubuntu+macOS (T-08). Sisa ACP: **bukti sesi Zed nyata** (manual). **Fase 3b: multiplexing multi-sesi (bump protokol berikutnya)** menyusul belakangan. Revisi ACP: [agentclientprotocol.com](https://agentclientprotocol.com).
+
+**Packaging (C):** ditunda (keputusan 2026-11-10 — jangan dibuka tanpa persetujuan eksplisit).
 
 **Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`takka --runtime daemon` gagal dengan pesan aksi di Windows).
 
-**Fase UX (landed 2026-11-09):** inisiatif `initiative-repl-ux-hardening` selesai — (R2) streaming preview live di inline REPL, (R1) input-during-run steer/queue di REPL + TUI, (R3) TUI slash-command + `@`-file completion. Rincian di `CHANGELOG.md` bagian [Unreleased] "REPL/TUI UX hardening"; arsip di `_bmad-output/initiative-repl-ux-hardening/`.
+**Fase UX (landed 2026-11-09):** inisiatif `initiative-repl-ux-hardening` selesai — (R2) streaming preview live di inline REPL, (R1) input-during-run steer/queue di REPL + TUI, (R3) TUI slash-command + `@`-file completion. Rincian di `CHANGELOG.md` bagian [0.6.0] "REPL/TUI UX hardening"; arsip di `_bmad-output/initiative-repl-ux-hardening/`.
 
-**CI (open):** daemon smoke test merah deterministik di `Test (macos-latest)` sejak Fase 3a landed — pre-existing, bukan regresi PR mana pun (Linux + Windows hijau; run berasal dari PR #1 dan rerun ×2). Diagnosa + arah investigasi: [#2](https://github.com/dchya24/takka/issues/2).
+**CI (closed):** daemon smoke test macOS (#2) — dua bug macOS/BSD nyata (accept mewarisi `O_NONBLOCK`; path socket melebihi `SUN_LEN`), diperbaiki dan ditutup via PR #11 (2026-11-11).
 
-**Test flaky (open):** env race `ENV_LOCK` + poisoning cascade ([#4](https://github.com/dchya24/takka/issues/4)); e2e timing-window windows lain turut diekspor di run CI (smoke_follow_up, plan_request).
+**Test flaky (closed):** env race `ENV_LOCK` + poisoning cascade dan deadline dinding tetap pada event-wait helpers (#4) — diperbaiki (ENV_LOCK `into_inner()` recovery, drop-order guard, quiet-window deadlines) dan ditutup via PR #13 + #14 (2026-11-12). Sisa opsional: dua cancel-smoke Windows tetap keluarga timing-flake yang dikenal (sudah jarang muncul); hardening menyusul kalau muncul lagi.
 
 Sized by effort. Each item has its own home in
 [`../tasks/tasks-core-agentic.md`](../tasks/tasks-core-agentic.md) or
 [`../tasks/tasks-agentic-cli.md`](../tasks/tasks-agentic-cli.md).
 
-Prioritas saat ini (keputusan 2026-11-10): packaging/distribution di bawah ini ditunda; dulu housekeeping docs + ACP (Fase 4) + CI debt (#2, #4).
+Prioritas saat ini (keputusan 2026-11-10, diperbarui 2026-11-12): housekeeping docs, ACP (Fase 4), dan CI debt (#2, #4) tuntas. Tersisa: bukti sesi Zed nyata (manual), Fase 3b multiplexing, packaging (ditunda).
 
 ### Quick wins (under a day each)
 
@@ -185,46 +187,28 @@ Prioritas saat ini (keputusan 2026-11-10): packaging/distribution di bawah ini d
 
 ## How to choose what's next
 
-Three reasonable paths from here:
+Post-v0.6.0 state: REPL/TUI hardening, rebrand, protocol hardening,
+steer/queue, daemon mode, embedded runtime, and the ACP adapter are all
+landed. The remaining known work, in the order the working agreement
+(2026-11-10) implies:
 
-1. **Solidify before building.** Integration tests first, then `/restart`
-   + status-line indicators. Lowest risk, makes the next big feature
-   safer to land.
-2. **Polish daily-use ergonomics.** Streaming markdown polish + the two
-   quick wins. Highest visible-per-day return.
-3. **Strategic feature.** Planner agent. Biggest single bet; depends on
-   the existing subagent + cancel + memory machinery being stable.
-
-The repo currently leans toward path 1 because the recent refactors
-(memory/orchestrator/safety module split, cost tracking, URL allowlist,
-prompt-injection scanner) added a lot of new surface area that benefits
-from end-to-end tests.
+1. **Zed proof (manual).** Run takka as a real ACP agent inside Zed
+   (open project → chat → approve a command), record the evidence —
+   the strongest check the conformance script cannot give.
+2. **Fase 3b: multi-session multiplexing.** Session-id routing + protocol
+   envelope bump + per-session capability gating. Deliberately postponed.
+3. **Packaging/distribution (C).** Deliberately postponed — do not open
+   without an explicit go-ahead.
 
 ---
-## v0.3.0 (agentic-cli) / v0.1.1 (core-agentic)
-
-```text
-refactor(cli): TUI input widget (ratatui) replacing reedline, ESC to abort
-feat(cli): --log-file / --no-log-file session log persistence
-feat(cli): live streaming, thinking animation, toast notifications
-style: cargo fmt across the workspace
-docs: add CONTRIBUTING.md, LICENSE (MIT), SECURITY.md, CI workflow
-```
-
----
-
 ## Recent history
 
-Key changes that landed recently:
+Key changes that landed recently (v0.6.0 shipped 2026-11-10; after that):
 
 ```
-(latest)     feat: Phase 11 — Prompt caching (core + CLI observability)
-(latest)     feat(cli): session system — auto-save, /new, /sessions, /sessions <id>
-(latest)     feat(tools): add question + todowrite tools (M4)
-(latest)     docs: update TOOL_REFERENCE.md for 16-tool set
-(latest)     refactor(cli): replace ratatui model_picker with dialoguer inline fuzzy-select
-(latest)     feat(cli): /models auto-complete via reedline completer
-(latest)     feat(cli): /restart slash command + AGENT.md/memory.md indicators
+(latest)     feat(acp): ACP v1 adapter sessions T-03–T-07, D9/D12 + conformance gate (PR #10, #15)
+(latest)     fix(runtime): plan-approval lost wakeup + ENV_LOCK poisoning + activity deadlines (PR #12, #13, #14)
+(latest)     fix(daemon): macOS/BSD unix-socket bugs, issue #2 closed (PR #11)
 3b1f740  feat(safety+cli): interactive diff preview in confirmation prompt
 72a7edf  feat(safety): prompt-injection detector for fetch / web_search
 3685965  feat(tools): add apply_patch tool for unified-diff application
