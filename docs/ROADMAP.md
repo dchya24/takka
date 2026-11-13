@@ -93,6 +93,12 @@ Next: sisa Fase UX dari design yang sama sudah landed — streaming preview, mid
 
 ## Open work
 
+**Hardening backlog (2026-11-14):** source audit found a real P0 (shell tools
+have no enforced timeout, a stdout/stderr pipe deadlock, and no cancellation —
+`run_script`'s `timeout` parameter is ignored) plus poisoning `.lock().unwrap()`
+sites, duplicated token estimation, and god files. Tracked item by item in
+[`../tasks/14112026-harness-hardening-backlog.md`](../tasks/14112026-harness-hardening-backlog.md).
+
 **Protocol:** Fase 2a (capabilities + strict init + notification opt-out), **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`), dan **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) sudah landed. **Fase 4: ACP juga landed (2026-11-11, PR #10–#15)** — keputusan 2026-11-10: ACP menggantikan rencana lama "SDK bahasa lain" (dibatalkan). `takka-runtime --acp` melayani ACP v1 (JSON-RPC over stdio, permukaan integrasi Zed): sesi multi (bounded), prompt streaming, mode, cancel, turn-limit; **stored-session lifecycle (`session/load` + `session/resume` di atas checkpoint store) landed 2026-11-14** — thread lama bisa dibuka lagi setelah restart, error "loading or resuming sessions is not supported" hilang; conformance hermetik kini 18-check (`scripts/acp-conformance.sh`), gate CI ubuntu+macOS (T-08). Sisa ACP: **bukti sesi Zed nyata** (manual). **Fase 3b: multiplexing multi-sesi (bump protokol berikutnya)** menyusul belakangan. Revisi ACP: [agentclientprotocol.com](https://agentclientprotocol.com).
 
 **Packaging (C):** ditunda (keputusan 2026-11-10 — jangan dibuka tanpa persetujuan eksplisit).
