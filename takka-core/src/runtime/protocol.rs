@@ -111,6 +111,20 @@ pub enum Request {
         #[serde(rename = "sessionId")]
         session_id: String,
     },
+    /// Switch the running session's provider + model (ACP
+    /// `session/set_config_option` on the `model` option). `model` is the
+    /// provider-qualified id (`"<provider>/<model>"`). The engine acks
+    /// with `Event::SessionModelChanged`. Additive: no protocol bump.
+    SetSessionModel {
+        model: String,
+    },
+    /// Allow `command` to run without a confirmation prompt for the rest
+    /// of the session (the engine-side effect of a client's
+    /// "always allow" permission answer). Fire-and-forget: no ack event.
+    /// Additive: no protocol bump.
+    AllowCommand {
+        command: String,
+    },
     /// Ask the daemon for its registered tool set (for `/tools`).
     ListTools,
     /// Activate a skill in the daemon's orchestrator (for `/skill`).

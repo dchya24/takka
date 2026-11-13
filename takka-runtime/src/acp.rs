@@ -60,7 +60,7 @@ use takka_core::runtime::protocol::{
 use takka_core::runtime::transport::MemoryTransport;
 use takka_core::PermissionMode;
 
-use crate::acp_permission;
+use crate::acp_permission::{self as acp_permission, PermissionAnswer};
 
 /// Method names we accept on the agent side of the v1 dialect
 /// (mirrors `acp::AGENT_METHOD_NAMES`, kept as consts for framing tests).
@@ -73,6 +73,9 @@ const SESSION_LOAD: &str = "session/load";
 /// v1 resume: the agent kept the session live (or can rebuild it from its
 /// own store) and the client re-attaches without a history replay.
 const SESSION_RESUME: &str = "session/resume";
+/// v1 config-option switch (the `model` / `mode` selects advertised on
+/// `session/new.configOptions`).
+const SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
 const SESSION_UPDATE: &str = "session/update";
 /// Outbound agent → client permission request (T-05/T-06, D8): the turn
 /// thread asks, the client answers with a result frame on the same id.
@@ -280,9 +283,10 @@ fn serve_over_test(
 struct PermissionWaiter {
     /// Owning session — `session/cancel` denies only this session's gates.
     session_id: String,
-    /// The `approved` bool back to the parked turn thread. Capacity 1:
-    /// every waiter receives exactly one answer, so a send cannot block.
-    answer_tx: mpsc::SyncSender<bool>,
+    /// The client's permission answer back to the parked turn thread.
+    /// Capacity 1: every waiter receives exactly one answer, so a send
+    /// cannot block.
+    answer_tx: mpsc::SyncSender<PermissionAnswer>,
 }
 
 /// Pending `session/request_permission` waiters keyed by the outbound
@@ -339,7 +343,7 @@ impl PermissionWaiters {
                 .collect()
         };
         for waiter in denied {
-            let _ = waiter.answer_tx.send(false);
+            let _ = waiter.answer_tx.send(PermissionAnswer::Deny);
         }
     }
 
@@ -353,7 +357,7 @@ impl PermissionWaiters {
             .map(|(_, waiter)| waiter)
             .collect();
         for waiter in denied {
-            let _ = waiter.answer_tx.send(false);
+            let _ = waiter.answer_tx.send(PermissionAnswer::Deny);
         }
     }
 }
@@ -405,6 +409,14 @@ struct Session {
     /// EOF. A finished turn leaves the handle in place — joining a
     /// finished thread returns immediately.
     turn: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Current permission mode id (the `mode` config option's value).
+    current_mode: Mutex<String>,
+    /// Current model as the provider-qualified config id
+    /// (`"<provider>/<model>"` — the `model` config option's value).
+    current_model: Mutex<String>,
+    /// Context-window size reported on `UsageUpdate` (the active model's
+    /// `max_tokens`); updated when the model switches.
+    context_size: std::sync::atomic::AtomicU64,
 }
 
 impl Session {
@@ -545,6 +557,8 @@ impl AcpService {
             // only when the session is not live in this process).
             (Some(SESSION_LOAD), true) => self.session_load(frame, false),
             (Some(SESSION_RESUME), true) => self.session_load(frame, true),
+            // Config-option switches (model / mode selects).
+            (Some(SESSION_SET_CONFIG_OPTION), true) => self.session_set_config_option(frame),
             // session/cancel is a notification in v1; if a client carries
             // an id on it anyway, an empty result keeps the JSON-RPC
             // contract intact. Unknown/idle sessions: silence per spec.
@@ -556,6 +570,16 @@ impl AcpService {
             // ignored rather than tearing down the connection.
             (Some(_), true) => RouteOutcome::Error(acp::Error::method_not_found()),
             _ => RouteOutcome::Reply(serde_json::json!({ "ignored": true })),
+        }
+    }
+
+    /// Config for the session surfaces (model list, context size). Same
+    /// precedence as the engine's init: the pinned config path when set,
+    /// else the user's ambient config; `None` when nothing loads.
+    fn adapter_config(&self) -> Option<takka_core::Config> {
+        match self.config.config_path.as_deref() {
+            Some(path) => takka_core::Config::load_from_path(path),
+            None => takka_core::Config::load(),
         }
     }
 
@@ -597,13 +621,29 @@ impl AcpService {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(internal_error("connection is shutting down"));
             }
-            registry.insert(session_id.clone(), session);
+            registry.insert(session_id.clone(), session.clone());
         }
 
-        Ok(
-            acp::NewSessionResponse::new(acp::SessionId::new(session_id))
-                .modes(session_mode_state()),
-        )
+        let mut response = acp::NewSessionResponse::new(acp::SessionId::new(session_id))
+            .modes(session_mode_state());
+        if let Some(config) = self.adapter_config() {
+            let current_model = session
+                .current_model
+                .lock()
+                .expect("current model lock")
+                .clone();
+            let current_mode = session
+                .current_mode
+                .lock()
+                .expect("current mode lock")
+                .clone();
+            response = response.config_options(build_config_options(
+                &config,
+                &current_model,
+                &current_mode,
+            ));
+        }
+        Ok(response)
     }
 
     /// Boot the session engine thread, send `Init` with the adapter's
@@ -620,6 +660,20 @@ impl AcpService {
         // engine for the real one (never compiled into production).
         let engine_handle = self.spawn_engine(engine_name, req_rx, evt_tx)?;
 
+        // Config-derived session state: the active model (qualified id)
+        // and its context window — the `model` config option's value and
+        // the `UsageUpdate.size`. Default mode is `default` (D9).
+        let (current_model, context_size) = self
+            .adapter_config()
+            .and_then(|config| {
+                let model = config.active_model()?;
+                let provider = config.active_provider()?;
+                Some((
+                    format!("{}/{}", provider.name, model.model),
+                    u64::from(model.max_tokens),
+                ))
+            })
+            .unwrap_or_else(|| ("openai/gpt-4o".to_string(), 128_000));
         let session = Arc::new(Session {
             id: session_id.to_owned(),
             req_tx,
@@ -629,6 +683,9 @@ impl AcpService {
             request_counter: AtomicU64::new(0),
             engine: Mutex::new(Some(engine_handle)),
             turn: Mutex::new(None),
+            current_mode: Mutex::new("default".to_string()),
+            current_model: Mutex::new(current_model),
+            context_size: std::sync::atomic::AtomicU64::new(context_size),
         });
 
         let init_id = session.next_request_id("init");
@@ -731,13 +788,32 @@ impl AcpService {
         let Some(session) = session else {
             return RouteOutcome::Error(acp::Error::session_not_found(request.session_id));
         };
-        if session.busy.load(Ordering::SeqCst) {
-            return RouteOutcome::Error(busy_error(&session.id));
-        }
         let Some(mode) = permission_mode(request.mode_id.0.as_ref()) else {
             return RouteOutcome::Error(unknown_mode_error(request.mode_id.0.as_ref()));
         };
+        match self.switch_mode_on_engine(&session, mode) {
+            Ok(()) => RouteOutcome::Reply(
+                serde_json::to_value(acp::SetSessionModeResponse::default())
+                    .expect("set mode response serializes"),
+            ),
+            Err(error) => RouteOutcome::Error(error),
+        }
+    }
 
+    /// Shared engine dance of both mode switch paths (`session/set_mode`
+    /// and the `mode` config option): the session's one turn slot must be
+    /// free (mode laws are honored at turn boundaries, so switching
+    /// mid-turn is refused instead of deferred); the engine acks with
+    /// `Event::PermissionModeChanged`, awaited (bounded) so the client
+    /// never sees a mode it did not actually get.
+    fn switch_mode_on_engine(
+        &self,
+        session: &Arc<Session>,
+        mode: PermissionMode,
+    ) -> Result<(), acp::Error> {
+        if session.busy.load(Ordering::SeqCst) {
+            return Err(busy_error(&session.id));
+        }
         // Idle session: the event stream is parked and nobody else can take
         // it (the busy gate above proves no turn is in flight, and a new
         // prompt cannot be dispatched while this handler runs on the framing
@@ -745,9 +821,7 @@ impl AcpService {
         let receiver = match session.events.lock().expect("session events lock").take() {
             Some(receiver) => receiver,
             None => {
-                return RouteOutcome::Error(internal_error(
-                    "session engine stream is not available",
-                ))
+                return Err(internal_error("session engine stream is not available"));
             }
         };
         let request_id = session.next_request_id("mode");
@@ -757,9 +831,7 @@ impl AcpService {
         ));
         if sent.is_err() {
             *session.events.lock().expect("session events lock") = Some(receiver);
-            return RouteOutcome::Error(internal_error(
-                "runtime engine died before the mode switch",
-            ));
+            return Err(internal_error("runtime engine died before the mode switch"));
         }
 
         let deadline = Instant::now() + MODE_SWITCH_TIMEOUT;
@@ -792,13 +864,161 @@ impl AcpService {
         }
         // Park the stream back so the next prompt can run.
         *session.events.lock().expect("session events lock") = Some(receiver);
-        match ack {
-            Ok(()) => RouteOutcome::Reply(
-                serde_json::to_value(acp::SetSessionModeResponse::default())
-                    .expect("set mode response serializes"),
-            ),
-            Err(error) => RouteOutcome::Error(error),
+        if ack.is_ok() {
+            *session.current_mode.lock().expect("current mode lock") =
+                permission_mode_id(mode).to_string();
         }
+        ack
+    }
+
+    /// `session/set_config_option`: switch a config option the session
+    /// advertised — the `mode` select maps to a permission-mode switch,
+    /// the `model` select to a provider + model switch. The response
+    /// carries the full, refreshed option list (the client's source of
+    /// truth for the selectors).
+    fn session_set_config_option(&self, frame: &Value) -> RouteOutcome {
+        let request = match parse_params::<acp::SetSessionConfigOptionRequest>(
+            frame,
+            SESSION_SET_CONFIG_OPTION,
+        ) {
+            Ok(request) => request,
+            Err(error) => return RouteOutcome::Error(error),
+        };
+        let session_id = request.session_id.to_string();
+        let session = {
+            let sessions = self.sessions.lock().expect("session registry lock");
+            sessions.get(&session_id).cloned()
+        };
+        let Some(session) = session else {
+            return RouteOutcome::Error(acp::Error::session_not_found(request.session_id));
+        };
+        let config_id = request.config_id.0.to_string();
+        let Some(value) = request.value.as_value_id() else {
+            return RouteOutcome::Error(invalid_params_error(format!(
+                "config option {config_id:?} takes a value id (select), got a non-select value"
+            )));
+        };
+        match config_id.as_str() {
+            "mode" => {
+                let Some(mode) = permission_mode(value.0.as_ref()) else {
+                    return RouteOutcome::Error(unknown_mode_error(value.0.as_ref()));
+                };
+                match self.switch_mode_on_engine(&session, mode) {
+                    Ok(()) => {}
+                    Err(error) => return RouteOutcome::Error(error),
+                }
+            }
+            "model" => {
+                let Some(config) = self.adapter_config() else {
+                    return RouteOutcome::Error(internal_error("no provider configuration"));
+                };
+                let Some((provider_name, model_name)) = value.0.split_once('/') else {
+                    return RouteOutcome::Error(invalid_params_error(format!(
+                        "invalid model id: {value:?} (expected \"<provider>/<model>\")"
+                    )));
+                };
+                let known = config
+                    .providers
+                    .iter()
+                    .find(|provider| provider.name.eq_ignore_ascii_case(provider_name))
+                    .and_then(|provider| {
+                        provider
+                            .models
+                            .iter()
+                            .find(|model| model.model.eq_ignore_ascii_case(model_name))
+                    });
+                if known.is_none() {
+                    return RouteOutcome::Error(invalid_params_error(format!(
+                        "model '{value}' is not configured"
+                    )));
+                }
+                if session.busy.load(Ordering::SeqCst) {
+                    return RouteOutcome::Error(busy_error(&session.id));
+                }
+                let receiver = match session.events.lock().expect("session events lock").take() {
+                    Some(receiver) => receiver,
+                    None => {
+                        return RouteOutcome::Error(internal_error(
+                            "session engine stream is not available",
+                        ))
+                    }
+                };
+                let request_id = session.next_request_id("model");
+                let sent = session.req_tx.send(ProtocolRequest::new(
+                    request_id,
+                    Request::SetSessionModel {
+                        model: value.0.to_string(),
+                    },
+                ));
+                if sent.is_err() {
+                    *session.events.lock().expect("session events lock") = Some(receiver);
+                    return RouteOutcome::Error(internal_error(
+                        "runtime engine died before the model switch",
+                    ));
+                }
+                let deadline = Instant::now() + MODE_SWITCH_TIMEOUT;
+                let mut ack: Result<(), acp::Error> = Err(internal_error(
+                    "session engine did not acknowledge the model switch",
+                ));
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(remaining) {
+                        Ok(event) => match &event.event {
+                            takka_core::Event::SessionModelChanged { provider, model } => {
+                                *session.current_model.lock().expect("current model lock") =
+                                    format!("{provider}/{model}");
+                                session.context_size.store(
+                                    u64::from(model_max_tokens(&config, provider, model)),
+                                    Ordering::SeqCst,
+                                );
+                                ack = Ok(());
+                                break;
+                            }
+                            takka_core::Event::Error { message } => {
+                                ack = Err(invalid_params_error(message.clone()));
+                                break;
+                            }
+                            _ => continue,
+                        },
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            ack = Err(internal_error(
+                                "runtime engine died during the model switch",
+                            ));
+                            break;
+                        }
+                    }
+                }
+                *session.events.lock().expect("session events lock") = Some(receiver);
+                if let Err(error) = ack {
+                    return RouteOutcome::Error(error);
+                }
+            }
+            other => {
+                return RouteOutcome::Error(invalid_params_error(format!(
+                    "unknown config option: {other:?} (available: \"model\", \"mode\")"
+                )));
+            }
+        }
+        let current_model = session
+            .current_model
+            .lock()
+            .expect("current model lock")
+            .clone();
+        let current_mode = session
+            .current_mode
+            .lock()
+            .expect("current mode lock")
+            .clone();
+        let config = self.adapter_config();
+        let options = match &config {
+            Some(config) => build_config_options(config, &current_model, &current_mode),
+            None => Vec::new(),
+        };
+        RouteOutcome::Reply(
+            serde_json::to_value(acp::SetSessionConfigOptionResponse::new(options))
+                .expect("set config option response serializes"),
+        )
     }
 
     /// `session/load` / `session/resume`: attach a stored checkpoint to a
@@ -870,6 +1090,17 @@ impl AcpService {
             Ok(session) => session,
             Err(error) => return RouteOutcome::Error(error),
         };
+        {
+            // Register BEFORE the load: without this the session Arc (and
+            // its engine) died when this handler returned, and the first
+            // prompt after a successful load answered `session not found`.
+            // Same EOF-drain guard as `session/new`.
+            let mut registry = self.sessions.lock().expect("session registry lock");
+            if self.closed.load(Ordering::SeqCst) {
+                return RouteOutcome::Error(internal_error("connection is shutting down"));
+            }
+            registry.insert(session_id.clone(), session.clone());
+        }
 
         let request_id = session.next_request_id("load");
         let sent = session.req_tx.send(ProtocolRequest::new(
@@ -1115,11 +1346,11 @@ impl AcpService {
                 // shape the bridge asked for — ignore.
                 Err(_) => return,
             };
-        let (request_id, approved) = match answered {
+        let (request_id, answer) = match answered {
             acp::Response::Result { id, result } => {
-                (id, acp_permission::outcome_approves(&result.outcome))
+                (id, acp_permission::outcome_answer(&result.outcome))
             }
-            acp::Response::Error { id, .. } => (id, false),
+            acp::Response::Error { id, .. } => (id, PermissionAnswer::Deny),
         };
         // Outbound ids are strings (`acp-perm-N`); other id shapes can
         // never match one and fall through to the same silent drop.
@@ -1127,7 +1358,7 @@ impl AcpService {
             .permission_waiters
             .remove(request_id.to_string().as_str())
         {
-            let _ = waiter.answer_tx.send(approved);
+            let _ = waiter.answer_tx.send(answer);
         }
     }
 }
@@ -1236,7 +1467,8 @@ fn run_prompt_turn(
         return;
     }
 
-    let mut translator = TranslatorState::new();
+    let mut translator =
+        TranslatorState::with_context_size(session.context_size.load(Ordering::SeqCst));
     let mut engine_died = false;
     // D12: a turn that ends because a limit was hit must report the real
     // reason instead of degrading to `end_turn`. The engine emits the limit
@@ -1275,15 +1507,19 @@ fn run_prompt_turn(
                 takka_core::Event::ConfirmationRequest {
                     action,
                     description,
+                    target,
                     ..
                 } => {
                     // T-05: the permission bridge (D8). Ask the client,
                     // park until its answer frame (routed by the framing
                     // loop) or a cancel/teardown deny frees the waiter,
                     // then unblock the engine with `ConfirmResponse` so
-                    // the turn continues either way.
-                    let approved =
+                    // the turn continues either way. An "always allow"
+                    // additionally persists the target command on the
+                    // engine's dynamic auto-approve list (in-session).
+                    let answer =
                         request_permission(&session, &permissions, &sink, action, description);
+                    let approved = !matches!(answer, PermissionAnswer::Deny);
                     let confirm_id = session.next_request_id("confirm");
                     let confirm = ProtocolRequest::new(
                         confirm_id,
@@ -1292,6 +1528,18 @@ fn run_prompt_turn(
                     if session.req_tx.send(confirm).is_err() {
                         engine_died = true;
                         break Err(internal_error("runtime engine died mid-turn"));
+                    }
+                    if let (PermissionAnswer::AllowAlways, Some(command)) = (answer, target) {
+                        let allow_id = session.next_request_id("allow");
+                        let allow = ProtocolRequest::new(
+                            allow_id,
+                            Request::AllowCommand {
+                                command: command.clone(),
+                            },
+                        );
+                        // FIFO behind the ConfirmResponse above; fire-and-
+                        // forget (the engine applies it without an ack).
+                        let _ = session.req_tx.send(allow);
                     }
                 }
                 event => {
@@ -1350,9 +1598,9 @@ fn request_permission(
     sink: &Arc<dyn AcpSink>,
     action: &str,
     description: &str,
-) -> bool {
+) -> PermissionAnswer {
     let outbound_id = permissions.next_outbound_id();
-    let (answer_tx, answer_rx) = mpsc::sync_channel::<bool>(1);
+    let (answer_tx, answer_rx) = mpsc::sync_channel::<PermissionAnswer>(1);
     permissions.insert(
         outbound_id.clone(),
         PermissionWaiter {
@@ -1370,7 +1618,7 @@ fn request_permission(
     // No deadline here (a user may take minutes to decide) — cancel and
     // teardown are the events that free this park early. A dropped
     // sender (waiter removed without an answer) is also a denial.
-    answer_rx.recv().unwrap_or(false)
+    answer_rx.recv().unwrap_or(PermissionAnswer::Deny)
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1764,86 @@ fn unknown_mode_error(mode_id: &str) -> acp::Error {
     }))
 }
 
+/// takka permission mode -> the ACP mode id advertised on the wire.
+fn permission_mode_id(mode: PermissionMode) -> &'static str {
+    mode.as_str()
+}
+
+/// Config option surfaces for one session (Zed renders `configOptions` in
+/// place of the legacy `modes` field, so BOTH selectors live here): the
+/// `model` select groups every configured provider's models (value =
+/// provider-qualified id), the `mode` select carries the permission modes.
+fn build_config_options(
+    config: &takka_core::Config,
+    current_model: &str,
+    current_mode: &str,
+) -> Vec<acp::SessionConfigOption> {
+    let mut options = Vec::new();
+    let groups: Vec<acp::SessionConfigSelectGroup> = config
+        .providers
+        .iter()
+        .filter(|provider| !provider.models.is_empty())
+        .map(|provider| {
+            let model_options = provider
+                .models
+                .iter()
+                .map(|model| {
+                    acp::SessionConfigSelectOption::new(
+                        format!("{}/{}", provider.name, model.model),
+                        model
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| model.model.clone()),
+                    )
+                })
+                .collect();
+            acp::SessionConfigSelectGroup::new(
+                provider.name.clone(),
+                provider.name.clone(),
+                model_options,
+            )
+        })
+        .collect();
+    if !groups.is_empty() {
+        options.push(
+            acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                current_model.to_string(),
+                acp::SessionConfigSelectOptions::Grouped(groups),
+            )
+            .category(acp::SessionConfigOptionCategory::Model),
+        );
+    }
+    let mode_options: Vec<acp::SessionConfigSelectOption> = ["default", "plan", "yolo"]
+        .iter()
+        .map(|mode_id| acp::SessionConfigSelectOption::new(*mode_id, *mode_id))
+        .collect();
+    options.push(
+        acp::SessionConfigOption::select("mode", "Mode", current_mode.to_string(), mode_options)
+            .category(acp::SessionConfigOptionCategory::Mode),
+    );
+    options
+}
+
+/// `max_tokens` of the configured model `provider/model` (the
+/// `UsageUpdate.size` for a session running it). Falls back to the
+/// default memory budget when the model is not configured.
+fn model_max_tokens(config: &takka_core::Config, provider_name: &str, model_id: &str) -> u32 {
+    config
+        .providers
+        .iter()
+        .find(|provider| provider.name.eq_ignore_ascii_case(provider_name))
+        .and_then(|provider| {
+            provider
+                .models
+                .iter()
+                .find(|model| model.model.eq_ignore_ascii_case(model_id))
+        })
+        .map(|model| model.max_tokens)
+        .unwrap_or(128_000)
+}
+
 /// D9: ACP mode id -> takka's permission mode. `None` = not advertised.
 fn permission_mode(mode_id: &str) -> Option<PermissionMode> {
     match mode_id {
@@ -1648,12 +1976,25 @@ pub struct TranslatorState {
     /// here and each update carries the full accumulated text, because ACP
     /// `ToolCallUpdateFields.content` is overwritten, not extended).
     stream_buffer: std::collections::HashMap<String, String>,
+    /// Context-window size reported on `UsageUpdate` (the active model's
+    /// `max_tokens`); 0 when unknown.
+    context_size: u64,
 }
 
 impl TranslatorState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Translator that reports `UsageUpdate.size = context_size` (the
+    /// session's active model context window).
+    #[must_use]
+    pub fn with_context_size(context_size: u64) -> Self {
+        Self {
+            context_size,
+            ..Self::default()
+        }
     }
 
     /// Map an engine event to the ACP session update it should surface.
@@ -1680,6 +2021,13 @@ impl TranslatorState {
                 )),
                 _ => None,
             },
+            // Context-window telemetry (Zed renders it as the context
+            // usage indicator): `used` = the prompt size of the last
+            // model call (what is in context), `size` = the active
+            // model's context window.
+            Event::Usage { prompt_tokens, .. } => Some(acp::SessionUpdate::UsageUpdate(
+                acp::UsageUpdate::new(u64::from(*prompt_tokens), self.context_size),
+            )),
             Event::AssistantDelta { content } => Some(acp::SessionUpdate::AgentMessageChunk(
                 acp::ContentChunk::new(text_block(content)),
             )),
@@ -1758,7 +2106,6 @@ impl TranslatorState {
             | Event::TodoChanged { .. }
             | Event::SessionReset
             | Event::MemorySearchResult { .. }
-            | Event::Usage { .. }
             | Event::ToolList { .. }
             | Event::SkillActivatedResult { .. }
             | Event::PlanApprovalRequest { .. }
@@ -1781,6 +2128,7 @@ impl TranslatorState {
             | Event::Steered { .. }
             | Event::SessionAdopted { .. }
             | Event::SessionLoaded { .. }
+            | Event::SessionModelChanged { .. }
             | Event::CompactionStarted
             | Event::WaitingForUser
             | Event::SessionCompleted { .. } => None,
@@ -2150,6 +2498,274 @@ mod tests {
         acp.close_and_join();
     }
 
+    /// Regression: a successfully loaded session must be usable — the
+    /// first prompt after `session/load` reaches the engine and completes
+    /// (previously the session died with the handler and the prompt
+    /// answered `session not found`).
+    #[test]
+    fn session_load_is_promptable_afterwards() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(
+            DEFAULT_MAX_SESSIONS,
+            Arc::new(|req_rx, evt_tx| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => {
+                            emit(takka_core::Event::InitOk {
+                                protocol: "takka".to_owned(),
+                                version: 2,
+                            });
+                        }
+                        Request::LoadSession { .. } => {
+                            emit(takka_core::Event::SessionLoaded {
+                                session_id: "loaded-1".to_owned(),
+                            });
+                        }
+                        Request::Run { .. } => {
+                            emit(takka_core::Event::AssistantDelta {
+                                content: "after load".to_owned(),
+                            });
+                            emit(takka_core::Event::Done {
+                                result: "after load".to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        let cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_string_lossy()
+            .into_owned();
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": SESSION_LOAD,
+            "params": { "sessionId": "loaded-1", "cwd": cwd, "mcpServers": [] }
+        }));
+        let response = acp.response(1);
+        assert!(
+            response["error"].is_null(),
+            "load failed: {}",
+            response["error"]
+        );
+        send_prompt(&acp, 2, "loaded-1", text_prompt("are you alive"));
+        let response = acp.response(2);
+        assert!(
+            response["error"].is_null(),
+            "prompt after load must work, got {}",
+            response["error"]
+        );
+        acp.close_and_join();
+    }
+
+    /// `session/new` advertises the config-option surface: a `model`
+    /// select grouped by provider (current = the active qualified model)
+    /// and a `mode` select carrying the permission modes (current =
+    /// `default`). Zed renders `configOptions` instead of the legacy
+    /// `modes` field, so both selectors must be here.
+    #[test]
+    fn session_new_advertises_model_and_mode_config_options() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let _session = new_session(&acp, 1);
+        let response = acp.response(1);
+        let options = &response["result"]["configOptions"];
+        assert!(options.is_array(), "configOptions: {response}");
+        let model = options
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|option| option["id"] == serde_json::json!("model"))
+            .expect("model option")
+            .clone();
+        assert_eq!(model["name"], serde_json::json!("Model"));
+        assert_eq!(model["category"], serde_json::json!("model"));
+        assert_eq!(
+            model["currentValue"],
+            serde_json::json!("hermetic-test/hermetic-model")
+        );
+        let groups = model["options"].as_array().expect("grouped options");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["group"], serde_json::json!("hermetic-test"));
+        assert_eq!(
+            groups[0]["options"][0]["value"],
+            serde_json::json!("hermetic-test/hermetic-model")
+        );
+        assert_eq!(
+            groups[0]["options"][0]["name"],
+            serde_json::json!("hermetic-model")
+        );
+
+        let mode = options
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|option| option["id"] == serde_json::json!("mode"))
+            .expect("mode option")
+            .clone();
+        assert_eq!(mode["category"], serde_json::json!("mode"));
+        assert_eq!(mode["currentValue"], serde_json::json!("default"));
+        let mode_values: Vec<&str> = mode["options"]
+            .as_array()
+            .expect("flat mode options")
+            .iter()
+            .map(|value| value["value"].as_str().expect("value id"))
+            .collect();
+        assert_eq!(mode_values, vec!["default", "plan", "yolo"]);
+        acp.close_and_join();
+    }
+
+    /// `session/set_config_option` on the `mode` select switches the
+    /// permission mode and returns the refreshed option list with the new
+    /// current value.
+    #[test]
+    fn session_set_config_option_switches_the_mode() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(
+            DEFAULT_MAX_SESSIONS,
+            Arc::new(|req_rx, evt_tx| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => {
+                            emit(takka_core::Event::InitOk {
+                                protocol: "takka".to_owned(),
+                                version: 2,
+                            });
+                        }
+                        Request::SetPermissionMode { mode } => {
+                            emit(takka_core::Event::PermissionModeChanged { mode });
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        let session = new_session(&acp, 1);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_SET_CONFIG_OPTION,
+            "params": { "sessionId": session, "configId": "mode", "value": "plan" }
+        }));
+        let response = acp.response(2);
+        assert!(
+            response["error"].is_null(),
+            "switch failed: {}",
+            response["error"]
+        );
+        let mode = response["result"]["configOptions"]
+            .as_array()
+            .expect("options array")
+            .iter()
+            .find(|option| option["id"] == serde_json::json!("mode"))
+            .expect("mode option")
+            .clone();
+        assert_eq!(mode["currentValue"], serde_json::json!("plan"));
+        acp.close_and_join();
+    }
+
+    /// `session/set_config_option` on an unconfigured model is invalid
+    /// params naming the miss.
+    #[test]
+    fn session_set_config_option_rejects_unknown_models() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let session = new_session(&acp, 1);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_SET_CONFIG_OPTION,
+            "params": { "sessionId": session, "configId": "model", "value": "no-provider/no-model" }
+        }));
+        let response = acp.response(2);
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(-32602),
+            "{response}"
+        );
+        assert!(
+            format!("{}", response["error"]["message"]).contains("not configured"),
+            "{response}"
+        );
+        acp.close_and_join();
+    }
+
+    /// An unknown config id is invalid params naming the available ids.
+    #[test]
+    fn session_set_config_option_rejects_unknown_ids() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let session = new_session(&acp, 1);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_SET_CONFIG_OPTION,
+            "params": { "sessionId": session, "configId": "temperature", "value": "0.7" }
+        }));
+        let response = acp.response(2);
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(-32602),
+            "{response}"
+        );
+        assert!(
+            format!("{}", response["error"]["message"]).contains("temperature"),
+            "{response}"
+        );
+        acp.close_and_join();
+    }
+
+    /// `session/set_config_option` on the `model` select reaches the
+    /// engine (`Request::SetSessionModel`), and the response reports the
+    /// new current value.
+    #[test]
+    fn session_set_config_option_switches_the_model() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(
+            DEFAULT_MAX_SESSIONS,
+            Arc::new(|req_rx, evt_tx| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => {
+                            emit(takka_core::Event::InitOk {
+                                protocol: "takka".to_owned(),
+                                version: 2,
+                            });
+                        }
+                        Request::SetSessionModel { model } => {
+                            let (provider, model) = model.split_once('/').expect("qualified");
+                            emit(takka_core::Event::SessionModelChanged {
+                                provider: provider.to_owned(),
+                                model: model.to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        let session = new_session(&acp, 1);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_SET_CONFIG_OPTION,
+            "params": { "sessionId": session, "configId": "model", "value": "hermetic-test/hermetic-model" }
+        }));
+        let response = acp.response(2);
+        assert!(
+            response["error"].is_null(),
+            "switch failed: {}",
+            response["error"]
+        );
+        let model = response["result"]["configOptions"]
+            .as_array()
+            .expect("options array")
+            .iter()
+            .find(|option| option["id"] == serde_json::json!("model"))
+            .expect("model option")
+            .clone();
+        assert_eq!(
+            model["currentValue"],
+            serde_json::json!("hermetic-test/hermetic-model")
+        );
+        acp.close_and_join();
+    }
+
     /// D9: an unadvertised mode id is rejected as invalid params and names
     /// the modes the client may actually use.
     #[test]
@@ -2252,6 +2868,25 @@ mod tests {
         state
             .translate(&event)
             .expect("event maps to an update in these scenarios")
+    }
+
+    #[test]
+    fn usage_maps_to_a_usage_update_with_the_session_context_size() {
+        let mut state = TranslatorState::with_context_size(198_192);
+        let update = take(
+            &mut state,
+            takka_core::Event::Usage {
+                prompt_tokens: 53_000,
+                completion_tokens: 1_200,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+            },
+        );
+        let acp::SessionUpdate::UsageUpdate(usage) = update else {
+            panic!("usage must map to a UsageUpdate, got {update:?}");
+        };
+        assert_eq!(usage.used, 53_000);
+        assert_eq!(usage.size, 198_192);
     }
 
     #[test]
@@ -2442,6 +3077,7 @@ mod tests {
                 message: "w".to_owned(),
             },
             takka_core::Event::ConfirmationRequest {
+                target: None,
                 action: "run".to_owned(),
                 description: "x".to_owned(),
                 risk_level: "MEDIUM".to_owned(),
@@ -3011,6 +3647,7 @@ mod tests {
                     });
                     if gate {
                         emit(takka_core::Event::ConfirmationRequest {
+                            target: None,
                             action: "run".to_owned(),
                             description: "delete the build dir".to_owned(),
                             risk_level: "MEDIUM".to_owned(),
@@ -3158,6 +3795,7 @@ mod tests {
                                 let mut confirm_pending = false;
                                 if gate {
                                     emit(takka_core::Event::ConfirmationRequest {
+                                        target: None,
                                         action: "run".to_owned(),
                                         description: "delete the build dir".to_owned(),
                                         risk_level: "MEDIUM".to_owned(),
@@ -3390,9 +4028,10 @@ mod tests {
         let options = permission["params"]["options"]
             .as_array()
             .expect("options array");
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
         assert_eq!(options[0]["optionId"], serde_json::json!("allow_once"));
-        assert_eq!(options[1]["optionId"], serde_json::json!("reject_once"));
+        assert_eq!(options[1]["optionId"], serde_json::json!("allow_always"));
+        assert_eq!(options[2]["optionId"], serde_json::json!("reject_once"));
 
         // The client answers allow_once, echoing the request id.
         acp.send(serde_json::json!({

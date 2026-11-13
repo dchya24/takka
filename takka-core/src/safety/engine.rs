@@ -25,6 +25,9 @@ pub struct Safety {
     audit_log: Mutex<Vec<AuditEntry>>,
     /// Active permission mode. Defaults to `Default` (ask).
     mode: Mutex<PermissionMode>,
+    /// Commands allowed at runtime (the client's "always allow" answers).
+    /// Checked alongside `config.auto_approve_commands`; never persisted.
+    dynamic_allow: Mutex<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +100,7 @@ impl Safety {
             rate_limit_states: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
             mode: Mutex::new(PermissionMode::default()),
+            dynamic_allow: Mutex::new(Vec::new()),
         }
     }
 
@@ -106,6 +110,7 @@ impl Safety {
             rate_limit_states: Mutex::new(HashMap::new()),
             audit_log: Mutex::new(Vec::new()),
             mode: Mutex::new(PermissionMode::default()),
+            dynamic_allow: Mutex::new(Vec::new()),
         }
     }
 
@@ -123,6 +128,27 @@ impl Safety {
     /// (see [`super::config::SafetyConfig::auto_approve_commands`]).
     pub fn set_auto_approve_commands(&mut self, commands: Vec<String>) {
         self.config.auto_approve_commands = commands;
+    }
+
+    /// Allow `command` (and anything prefixing beyond it) to run without a
+    /// confirmation prompt for the rest of this Safety's lifetime — the
+    /// engine-side effect of a client's "always allow" answer. Kept in a
+    /// separate in-memory list (`&self`: the answer arrives mid-turn),
+    /// deduplicated; the strict matching rules of
+    /// [`SafetyConfig::auto_approve_commands`] still apply, so chained or
+    /// destructive commands keep prompting.
+    pub fn allow_command(&self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        let mut dynamic = self.dynamic_allow.lock().expect("dynamic allow lock");
+        if !dynamic
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(command))
+        {
+            dynamic.push(command.to_string());
+        }
     }
 
     pub fn with_auto_approve_commands(mut self, commands: Vec<String>) -> Self {
@@ -243,6 +269,15 @@ impl Safety {
     /// Does one (un-chained) command start with an auto-approve prefix?
     fn matches_auto_approve_prefix(&self, command: &str) -> bool {
         let normalized = command.trim().to_lowercase();
+        if self
+            .dynamic_allow
+            .lock()
+            .expect("dynamic allow lock")
+            .iter()
+            .any(|allowed| normalized.starts_with(&allowed.to_lowercase()))
+        {
+            return true;
+        }
         self.config.auto_approve_commands.iter().any(|prefix| {
             let prefix = prefix.trim().to_lowercase();
             !prefix.is_empty()
@@ -671,6 +706,7 @@ impl Safety {
             reason: format!("Risk score: {:.2} ({})", score.value, score.level.as_str()),
             timestamp: Utc::now(),
             preview_diff: None,
+            target: target.map(|target| target.to_string()),
         }
     }
 
@@ -997,4 +1033,36 @@ fn has_blocking_flag(segment: &str) -> bool {
     unquoted_content(segment)
         .split_whitespace()
         .any(|token| AUTO_APPROVE_BLOCKING_FLAGS.contains(&token))
+}
+
+#[cfg(test)]
+mod dynamic_allow_tests {
+    use super::*;
+
+    /// "Always allow" (the client's `Request::AllowCommand`): the exact
+    /// command and longer prefix variants stop asking; chained commands
+    /// keep prompting; duplicates are ignored.
+    #[test]
+    fn allow_command_covers_exact_and_prefix_variants_only() {
+        let safety = Safety::new();
+        assert!(
+            !safety.is_auto_approved_command("cargo build --release"),
+            "un-allowed commands start gated"
+        );
+        safety.allow_command("cargo build --release");
+        assert!(safety.is_auto_approved_command("cargo build --release"));
+        assert!(safety.is_auto_approved_command("cargo build --release --quiet"));
+        assert!(
+            !safety.is_auto_approved_command("cargo build && rm -rf /"),
+            "chained commands still prompt"
+        );
+        assert!(
+            !safety.is_auto_approved_command("cargo test -- --nocapture"),
+            "other commands stay gated"
+        );
+        // Duplicate answers (the same command approved twice) collapse.
+        safety.allow_command("cargo build --release");
+        assert!(safety.is_auto_approved_command("cargo build --release"));
+        assert_eq!(safety.dynamic_allow.lock().unwrap().len(), 1);
+    }
 }

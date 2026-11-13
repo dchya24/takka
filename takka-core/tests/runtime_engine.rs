@@ -716,6 +716,7 @@ mod sink_tests {
         sink.send(
             Some("r".into()),
             Event::ConfirmationRequest {
+                target: None,
                 action: "write".into(),
                 description: "d".into(),
                 risk_level: "medium".into(),
@@ -1799,4 +1800,160 @@ fn load_session_replays_history_and_acks() {
 
     let _ = AgentSession::new(session_id, "unused");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ACP model switch (`Request::SetSessionModel`): the engine reorders the
+/// config so the chosen provider/model is active, persists the config file
+/// back to its source path, rebuilds the provider + spawn_subagent tool,
+/// and acks `SessionModelChanged`.
+#[test]
+fn set_session_model_reorders_persists_and_acks() {
+    use std::io::Read;
+
+    let dir = std::env::temp_dir().join(format!(
+        "takka-set-model-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "providers": [
+    {
+      "name": "provider-one",
+      "type": "openai-compatible",
+      "api_base": "http://127.0.0.1:9",
+      "api_key": "unused",
+      "models": [
+        { "model": "model-a", "temperature": 0.0, "max_tokens": 64 }
+      ]
+    },
+    {
+      "name": "provider-two",
+      "type": "openai-compatible",
+      "api_base": "http://127.0.0.1:9",
+      "api_key": "unused",
+      "models": [
+        { "model": "model-b", "temperature": 0.0, "max_tokens": 128 }
+      ]
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let transport = MemoryTransport::new(request_rx, event_tx);
+    let mut engine = RuntimeEngine::new(transport);
+    let worker = std::thread::spawn(move || engine.run());
+    request_tx
+        .send(ProtocolRequest::new(
+            "init-1",
+            Request::Init {
+                overrides: takka_core::runtime::protocol::InitOverrides {
+                    config_path: Some(config_path.to_string_lossy().into_owned()),
+                    permission_mode: None,
+                    model: None,
+                    system_prompt: None,
+                    session_id: None,
+                },
+                capabilities: ConnectionCapabilities::default(),
+                daemon_token: None,
+            },
+        ))
+        .unwrap();
+    request_tx
+        .send(ProtocolRequest::new(
+            "model-1",
+            Request::SetSessionModel {
+                model: "provider-two/model-b".into(),
+            },
+        ))
+        .unwrap();
+    request_tx
+        .send(ProtocolRequest::new(
+            "model-2",
+            Request::SetSessionModel {
+                model: "provider-three/no-model".into(),
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+    let events: Vec<_> = event_rx.try_iter().collect();
+
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        Event::SessionModelChanged { provider, model }
+            if provider == "provider-two" && model == "model-b"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        Event::Error { message } if message.contains("not configured")
+    )));
+
+    // The reorder is persisted back to the config file: provider-two now
+    // sits first.
+    let mut persisted = String::new();
+    std::fs::File::open(&config_path)
+        .unwrap()
+        .read_to_string(&mut persisted)
+        .unwrap();
+    let provider_pos = persisted
+        .find("\"provider-two\"")
+        .expect("provider-two persisted");
+    let other_pos = persisted
+        .find("\"provider-one\"")
+        .expect("provider-one persisted");
+    assert!(
+        provider_pos < other_pos,
+        "the chosen provider must be first after the switch"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Client "always allow" (`Request::AllowCommand`): the engine accepts it
+/// on an initialized session (no ack, fire-and-forget), and a subsequent
+/// identical `Run` still works.
+#[test]
+fn allow_command_is_accepted_and_session_survives() {
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let transport = MemoryTransport::new(request_rx, event_tx);
+    let mut engine = RuntimeEngine::with_session(
+        transport,
+        std::sync::Arc::new(TextProvider),
+        ToolRegistry::new(),
+    );
+    let worker = std::thread::spawn(move || engine.run());
+    request_tx
+        .send(ProtocolRequest::new(
+            "allow-1",
+            Request::AllowCommand {
+                command: "cargo build".into(),
+            },
+        ))
+        .unwrap();
+    request_tx
+        .send(ProtocolRequest::new(
+            "run-1",
+            Request::Run {
+                task: "still alive".into(),
+                attachments: vec![],
+            },
+        ))
+        .unwrap();
+    drop(request_tx);
+    worker.join().unwrap();
+    let events: Vec<_> = event_rx.try_iter().collect();
+    assert!(events
+        .iter()
+        .any(|event| matches!(&event.event, Event::Done { .. })));
 }

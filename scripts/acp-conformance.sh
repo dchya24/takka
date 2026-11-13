@@ -230,6 +230,10 @@ PY
         ok "session/new returns a sessionId"
         assert_field 2 "result.modes.currentModeId" '"default"' "session/new advertises default as the current mode"
         assert_field 2 "result.modes.availableModes.1.id" '"plan"' "session/new advertises the plan mode"
+        assert_field 2 "result.configOptions.0.id" '"model"' "session/new advertises the model config option"
+        assert_field 2 "result.configOptions.0.currentValue" '"conformance-hermetic/hermetic-model"' "session/new reports the active model"
+        assert_field 2 "result.configOptions.1.id" '"mode"' "session/new advertises the mode config option"
+        assert_field 2 "result.configOptions.1.currentValue" '"default"' "session/new reports the default permission mode"
     else
         bad "session/new returns a sessionId" "no sessionId in the result"
     fi
@@ -380,7 +384,34 @@ else
     bad "session/load is answered" "no response to id 8 within 15s"
 fi
 
-# --- 9) EOF: the client closes stdin, the agent exits 0 ------------------
+# --- 9) session/set_config_option switches the mode -----------------------
+send "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"session/set_config_option\",\"params\":{\"sessionId\":\"$SESSION\",\"configId\":\"mode\",\"value\":\"plan\"}}"
+if await_id 9; then
+    if python3 - "$OUT" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        frame = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(frame, dict) and str(frame.get("id")) == "9":
+        sys.exit(0 if isinstance(frame.get("result"), dict) else 1)
+sys.exit(1)
+PY
+    then
+        ok "session/set_config_option(mode=plan) succeeds (result object, no error)"
+    else
+        bad "session/set_config_option(mode=plan)" "got an error frame"
+    fi
+    assert_field 9 "result.configOptions.1.currentValue" '"plan"' "session/set_config_option reports the new current mode"
+else
+    bad "session/set_config_option is answered" "no response to id 9 within 15s"
+fi
+
+# --- 10) EOF: the client closes stdin, the agent exits 0 ------------------
 # Closing the FIFO writer is precisely what an ACP client does at shutdown.
 exec 3>&-
 

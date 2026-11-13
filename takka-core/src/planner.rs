@@ -529,6 +529,7 @@ impl PlannerAgent {
     /// Request approval for a plan. Returns `true` if approved.
     pub fn request_approval(&self, plan: &Plan) -> bool {
         self.events.emit(crate::events::Event::ConfirmationRequest {
+            target: None,
             action: "plan_approval".to_string(),
             description: format!(
                 "Plan: {} ({} steps)\n{}",

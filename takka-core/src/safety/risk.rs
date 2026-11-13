@@ -172,4 +172,10 @@ pub struct ConfirmationRequest {
     /// could not be computed (e.g. file unreadable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_diff: Option<String>,
+    /// Raw target the request scores (the command line, the file path) —
+    /// the same value `create_request_for` scored. Frontends use it for
+    /// "always allow this command" persistence; `None` when there is no
+    /// target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }

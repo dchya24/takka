@@ -2686,6 +2686,7 @@ impl Commands {
                 },
                 |event| match &event.event {
                     takka_core::Event::ConfirmationRequest {
+                        target,
                         action,
                         description,
                         risk_level,
@@ -2698,6 +2699,7 @@ impl Commands {
                         let request = takka_core::ConfirmationRequest {
                             action: action.clone(),
                             description: description.clone(),
+                            target: target.clone(),
                             risk_level: match risk_level.as_str() {
                                 "low" => takka_core::RiskLevel::Low,
                                 "high" => takka_core::RiskLevel::High,
@@ -2957,6 +2959,7 @@ impl Commands {
                         let approved = prompt_confirmation(&takka_core::ConfirmationRequest {
                             action: "runtime".to_string(),
                             description: description.clone(),
+                            target: None,
                             risk_level: takka_core::RiskLevel::Medium,
                             risk_score: 0.5,
                             reason: description.clone(),

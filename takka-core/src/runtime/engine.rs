@@ -95,6 +95,14 @@ pub struct RuntimeEngine<T: Transport> {
     /// Discovered skill index — populated by [`Self::initialize`], used
     /// by `Request::SkillActivate` (resolve + inject).
     skill_index: Option<Arc<std::sync::RwLock<crate::SkillIndex>>>,
+    /// Loaded config, kept for `Request::SetSessionModel` (provider +
+    /// model lookup, reorder, persist). `None` for embedded sessions
+    /// built via `with_session`/`with_provider`.
+    session_config: Option<crate::Config>,
+    /// Where `session_config` was loaded from — model switches are
+    /// written back there (never to the ambient config unless the engine
+    /// actually loaded it).
+    session_config_path: Option<std::path::PathBuf>,
     /// Steer queue (Fase 2b): `Request::Steer` pushes here while a run
     /// is active; the orchestrator's steering source drains the whole
     /// FIFO at each iteration boundary. One shared `Arc` connects the
@@ -119,6 +127,8 @@ impl<T: Transport> RuntimeEngine<T> {
             sink,
             orchestrator: None,
             initialized: false,
+            session_config: None,
+            session_config_path: None,
             capabilities: ConnectionCapabilities::default(),
             daemon_token: None,
             adopt_on_reinit: false,
@@ -195,6 +205,7 @@ impl<T: Transport> RuntimeEngine<T> {
             sink.send(
                 request_id,
                 Event::ConfirmationRequest {
+                    target: request.target.clone(),
                     action: request.action,
                     description: request.description,
                     risk_level: request.risk_level.as_str().to_string(),
@@ -523,6 +534,77 @@ impl<T: Transport> RuntimeEngine<T> {
                         ),
                     }
                 }
+                // ACP model switch (`session/set_config_option`, model
+                // option): rebuild the provider + model, refresh the
+                // spawn_subagent tool, persist the reorder, and ack. Needs
+                // exclusive orchestrator access — same gate as Run.
+                Request::SetSessionModel { model } => {
+                    if self.session_config.is_none() {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    let Some((provider_name, model_id)) = model.split_once('/') else {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: format!(
+                                    "invalid model id: {model:?} (expected \"<provider>/<model>\")"
+                                ),
+                            },
+                        );
+                        continue;
+                    };
+                    if self.running.swap(true, Ordering::SeqCst) {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "busy: another run is active".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    self.running.store(false, Ordering::SeqCst);
+                    let config = self.session_config.as_mut().expect("checked above");
+                    let orchestrator =
+                        Arc::get_mut(self.orchestrator.as_mut().expect("checked above"))
+                            .expect("no run holds the orchestrator between runs");
+                    let outcome = apply_session_model(
+                        config,
+                        self.session_config_path.as_deref(),
+                        orchestrator,
+                        provider_name,
+                        model_id,
+                    );
+                    match outcome {
+                        Ok(()) => self.emit(
+                            Some(request.id),
+                            Event::SessionModelChanged {
+                                provider: provider_name.to_string(),
+                                model: model_id.to_string(),
+                            },
+                        ),
+                        Err(message) => self.emit(Some(request.id), Event::Error { message }),
+                    }
+                }
+                // Client's "always allow": add the command to the safety
+                // engine's dynamic auto-approve list (fire-and-forget).
+                Request::AllowCommand { command } => {
+                    if let Some(orchestrator) = self.orchestrator.as_ref() {
+                        orchestrator.allow_command(&command);
+                    } else {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                    }
+                }
                 // ACP `session/set_mode` (D9): switch the permission mode of
                 // the running session. Safety is consulted per boundary, so
                 // the new mode governs the next turn.
@@ -578,6 +660,8 @@ impl<T: Transport> RuntimeEngine<T> {
                 .ok_or_else(|| format!("failed to load config from: {path}"))?,
             None => Config::load().unwrap_or_else(Config::fallback),
         };
+        self.session_config_path = overrides.config_path.as_ref().map(std::path::PathBuf::from);
+        self.session_config = Some(config.clone());
         let provider_config = config
             .to_provider_config()
             .ok_or_else(|| "no provider configured".to_string())?;
@@ -693,6 +777,7 @@ impl<T: Transport> RuntimeEngine<T> {
             sink.send(
                 request_id,
                 Event::ConfirmationRequest {
+                    target: request.target.clone(),
                     action: request.action,
                     description: request.description,
                     risk_level: request.risk_level.as_str().to_string(),
@@ -1016,6 +1101,43 @@ impl<T: Transport> TodoChangeHandler for RuntimeTodoHandler<T> {
             },
         );
     }
+}
+
+/// `Request::SetSessionModel` body: reorder the config so
+/// `provider_name/model_id` is active, persist it, rebuild the provider,
+/// and refresh the spawn_subagent tool so spawned children follow the
+/// switch. Called between runs (the arm holds the busy gate).
+fn apply_session_model(
+    session_config: &mut crate::Config,
+    config_path: Option<&std::path::Path>,
+    orchestrator: &mut Orchestrator,
+    provider_name: &str,
+    model_id: &str,
+) -> Result<(), String> {
+    let (active_provider, active_model) = session_config.activate_model(provider_name, model_id)?;
+    let _ = active_provider;
+    // Persist the reorder so a restart keeps the choice. Best-effort: a
+    // failed write must not break the live switch.
+    let persist = match config_path {
+        Some(path) => session_config.save_to(path),
+        None => session_config.save(),
+    };
+    if let Err(error) = persist {
+        tracing::warn!(error = %error, "failed to persist the model switch");
+    }
+    let provider_config = session_config
+        .to_provider_config()
+        .ok_or_else(|| "no provider configured".to_string())?;
+    let provider: Arc<dyn LLMProvider> = Arc::new(OpenAIProvider::new(provider_config));
+    orchestrator.set_provider(provider.clone());
+    orchestrator.set_model(active_model.clone());
+    let tools = orchestrator.tool_registry().clone();
+    tools.unregister("spawn_subagent");
+    tools.register(Box::new(
+        SpawnSubagentTool::new(provider, tools.clone(), active_model)
+            .with_mode(orchestrator.permission_mode()),
+    ));
+    Ok(())
 }
 
 /// Root of the session checkpoint store for a connection. With a pinned

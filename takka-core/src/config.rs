@@ -456,6 +456,18 @@ impl Config {
         }
     }
 
+    /// Save config to an explicit path (a host that loaded a config from
+    /// a non-default location writes its updates back there).
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config directory: {}", e))?;
+        }
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        std::fs::write(path, content).map_err(|e| format!("Failed to write config file: {}", e))
+    }
+
     /// Save config to default path
     pub fn save(&self) -> Result<(), String> {
         let path = Self::config_path();
@@ -555,6 +567,44 @@ impl Config {
                 })
             })
             .collect()
+    }
+
+    /// Make `provider_name/model_name` the active (first) provider +
+    /// model — the same reorder the CLI's model switch performs, so the
+    /// next `to_provider_config` / engine init picks it up. Exact
+    /// provider-name + model-id match, case-insensitive. Returns the
+    /// (provider name, model id) that is now active, or an error naming
+    /// the miss.
+    pub fn activate_model(
+        &mut self,
+        provider_name: &str,
+        model_name: &str,
+    ) -> Result<(String, String), String> {
+        let mut found: Option<(usize, usize)> = None;
+        for (pi, provider) in self.providers.iter().enumerate() {
+            if !provider.name.eq_ignore_ascii_case(provider_name) {
+                continue;
+            }
+            for (mi, model) in provider.models.iter().enumerate() {
+                if model.model.eq_ignore_ascii_case(model_name) {
+                    found = Some((pi, mi));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (pi, mi) = found
+            .ok_or_else(|| format!("model '{provider_name}/{model_name}' is not configured"))?;
+        let mut providers = self.providers.clone();
+        let mut provider = providers.remove(pi);
+        let model = provider.models.remove(mi);
+        let model_id = model.model.clone();
+        provider.models.insert(0, model);
+        providers.insert(0, provider);
+        self.providers = providers;
+        Ok((self.providers[0].name.clone(), model_id))
     }
 
     pub fn to_provider_config(&self) -> Option<super::providers::OpenAIProviderConfig> {
