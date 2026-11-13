@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows cfg faces). A hermetic conformance run
   (`scripts/acp-conformance.sh`, now 23 checks) drives the real binary and is
   now a CI gate on ubuntu + macOS (T-08); Windows compilation sanity stays
-  with the test matrix.
+  with the test matrix. The editor's @-file mentions are supported:
+  `session/prompt` inlines `file://` `resource_link` blocks (text files as
+  bounded fenced blocks, image files as engine attachments, directories as a
+  path note).
 
 ### Fixed
 - Runtime: a plan-approval reply could be lost when the client answered the

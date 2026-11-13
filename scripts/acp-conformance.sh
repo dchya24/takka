@@ -411,7 +411,40 @@ else
     bad "session/set_config_option is answered" "no response to id 9 within 15s"
 fi
 
-# --- 10) EOF: the client closes stdin, the agent exits 0 ------------------
+# --- 10) resource_link @-file mentions are inlined -------------------------
+printf 'the mentioned note\n' >"$WORKDIR/mention.md"
+MENTION_URI="file://$WORKDIR/mention.md"
+send "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"$SESSION\",\"prompt\":[{\"type\":\"text\",\"text\":\"look at this\"},{\"type\":\"resource_link\",\"name\":\"mention\",\"mime_type\":\"text/markdown\",\"uri\":\"$MENTION_URI\"}]}}"
+if await_id 10; then
+    if python3 - "$OUT" "$MENTION_URI" <<'PY'
+import json, sys
+path, uri = sys.argv[1:3]
+for line in open(path, encoding="utf-8", errors="replace").read().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        frame = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if isinstance(frame, dict) and str(frame.get("id")) == "10":
+        error = frame.get("error") or {}
+        # The turn fails against the pinned discard provider (internal
+        # error) — but an invalid-params error would mean the resource
+        # link was rejected instead of inlined.
+        sys.exit(0 if error.get("code") != -32602 else 1)
+sys.exit(1)
+PY
+    then
+        ok "session/prompt inlines a file:// resource_link (no invalid-params)"
+    else
+        bad "session/prompt inlines a file:// resource_link" "the resource_link was rejected"
+    fi
+else
+    bad "resource_link prompt is answered" "no response to id 10 within 15s"
+fi
+
+# --- 11) EOF: the client closes stdin, the agent exits 0 ------------------
 # Closing the FIFO writer is precisely what an ACP client does at shutdown.
 exec 3>&-
 
