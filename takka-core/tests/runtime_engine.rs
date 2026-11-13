@@ -1735,19 +1735,17 @@ fn load_session_replays_history_and_acks() {
         drop(request_tx);
         worker.join().unwrap();
         let events: Vec<_> = event_rx.try_iter().collect();
-        assert!(events
-            .iter()
-            .any(|event| matches!(
+        assert!(
+            events.iter().any(|event| matches!(
                 &event.event,
                 Event::HistoryReplay { role, content } if role == "user" && content == "ping"
             )),
-            "expected the user turn replayed, got {events:?}");
-        assert!(events
-            .iter()
-            .any(|event| matches!(
-                &event.event,
-                Event::SessionLoaded { session_id } if session_id == "engine-load-1"
-            )));
+            "expected the user turn replayed, got {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::SessionLoaded { session_id } if session_id == "engine-load-1"
+        )));
         assert!(
             events
                 .iter()

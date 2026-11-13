@@ -177,7 +177,10 @@ impl Orchestrator {
                 // Frontends replay the textual history as stream updates
                 // before the load ack; tool turns carry no standalone text
                 // and are skipped.
-                if matches!(message.role, crate::memory::MessageRole::User | crate::memory::MessageRole::Assistant) {
+                if matches!(
+                    message.role,
+                    crate::memory::MessageRole::User | crate::memory::MessageRole::Assistant
+                ) {
                     self.events.emit(Event::HistoryReplay {
                         role: message.role.as_str().to_string(),
                         content: message.content.clone(),

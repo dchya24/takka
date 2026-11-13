@@ -487,8 +487,9 @@ impl<T: Transport> RuntimeEngine<T> {
                         continue;
                     }
                     self.running.store(false, Ordering::SeqCst);
-                    let orchestrator = Arc::get_mut(self.orchestrator.as_mut().expect("checked above"))
-                        .expect("no run holds the orchestrator between runs");
+                    let orchestrator =
+                        Arc::get_mut(self.orchestrator.as_mut().expect("checked above"))
+                            .expect("no run holds the orchestrator between runs");
                     orchestrator.reset_cancel();
                     // Outside a run the orchestrator has no event
                     // subscribers: forward the replayed history to this
@@ -502,8 +503,9 @@ impl<T: Transport> RuntimeEngine<T> {
                             sink.send(Some(reply_id.clone()), event);
                         }
                     });
-                    let store =
-                        crate::session::SessionStore::new(session_store_root(&self.current_overrides));
+                    let store = crate::session::SessionStore::new(session_store_root(
+                        &self.current_overrides,
+                    ));
                     let outcome = orchestrator.resume_session(store, &session_id);
                     orchestrator.clear_event_handlers();
                     match outcome {
@@ -636,9 +638,9 @@ impl<T: Transport> RuntimeEngine<T> {
         if let Some(session_id) = overrides.session_id.as_deref() {
             // Stable session identity (ACP): persist under the adopted id so
             // `Request::LoadSession` can find the checkpoint later.
-            orchestrator.set_session_store(crate::session::SessionStore::new(
-                session_store_root(&overrides),
-            ));
+            orchestrator.set_session_store(crate::session::SessionStore::new(session_store_root(
+                &overrides,
+            )));
             orchestrator.adopt_session_id(session_id);
         }
         if config.agent.auto_compact_with_llm {

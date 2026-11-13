@@ -879,9 +879,7 @@ impl AcpService {
             },
         ));
         if sent.is_err() {
-            return RouteOutcome::Error(internal_error(
-                "session engine died before the load",
-            ));
+            return RouteOutcome::Error(internal_error("session engine died before the load"));
         }
 
         // Take the parked stream; the replayed history flows out as session
@@ -1920,10 +1918,9 @@ mod tests {
         let (acp, _probe) = TestAcp::spawn_with_fake(
             DEFAULT_MAX_SESSIONS,
             Arc::new(|req_rx, evt_tx| {
-                let emit =
-                    |event: takka_core::Event| {
-                        let _ = evt_tx.send(ProtocolEvent::new(None, event));
-                    };
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
                 while let Ok(request) = req_rx.recv() {
                     match request.request {
                         Request::Init { .. } => {
@@ -1959,19 +1956,33 @@ mod tests {
             "params": { "sessionId": "loaded-1", "cwd": cwd, "mcpServers": [] }
         }));
         let response = acp.response(1);
-        assert!(response["error"].is_null(), "load failed: {}", response["error"]);
+        assert!(
+            response["error"].is_null(),
+            "load failed: {}",
+            response["error"]
+        );
         let modes = &response["result"]["modes"];
-        assert_eq!(modes["currentModeId"], serde_json::json!("default"), "{response}");
+        assert_eq!(
+            modes["currentModeId"],
+            serde_json::json!("default"),
+            "{response}"
+        );
 
         // Both replayed turns reached the client as session updates.
         let updates = acp.sink.updates();
         assert_eq!(updates.len(), 2, "updates: {updates:?}");
-        assert_eq!(updates[0]["params"]["update"]["sessionUpdate"], serde_json::json!("user_message_chunk"));
+        assert_eq!(
+            updates[0]["params"]["update"]["sessionUpdate"],
+            serde_json::json!("user_message_chunk")
+        );
         assert_eq!(
             updates[0]["params"]["update"]["content"]["text"],
             serde_json::json!("hi")
         );
-        assert_eq!(updates[1]["params"]["update"]["sessionUpdate"], serde_json::json!("agent_message_chunk"));
+        assert_eq!(
+            updates[1]["params"]["update"]["sessionUpdate"],
+            serde_json::json!("agent_message_chunk")
+        );
         assert_eq!(
             updates[1]["params"]["update"]["content"]["text"],
             serde_json::json!("hello")
@@ -1987,10 +1998,9 @@ mod tests {
         let (acp, _probe) = TestAcp::spawn_with_fake(
             DEFAULT_MAX_SESSIONS,
             Arc::new(|req_rx, evt_tx| {
-                let emit =
-                    |event: takka_core::Event| {
-                        let _ = evt_tx.send(ProtocolEvent::new(None, event));
-                    };
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
                 while let Ok(request) = req_rx.recv() {
                     match request.request {
                         Request::Init { .. } => {
@@ -2040,10 +2050,8 @@ mod tests {
     /// never needed).
     #[test]
     fn session_resume_of_a_live_session_reattaches_without_engine_traffic() {
-        let (acp, _probe) = TestAcp::spawn_with_fake(
-            DEFAULT_MAX_SESSIONS,
-            Arc::new(fake_engine_script),
-        );
+        let (acp, _probe) =
+            TestAcp::spawn_with_fake(DEFAULT_MAX_SESSIONS, Arc::new(fake_engine_script));
         let session = new_session(&acp, 1);
         let cwd = std::env::current_dir()
             .expect("process cwd")
@@ -2054,7 +2062,11 @@ mod tests {
             "params": { "sessionId": session, "cwd": cwd, "mcpServers": [] }
         }));
         let response = acp.response(2);
-        assert!(response["error"].is_null(), "resume failed: {}", response["error"]);
+        assert!(
+            response["error"].is_null(),
+            "resume failed: {}",
+            response["error"]
+        );
         assert_eq!(
             response["result"]["modes"]["currentModeId"],
             serde_json::json!("default")
@@ -2096,10 +2108,9 @@ mod tests {
         let (acp, _probe) = TestAcp::spawn_with_fake(
             DEFAULT_MAX_SESSIONS,
             Arc::new(|req_rx, evt_tx| {
-                let emit =
-                    |event: takka_core::Event| {
-                        let _ = evt_tx.send(ProtocolEvent::new(None, event));
-                    };
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
                 while let Ok(request) = req_rx.recv() {
                     match request.request {
                         Request::Init { .. } => {
@@ -2125,7 +2136,11 @@ mod tests {
             "params": { "sessionId": "sess-3", "cwd": cwd, "mcpServers": [] }
         }));
         let response = acp.response(1);
-        assert!(response["error"].is_null(), "load failed: {}", response["error"]);
+        assert!(
+            response["error"].is_null(),
+            "load failed: {}",
+            response["error"]
+        );
 
         let session = new_session(&acp, 2);
         assert!(
