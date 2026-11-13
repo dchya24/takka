@@ -3649,9 +3649,6 @@ mod tests {
         acp.close_and_join();
     }
 
-    /// T-03: `resource_link` content is refused — only text + image are
-    /// advertised (D7).
-    #[test]
     /// `file://` resource links (the editor's @-file mentions) are inlined:
     /// text files become fenced blocks with a path header. This prompt is
     /// accepted by the adapter — the turn then fails against the pinned
