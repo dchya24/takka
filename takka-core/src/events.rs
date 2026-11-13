@@ -283,6 +283,20 @@ pub enum Event {
     /// boundary (safety is checked per boundary).
     #[serde(rename = "permission_mode_changed")]
     PermissionModeChanged { mode: PermissionMode },
+
+    /// One message of a session's stored history, replayed by
+    /// `Request::LoadSession` before the `SessionLoaded` ack. `role` is the
+    /// wire role string (`user` / `assistant`); tool turns are skipped.
+    #[serde(rename = "history_replay")]
+    #[serde(rename_all = "camelCase")]
+    HistoryReplay { role: String, content: String },
+
+    /// Ack of `Request::LoadSession` (ACP `session/load` / `session/resume`):
+    /// the stored session was loaded onto the engine's orchestrator; all
+    /// `HistoryReplay` events preceded this one.
+    #[serde(rename = "session_loaded")]
+    #[serde(rename_all = "camelCase")]
+    SessionLoaded { session_id: String },
 }
 
 /// Which limit ended the turn (payload of [`Event::TurnLimitExceeded`]).
@@ -363,6 +377,8 @@ pub enum EventType {
     SessionAdopted,
     TurnLimitExceeded,
     PermissionModeChanged,
+    HistoryReplay,
+    SessionLoaded,
 }
 
 impl Event {
@@ -410,6 +426,8 @@ impl Event {
             Event::SessionAdopted { .. } => EventType::SessionAdopted,
             Event::TurnLimitExceeded { .. } => EventType::TurnLimitExceeded,
             Event::PermissionModeChanged { .. } => EventType::PermissionModeChanged,
+            Event::HistoryReplay { .. } => EventType::HistoryReplay,
+            Event::SessionLoaded { .. } => EventType::SessionLoaded,
         }
     }
 }

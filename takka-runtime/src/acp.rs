@@ -70,6 +70,9 @@ const SESSION_PROMPT: &str = "session/prompt";
 const SESSION_CANCEL: &str = "session/cancel";
 const SESSION_SET_MODE: &str = "session/set_mode";
 const SESSION_LOAD: &str = "session/load";
+/// v1 resume: the agent kept the session live (or can rebuild it from its
+/// own store) and the client re-attaches without a history replay.
+const SESSION_RESUME: &str = "session/resume";
 const SESSION_UPDATE: &str = "session/update";
 /// Outbound agent → client permission request (T-05/T-06, D8): the turn
 /// thread asks, the client answers with a result frame on the same id.
@@ -537,8 +540,11 @@ impl AcpService {
             // consulted per boundary), so a busy session is refused rather
             // than silently deferred.
             (Some(SESSION_SET_MODE), true) => self.session_set_mode(frame),
-            // loadSession is not advertised (D7) — refuse honestly.
-            (Some(SESSION_LOAD), true) => RouteOutcome::Error(load_unsupported()),
+            // A stored-session lifecycle: `session/load` replays the
+            // checkpoint history, `session/resume` re-attaches (replaying
+            // only when the session is not live in this process).
+            (Some(SESSION_LOAD), true) => self.session_load(frame, false),
+            (Some(SESSION_RESUME), true) => self.session_load(frame, true),
             // session/cancel is a notification in v1; if a client carries
             // an id on it anyway, an empty result keeps the JSON-RPC
             // contract intact. Unknown/idle sessions: silence per spec.
@@ -634,6 +640,9 @@ impl AcpService {
                     permission_mode: None,
                     model: None,
                     system_prompt: None,
+                    // The ACP session id IS the checkpoint id: a later
+                    // `session/load` finds the persisted document under it.
+                    session_id: Some(session_id.to_owned()),
                 },
                 capabilities: ConnectionCapabilities::default(),
                 daemon_token: None,
@@ -789,6 +798,151 @@ impl AcpService {
                     .expect("set mode response serializes"),
             ),
             Err(error) => RouteOutcome::Error(error),
+        }
+    }
+
+    /// `session/load` / `session/resume`: attach a stored checkpoint to a
+    /// fresh engine booted under the client-supplied session id (the id
+    /// doubles as the checkpoint filename, so the client's saved id keeps
+    /// working across agent restarts).
+    ///
+    /// `session/load` streams the stored history to the client as
+    /// `session/update` notifications BEFORE the response (the replay
+    /// contract); `session/resume` on a session still live in this process
+    /// re-attaches without any engine traffic. A failed load tears the
+    /// freshly booted session down again and frees its capacity slot.
+    fn session_load(&self, frame: &Value, resume: bool) -> RouteOutcome {
+        let (session_id, cwd) = if resume {
+            match parse_params::<acp::ResumeSessionRequest>(frame, SESSION_RESUME) {
+                Ok(request) => (request.session_id.to_string(), request.cwd),
+                Err(error) => return RouteOutcome::Error(error),
+            }
+        } else {
+            match parse_params::<acp::LoadSessionRequest>(frame, SESSION_LOAD) {
+                Ok(request) => (request.session_id.to_string(), request.cwd),
+                Err(error) => return RouteOutcome::Error(error),
+            }
+        };
+
+        // D11: the same single-cwd contract as `session/new`.
+        let process_cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                return RouteOutcome::Error(internal_error(format!(
+                    "cannot read the agent working directory: {error}"
+                )))
+            }
+        };
+        if cwd != process_cwd {
+            return RouteOutcome::Error(cwd_mismatch_error(&cwd, &process_cwd));
+        }
+        if let Err(message) = validate_session_id(&session_id) {
+            return RouteOutcome::Error(invalid_params_error(message));
+        }
+
+        {
+            let sessions = self.sessions.lock().expect("session registry lock");
+            if sessions.contains_key(&session_id) {
+                if resume {
+                    // The agent kept the session live: just re-attach.
+                    return RouteOutcome::Reply(load_modes_reply(true));
+                }
+                return RouteOutcome::Error(internal_error(format!(
+                    "session {session_id} is already live"
+                )));
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return RouteOutcome::Error(internal_error("connection is shutting down"));
+            }
+            if sessions.len() >= self.config.max_sessions {
+                return RouteOutcome::Error(capacity_error(self.config.max_sessions));
+            }
+        }
+        // Adopted ids never collide with later minted `sess-N` ids.
+        if let Some(number) = session_id
+            .strip_prefix("sess-")
+            .and_then(|number| number.parse::<u64>().ok())
+        {
+            self.counter.fetch_max(number + 1, Ordering::SeqCst);
+        }
+
+        let session = match self.boot_engine(&session_id) {
+            Ok(session) => session,
+            Err(error) => return RouteOutcome::Error(error),
+        };
+
+        let request_id = session.next_request_id("load");
+        let sent = session.req_tx.send(ProtocolRequest::new(
+            request_id,
+            Request::LoadSession {
+                session_id: session_id.clone(),
+            },
+        ));
+        if sent.is_err() {
+            return RouteOutcome::Error(internal_error("session engine died before the load"));
+        }
+
+        // Take the parked stream; the replayed history flows out as session
+        // updates while the `SessionLoaded` ack is awaited.
+        let receiver = match session.events.lock().expect("session events lock").take() {
+            Some(receiver) => receiver,
+            None => {
+                return RouteOutcome::Error(internal_error(
+                    "session engine stream is not available",
+                ))
+            }
+        };
+        let mut translator = TranslatorState::new();
+        let mut ack: Result<(), acp::Error> = Err(internal_error(
+            "session engine did not acknowledge the load",
+        ));
+        loop {
+            match receiver.recv_timeout(BOOT_TIMEOUT) {
+                Ok(event) => match &event.event {
+                    takka_core::Event::SessionLoaded { .. } => {
+                        ack = Ok(());
+                        break;
+                    }
+                    takka_core::Event::Error { message } => {
+                        ack = Err(invalid_params_error(message.clone()));
+                        break;
+                    }
+                    // Replay chunk: surface it, keep waiting for the ack.
+                    event => {
+                        if let Some(update) = translator.translate(event) {
+                            let notification = acp::SessionNotification::new(
+                                acp::SessionId::new(session.id.as_str()),
+                                update,
+                            );
+                            self.send_raw(&serde_json::json!({
+                                "jsonrpc": "2.0", "method": SESSION_UPDATE,
+                                "params": serde_json::to_value(notification)
+                                    .expect("session notification serializes")
+                            }));
+                        }
+                    }
+                },
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    ack = Err(internal_error("session engine died during the load"));
+                    break;
+                }
+            }
+        }
+        // Park the stream back so the next prompt can run.
+        *session.events.lock().expect("session events lock") = Some(receiver);
+        match ack {
+            Ok(()) => RouteOutcome::Reply(load_modes_reply(resume)),
+            Err(error) => {
+                // A failed load leaves a useless session: drop the registry
+                // entry so the engine exits with its dropped senders and
+                // the capacity slot is free again.
+                self.sessions
+                    .lock()
+                    .expect("session registry lock")
+                    .remove(&session_id);
+                RouteOutcome::Error(error)
+            }
         }
     }
 
@@ -1349,27 +1503,6 @@ fn unsupported_content_type(kind: &str, hint: &str) -> acp::Error {
     ))
 }
 
-/// D7: `loadSession: false` — refuse with the honest phase note instead of
-/// pretending to load anything.
-fn load_unsupported() -> acp::Error {
-    acp::Error::new(
-        i32::from(acp::ErrorCode::InvalidRequest),
-        "session/load is phase 2 (loadSession capability not advertised)",
-    )
-    .data(serde_json::json!({ "method": SESSION_LOAD, "reason": "not implemented in phase 1" }))
-}
-
-/// D9: modes are advertised but not switchable yet (honest rejection).
-/// D9: ACP mode id -> takka's permission mode. `None` = not advertised.
-fn permission_mode(mode_id: &str) -> Option<PermissionMode> {
-    match mode_id {
-        "default" => Some(PermissionMode::Default),
-        "plan" => Some(PermissionMode::Plan),
-        "yolo" => Some(PermissionMode::Yolo),
-        _ => None,
-    }
-}
-
 fn unknown_mode_error(mode_id: &str) -> acp::Error {
     acp::Error::new(
         i32::from(acp::ErrorCode::InvalidParams),
@@ -1381,6 +1514,45 @@ fn unknown_mode_error(mode_id: &str) -> acp::Error {
         "requested": mode_id,
         "available": ["default", "plan", "yolo"],
     }))
+}
+
+/// D9: ACP mode id -> takka's permission mode. `None` = not advertised.
+fn permission_mode(mode_id: &str) -> Option<PermissionMode> {
+    match mode_id {
+        "default" => Some(PermissionMode::Default),
+        "plan" => Some(PermissionMode::Plan),
+        "yolo" => Some(PermissionMode::Yolo),
+        _ => None,
+    }
+}
+fn invalid_params_error(message: impl Into<String>) -> acp::Error {
+    acp::Error::new(i32::from(acp::ErrorCode::InvalidParams), message.into())
+}
+
+/// Same id law as the checkpoint store: plain identifiers only, never path
+/// separators — the id becomes a filename on disk.
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(format!("invalid session id: {session_id:?}"));
+    }
+    Ok(())
+}
+
+/// Reply body for a successful `session/load` / `session/resume`: the
+/// mode surface (permission modes) for the re-attached session.
+fn load_modes_reply(resume: bool) -> Value {
+    let modes = session_mode_state();
+    if resume {
+        serde_json::to_value(acp::ResumeSessionResponse::new().modes(modes))
+            .expect("resume response serializes")
+    } else {
+        serde_json::to_value(acp::LoadSessionResponse::new().modes(modes))
+            .expect("load response serializes")
+    }
 }
 
 /// Unwraps `params` and deserializes into a typed request body.
@@ -1453,6 +1625,10 @@ fn agent_capabilities() -> acp::AgentCapabilities {
     acp::AgentCapabilities::new()
         .prompt_capabilities(acp::PromptCapabilities::new().image(true))
         .mcp_capabilities(acp::McpCapabilities::new())
+        .load_session(true)
+        .session_capabilities(
+            acp::SessionCapabilities::new().resume(acp::SessionResumeCapabilities::new()),
+        )
 }
 
 fn agent_implementation() -> acp::Implementation {
@@ -1492,6 +1668,18 @@ impl TranslatorState {
             Event::Thinking { content } => Some(acp::SessionUpdate::AgentThoughtChunk(
                 acp::ContentChunk::new(text_block(content)),
             )),
+            // Stored-history replay (`Request::LoadSession`): user turns
+            // surface as user chunks, assistant turns as agent chunks; tool
+            // turns carry no standalone text and are skipped.
+            Event::HistoryReplay { role, content } => match role.as_str() {
+                "user" => Some(acp::SessionUpdate::UserMessageChunk(
+                    acp::ContentChunk::new(text_block(content)),
+                )),
+                "assistant" => Some(acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new(text_block(content)),
+                )),
+                _ => None,
+            },
             Event::AssistantDelta { content } => Some(acp::SessionUpdate::AgentMessageChunk(
                 acp::ContentChunk::new(text_block(content)),
             )),
@@ -1592,6 +1780,7 @@ impl TranslatorState {
             | Event::SteerQueued { .. }
             | Event::Steered { .. }
             | Event::SessionAdopted { .. }
+            | Event::SessionLoaded { .. }
             | Event::CompactionStarted
             | Event::WaitingForUser
             | Event::SessionCompleted { .. } => None,
@@ -1672,7 +1861,10 @@ mod tests {
     fn initialize_advertises_the_d7_capability_set() {
         let response = init_response(1);
         let caps = &response.agent_capabilities;
-        assert!(!caps.load_session);
+        // Stored-session lifecycle is supported: `session/load` replays the
+        // checkpoint history, `session/resume` re-attaches live sessions.
+        assert!(caps.load_session);
+        assert!(caps.session_capabilities.resume.is_some());
         assert!(caps.prompt_capabilities.image);
         assert!(!caps.prompt_capabilities.audio);
         assert!(!caps.prompt_capabilities.embedded_context);
@@ -1718,26 +1910,244 @@ mod tests {
         assert_eq!(response["protocolVersion"], serde_json::json!(1));
     }
 
-    /// `session/load` stays a phase-2 gap (loadSession is not advertised,
-    /// D7) and is rejected with an honest, phase-specific error. An unknown
-    /// session additionally fails as not-found (no silent success).
+    /// `session/load` replays the stored history as `session/update`
+    /// notifications (user chunks then assistant chunks) BEFORE the
+    /// response, and the response carries the D9 mode surface.
     #[test]
-    fn session_load_is_rejected_honestly() {
-        let frame = serde_json::json!({
-            "jsonrpc": "2.0", "id": 7, "method": SESSION_LOAD, "params": {}
-        });
-        let RouteOutcome::Error(error) = route(frame) else {
-            panic!("session/load must route to an error");
-        };
-        assert_eq!(i32::from(error.code), -32600, "invalid_request");
-        let text = format!(
-            "{} {}",
-            error.message,
-            serde_json::to_string(&error.data).expect("error data serializes")
+    fn session_load_replays_history_before_the_response() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(
+            DEFAULT_MAX_SESSIONS,
+            Arc::new(|req_rx, evt_tx| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => {
+                            emit(takka_core::Event::InitOk {
+                                protocol: "takka".to_owned(),
+                                version: 2,
+                            });
+                        }
+                        Request::LoadSession { .. } => {
+                            emit(takka_core::Event::HistoryReplay {
+                                role: "user".to_owned(),
+                                content: "hi".to_owned(),
+                            });
+                            emit(takka_core::Event::HistoryReplay {
+                                role: "assistant".to_owned(),
+                                content: "hello".to_owned(),
+                            });
+                            emit(takka_core::Event::SessionLoaded {
+                                session_id: "loaded-1".to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }),
         );
-        assert!(text.contains("phase 2"), "{text}");
-        assert!(text.contains("loadSession"), "{text}");
-        assert!(!text.contains("pre-T-03"), "stub wording must be gone");
+        let cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_string_lossy()
+            .into_owned();
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": SESSION_LOAD,
+            "params": { "sessionId": "loaded-1", "cwd": cwd, "mcpServers": [] }
+        }));
+        let response = acp.response(1);
+        assert!(
+            response["error"].is_null(),
+            "load failed: {}",
+            response["error"]
+        );
+        let modes = &response["result"]["modes"];
+        assert_eq!(
+            modes["currentModeId"],
+            serde_json::json!("default"),
+            "{response}"
+        );
+
+        // Both replayed turns reached the client as session updates.
+        let updates = acp.sink.updates();
+        assert_eq!(updates.len(), 2, "updates: {updates:?}");
+        assert_eq!(
+            updates[0]["params"]["update"]["sessionUpdate"],
+            serde_json::json!("user_message_chunk")
+        );
+        assert_eq!(
+            updates[0]["params"]["update"]["content"]["text"],
+            serde_json::json!("hi")
+        );
+        assert_eq!(
+            updates[1]["params"]["update"]["sessionUpdate"],
+            serde_json::json!("agent_message_chunk")
+        );
+        assert_eq!(
+            updates[1]["params"]["update"]["content"]["text"],
+            serde_json::json!("hello")
+        );
+        acp.close_and_join();
+    }
+
+    /// `session/load` of a session the engine cannot find answers
+    /// invalid-params with the engine's reason, and the capacity slot is
+    /// freed again (the next `session/new` still succeeds).
+    #[test]
+    fn session_load_of_an_unknown_session_frees_its_slot() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(
+            DEFAULT_MAX_SESSIONS,
+            Arc::new(|req_rx, evt_tx| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => {
+                            emit(takka_core::Event::InitOk {
+                                protocol: "takka".to_owned(),
+                                version: 2,
+                            });
+                        }
+                        Request::LoadSession { .. } => {
+                            emit(takka_core::Event::Error {
+                                message: "session not found: nope-1".to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        let cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_string_lossy()
+            .into_owned();
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": SESSION_LOAD,
+            "params": { "sessionId": "nope-1", "cwd": cwd, "mcpServers": [] }
+        }));
+        let response = acp.response(1);
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(-32602),
+            "invalid params: {response}"
+        );
+        assert!(
+            format!("{}", response["error"]["message"]).contains("session not found"),
+            "{response}"
+        );
+
+        // The failed boot did not leak a capacity slot.
+        let session = new_session(&acp, 2);
+        assert_eq!(session, "sess-1", "fresh mint after the failed load");
+        acp.close_and_join();
+    }
+
+    /// `session/resume` of a session still live in this process re-attaches
+    /// without any engine traffic (the fake engine would ignore a
+    /// `LoadSession` request forever — a successful reply proves it was
+    /// never needed).
+    #[test]
+    fn session_resume_of_a_live_session_reattaches_without_engine_traffic() {
+        let (acp, _probe) =
+            TestAcp::spawn_with_fake(DEFAULT_MAX_SESSIONS, Arc::new(fake_engine_script));
+        let session = new_session(&acp, 1);
+        let cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_string_lossy()
+            .into_owned();
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_RESUME,
+            "params": { "sessionId": session, "cwd": cwd, "mcpServers": [] }
+        }));
+        let response = acp.response(2);
+        assert!(
+            response["error"].is_null(),
+            "resume failed: {}",
+            response["error"]
+        );
+        assert_eq!(
+            response["result"]["modes"]["currentModeId"],
+            serde_json::json!("default")
+        );
+        assert!(
+            acp.sink.updates().is_empty(),
+            "resume must not replay history"
+        );
+        acp.close_and_join();
+    }
+
+    /// D11: `session/load` upholds the same single-cwd contract as
+    /// `session/new` — a mismatched cwd is refused with the actionable
+    /// restart error before any engine boots.
+    #[test]
+    fn session_load_refuses_a_mismatched_cwd() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": SESSION_LOAD,
+            "params": { "sessionId": "loaded-1", "cwd": "/definitely/not/the/process/cwd", "mcpServers": [] }
+        }));
+        let response = acp.response(1);
+        assert_eq!(
+            response["error"]["code"],
+            serde_json::json!(-32602),
+            "{response}"
+        );
+        assert!(
+            format!("{}", response["error"]["message"]).contains("restart the agent"),
+            "{response}"
+        );
+        acp.close_and_join();
+    }
+
+    /// An adopted `sess-N` id reserves its number: later minted ids skip
+    /// past it instead of colliding with the loaded session.
+    #[test]
+    fn session_load_adopts_the_client_id_without_future_collision() {
+        let (acp, _probe) = TestAcp::spawn_with_fake(
+            DEFAULT_MAX_SESSIONS,
+            Arc::new(|req_rx, evt_tx| {
+                let emit = |event: takka_core::Event| {
+                    let _ = evt_tx.send(ProtocolEvent::new(None, event));
+                };
+                while let Ok(request) = req_rx.recv() {
+                    match request.request {
+                        Request::Init { .. } => {
+                            emit(takka_core::Event::InitOk {
+                                protocol: "takka".to_owned(),
+                                version: 2,
+                            });
+                        }
+                        Request::LoadSession { session_id } => {
+                            emit(takka_core::Event::SessionLoaded { session_id });
+                        }
+                        _ => {}
+                    }
+                }
+            }),
+        );
+        let cwd = std::env::current_dir()
+            .expect("process cwd")
+            .to_string_lossy()
+            .into_owned();
+        acp.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": SESSION_LOAD,
+            "params": { "sessionId": "sess-3", "cwd": cwd, "mcpServers": [] }
+        }));
+        let response = acp.response(1);
+        assert!(
+            response["error"].is_null(),
+            "load failed: {}",
+            response["error"]
+        );
+
+        let session = new_session(&acp, 2);
+        assert!(
+            session != "sess-3",
+            "minted id must not collide with the adopted one: {session}"
+        );
+        acp.close_and_join();
     }
 
     /// D9: an unadvertised mode id is rejected as invalid params and names

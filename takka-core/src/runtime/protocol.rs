@@ -103,6 +103,14 @@ pub enum Request {
     SetPermissionMode {
         mode: PermissionMode,
     },
+    /// Load a stored checkpoint onto the running orchestrator (ACP
+    /// `session/load` / `session/resume`). The engine replays the stored
+    /// history as `Event::HistoryReplay` events, then acks with
+    /// `Event::SessionLoaded`. Additive: no protocol bump.
+    LoadSession {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     /// Ask the daemon for its registered tool set (for `/tools`).
     ListTools,
     /// Activate a skill in the daemon's orchestrator (for `/skill`).
@@ -142,6 +150,10 @@ pub struct InitOverrides {
     pub permission_mode: Option<PermissionMode>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// Stable session identity (ACP adapter): the orchestrator checkpoints
+    /// under this id instead of minting a uuid per run. `None` = mint.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Capabilities yang dideklarasikan frontend saat `Init` — sekali per

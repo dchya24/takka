@@ -850,6 +850,7 @@ impl Commands {
             config_path: self.runtime_config_path.clone(),
             permission_mode: Some(self.permission_mode),
             model: self.config.active_model().map(|model| model.model.clone()),
+            session_id: None,
             system_prompt: self.config.system_prompt.clone(),
         };
         let connection = match &self.daemon_info_path_override {
@@ -893,6 +894,7 @@ impl Commands {
             config_path: self.runtime_config_path.clone(),
             permission_mode: Some(self.permission_mode),
             model: self.config.active_model().map(|model| model.model.clone()),
+            session_id: None,
             system_prompt: self.config.system_prompt.clone(),
         };
         self.connection = Some(
@@ -7701,6 +7703,7 @@ mod daemon_smoke_tests {
                 config_path: Some(self.config_path.to_string_lossy().into_owned()),
                 permission_mode: Some(takka_core::PermissionMode::Yolo),
                 model: None,
+                session_id: None,
                 system_prompt: None,
             }
         }
@@ -7942,6 +7945,7 @@ mod daemon_smoke_tests {
                 config_path: Some(config_path.to_string_lossy().into_owned()),
                 permission_mode: Some(takka_core::PermissionMode::Yolo),
                 model: None,
+                session_id: None,
                 system_prompt: None,
             },
             CLI_CAPABILITIES,

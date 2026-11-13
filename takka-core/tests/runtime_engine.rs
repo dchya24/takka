@@ -1599,3 +1599,204 @@ fn set_permission_mode_before_init_is_rejected() {
         "no ack may be emitted when uninitialized"
     );
 }
+
+/// ACP `session/load` / `session/resume` (stored-session lifecycle): a run
+/// checkpointed under an adopted session id can be loaded onto a fresh
+/// engine — the stored history replays as `HistoryReplay` events before the
+/// `SessionLoaded` ack, and the conversation is usable again.
+#[test]
+fn load_session_replays_history_and_acks() {
+    use takka_core::session::{AgentSession, SessionStore};
+
+    // Hermetic config (discard port — the provider is never reached) in a
+    // unique temp directory; the checkpoint store derives from its path.
+    let dir = std::env::temp_dir().join(format!(
+        "takka-load-session-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.json");
+    std::fs::write(
+        &config_path,
+        r#"{
+  "providers": [
+    {
+      "name": "hermetic-test",
+      "type": "openai-compatible",
+      "api_base": "http://127.0.0.1:9",
+      "api_key": "unused",
+      "models": [
+        { "model": "hermetic-model", "temperature": 0.0, "max_tokens": 64 }
+      ]
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+    let session_id = "engine-load-1";
+
+    // Run 1: a run that fails at the provider still checkpoints the user
+    // message under the adopted session id.
+    {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let transport = MemoryTransport::new(request_rx, event_tx);
+        let mut engine = RuntimeEngine::new(transport);
+        let worker = std::thread::spawn(move || engine.run());
+        request_tx
+            .send(ProtocolRequest::new(
+                "init-1",
+                Request::Init {
+                    overrides: takka_core::runtime::protocol::InitOverrides {
+                        config_path: Some(config_path.to_string_lossy().into_owned()),
+                        permission_mode: None,
+                        model: None,
+                        system_prompt: None,
+                        session_id: Some(session_id.to_owned()),
+                    },
+                    capabilities: ConnectionCapabilities::default(),
+                    daemon_token: None,
+                },
+            ))
+            .unwrap();
+        request_tx
+            .send(ProtocolRequest::new(
+                "run-1",
+                Request::Run {
+                    task: "ping".into(),
+                    attachments: vec![],
+                },
+            ))
+            .unwrap();
+        drop(request_tx);
+        worker.join().unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event.event, Event::InitOk { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(&event.event, Event::Error { .. })));
+    }
+
+    // The checkpoint now exists (poll: the terminal write lands after the
+    // error event hits the stream).
+    let store = SessionStore::new(dir.join("config-sessions"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match store.load(session_id) {
+            Ok(session) if !session.messages.is_empty() => break,
+            _ => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "checkpoint with the user message never appeared"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
+    // Run 2: a fresh engine loads the stored session; history replays as
+    // events before the ack.
+    {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let transport = MemoryTransport::new(request_rx, event_tx);
+        let mut engine = RuntimeEngine::new(transport);
+        let worker = std::thread::spawn(move || engine.run());
+        request_tx
+            .send(ProtocolRequest::new(
+                "init-2",
+                Request::Init {
+                    overrides: takka_core::runtime::protocol::InitOverrides {
+                        config_path: Some(config_path.to_string_lossy().into_owned()),
+                        permission_mode: None,
+                        model: None,
+                        system_prompt: None,
+                        session_id: Some(session_id.to_owned()),
+                    },
+                    capabilities: ConnectionCapabilities::default(),
+                    daemon_token: None,
+                },
+            ))
+            .unwrap();
+        request_tx
+            .send(ProtocolRequest::new(
+                "load-2",
+                Request::LoadSession {
+                    session_id: session_id.to_owned(),
+                },
+            ))
+            .unwrap();
+        drop(request_tx);
+        worker.join().unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                Event::HistoryReplay { role, content } if role == "user" && content == "ping"
+            )),
+            "expected the user turn replayed, got {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::SessionLoaded { session_id } if session_id == "engine-load-1"
+        )));
+        assert!(
+            events
+                .iter()
+                .position(|event| matches!(&event.event, Event::HistoryReplay { .. }))
+                < events
+                    .iter()
+                    .position(|event| matches!(&event.event, Event::SessionLoaded { .. })),
+            "history must replay before the ack"
+        );
+    }
+
+    // Load of an unknown id answers as an engine Error.
+    {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let transport = MemoryTransport::new(request_rx, event_tx);
+        let mut engine = RuntimeEngine::new(transport);
+        let worker = std::thread::spawn(move || engine.run());
+        request_tx
+            .send(ProtocolRequest::new(
+                "init-3",
+                Request::Init {
+                    overrides: takka_core::runtime::protocol::InitOverrides {
+                        config_path: Some(config_path.to_string_lossy().into_owned()),
+                        permission_mode: None,
+                        model: None,
+                        system_prompt: None,
+                        session_id: Some("engine-load-2".to_owned()),
+                    },
+                    capabilities: ConnectionCapabilities::default(),
+                    daemon_token: None,
+                },
+            ))
+            .unwrap();
+        request_tx
+            .send(ProtocolRequest::new(
+                "load-3",
+                Request::LoadSession {
+                    session_id: "no-such-session".to_owned(),
+                },
+            ))
+            .unwrap();
+        drop(request_tx);
+        worker.join().unwrap();
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::Error { message } if message.contains("session not found")
+        )));
+    }
+
+    let _ = AgentSession::new(session_id, "unused");
+    let _ = std::fs::remove_dir_all(&dir);
+}

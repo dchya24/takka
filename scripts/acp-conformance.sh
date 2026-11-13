@@ -199,7 +199,8 @@ send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 if await_id 1; then
     assert_field 1 "result.protocolVersion" '1' "initialize answers protocolVersion 1 (client asked for 2)"
     assert_field 1 "result.agentCapabilities.promptCapabilities.image" 'true' "initialize advertises image prompts"
-    assert_field 1 "result.agentCapabilities.loadSession" 'false' "initialize advertises loadSession: false"
+    assert_field 1 "result.agentCapabilities.loadSession" 'true' "initialize advertises loadSession: true"
+    assert_field 1 "result.agentCapabilities.sessionCapabilities.resume" '{}' "initialize advertises sessionCapabilities.resume"
     assert_field 1 "result.agentInfo.name" '"takka"' "initialize reports agentInfo.name = takka"
 else
     bad "initialize is answered" "no response to id 1 within 15s"
@@ -324,7 +325,62 @@ else
     bad "unknown method is answered" "no response to id 7 within 15s"
 fi
 
-# --- 8) EOF: the client closes stdin, the agent exits 0 ------------------
+# --- 8) stored-session lifecycle: session/load replays the checkpoint -----
+# The checkpoint document is written straight into the hermetic store
+# (derived from the config file's directory) — exactly what a previous
+# session would have left behind.
+SESS_DIR="$WORKDIR/config-sessions"
+mkdir -p "$SESS_DIR"
+cat >"$SESS_DIR/conformance-load-1.json" <<'JSON'
+{
+  "version": 1,
+  "session_id": "conformance-load-1",
+  "state": "completed",
+  "model": "hermetic-model",
+  "created_at": "2026-11-14T00:00:00Z",
+  "updated_at": "2026-11-14T00:00:00Z",
+  "messages": [
+    { "id": "m1", "role": { "type": "user" }, "content": "hello from checkpoint", "timestamp": "2026-11-14T00:00:00Z" },
+    { "id": "m2", "role": { "type": "assistant" }, "content": "checkpoint answer", "timestamp": "2026-11-14T00:00:00Z" }
+  ],
+  "checkpoint_count": 1
+}
+JSON
+send "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"session/load\",\"params\":{\"sessionId\":\"conformance-load-1\",\"cwd\":$CWD_JSON,\"mcpServers\":[]}}"
+if await_id 8; then
+    assert_field 8 "result.modes.currentModeId" '"default"' "session/load answers with the D9 mode surface"
+    if python3 - "$OUT" <<'PY'
+import json, sys
+lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines() if l.strip()]
+updates, response_at = [], None
+for i, line in enumerate(lines):
+    try:
+        frame = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if frame.get("method") == "session/update":
+        updates.append(frame)
+    elif str(frame.get("id")) == "8" and "result" in frame:
+        response_at = i
+if response_at is None:
+    sys.exit(1)
+texts = []
+for f in updates:
+    update = f.get("params", {}).get("update", {})
+    if update.get("sessionUpdate") in ("user_message_chunk", "agent_message_chunk"):
+        texts.append((update.get("sessionUpdate"), update.get("content", {}).get("text")))
+sys.exit(0 if texts == [("user_message_chunk", "hello from checkpoint"), ("agent_message_chunk", "checkpoint answer")] else 1)
+PY
+    then
+        ok "session/load replays the stored history as session updates"
+    else
+        bad "session/load replays the stored history" "expected user+assistant chunks before the response"
+    fi
+else
+    bad "session/load is answered" "no response to id 8 within 15s"
+fi
+
+# --- 9) EOF: the client closes stdin, the agent exits 0 ------------------
 # Closing the FIFO writer is precisely what an ACP client does at shutdown.
 exec 3>&-
 
