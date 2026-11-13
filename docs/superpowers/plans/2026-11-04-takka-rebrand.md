@@ -1,6 +1,8 @@
 # Takka Rebrand Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Rename penuh `agentic` → `takka` (binary, 3 crate, lib identifier, env vars + fallback, config path + migrate, protokol name/version 1→2, installer/docs) tanpa mengubah behavior Fase 1–3a.
 
@@ -28,21 +30,21 @@
 - Produces: `takka_core` lib name; binary `takka` + `takka-runtime` ter-build di `target/debug/`.
 - Consumes: — (task pertama).
 
-- [ ] **Step 1: Rename Cargo layer**
+- [x] **Step 1: Rename Cargo layer**
   - Root `Cargo.toml` members → `takka-core`, `takka-cli`, `takka-runtime`; `[workspace.package]` authors tetap.
   - `core-agentic/Cargo.toml`: `name = "takka-core"`, `[lib] name = "takka_core"` bila ada (atau default underscore mapping), description tetap.
   - `agentic-cli/` → rename dir `takka-cli/`; `Cargo.toml`: `name = "takka-cli"`, `[[bin]] name = "takka"`; dep `core-agentic` → `takka-core = { path = "../takka-core" }`; description update.
   - `agentic-runtime/` → rename dir `takka-runtime/`; sama pola; `takka-core` dep.
   - `mv` direktori via `git mv`.
-- [ ] **Step 2: Kode `use` + binary refs**
+- [x] **Step 2: Kode `use` + binary refs**
   - `grep -rn "core_agentic" --include="*.rs"` → `takka_core` (semua).
   - `CARGO_BIN_EXE_agentic-runtime` → `CARGO_BIN_EXE_takka-runtime`.
   - clap `name = "agentic"` → `"takka"`; `long_about` lead → tagline baru; semua contoh `agentic ...` → `takka ...` (cli.rs, main.rs strings, interactive help).
   - `TAKKA_RUNTIME_BIN` sebagai env utama di `runtime_binary()` + fallback `AGENTIC_RUNTIME_BIN` + warning (implementasi fallback di Task 2 boleh; di sini minimal rename + baca TAKKA dulu).
-- [ ] **Step 3: Build + test**
+- [x] **Step 3: Build + test**
   - Run: `cargo build --workspace` lalu `cargo test --workspace`. Perbaiki semua sisa `agentic` yang bikin compile fail. Test failure karena string lama → update ekspektasi ke `takka`.
   - Expected: `target/debug/takka` + `target/debug/takka-runtime` ada; suite hijau.
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
   ```bash
   git add -A && git commit -m "feat!: rename workspace to takka (binary, crates, lib identifier)"
   ```
@@ -59,10 +61,10 @@
 - Produces: `config_dir() -> PathBuf` baru + `legacy_config_dir()`; `fn resolve_env(new, legacy) -> (Option<String>, bool warned)`.
 - Consumes: binary `takka` (Task 1).
 
-- [ ] **Step 1: Tulis test gagal** — config fallback + migrate + env fallback (tempdir HOME via `std::env::set_var` terkontrol serial test atau helper override).
-- [ ] **Step 2: Run → verify gagal** (compile error / assertion fail yang diharapkan).
-- [ ] **Step 3: Implementasi** sesuai interface; warning format: `takka: warning: using legacy AGENTIC_X; set TAKKA_X instead`.
-- [ ] **Step 4: Full suite hijau → commit** `feat!: takka config path with legacy fallback + config migrate`.
+- [x] **Step 1: Tulis test gagal** — config fallback + migrate + env fallback (tempdir HOME via `std::env::set_var` terkontrol serial test atau helper override).
+- [x] **Step 2: Run → verify gagal** (compile error / assertion fail yang diharapkan).
+- [x] **Step 3: Implementasi** sesuai interface; warning format: `takka: warning: using legacy AGENTIC_X; set TAKKA_X instead`.
+- [x] **Step 4: Full suite hijau → commit** `feat!: takka config path with legacy fallback + config migrate`.
 
 ### Task 3: Protokol name/version 1→2 + daemon/CLI handshake
 
@@ -75,10 +77,10 @@
 - Produces: wire v2 homogen.
 - Consumes: Task 1 (nama crate).
 
-- [ ] **Step 1: Tulis test gagal** — frame v1 ditolak engine v2; frame tanpa `v` default? (sesuai serde: tanpa default → deserialization error `protocol_error`; itu perilaku yang benar, pin di test).
-- [ ] **Step 2: Run → verify gagal.**
-- [ ] **Step 3: Implementasi** — ganti dua konstanta + update golden tests + doc comment versi.
-- [ ] **Step 4: Full suite + smoke daemon/flow → commit** `feat!: protocol v2 (takka) `.
+- [x] **Step 1: Tulis test gagal** — frame v1 ditolak engine v2; frame tanpa `v` default? (sesuai serde: tanpa default → deserialization error `protocol_error`; itu perilaku yang benar, pin di test).
+- [x] **Step 2: Run → verify gagal.**
+- [x] **Step 3: Implementasi** — ganti dua konstanta + update golden tests + doc comment versi.
+- [x] **Step 4: Full suite + smoke daemon/flow → commit** `feat!: protocol v2 (takka) `.
 
 ### Task 4: Docs + installer + repo refs + gates
 
@@ -86,10 +88,10 @@
 - Modify: `README.md`, `docs/*.md` (ganti `agentic` → `takka` di nama produk/command/path; simpan catatan migrasi satu paragraf), `scripts/install.sh`, `scripts/install.ps1` (REPOSITORY `dchya24/takka`, `TAKKA_*` vars + fallback note), `scripts/release.sh` (nama artefak), `.github/workflows/*` bila menyebut nama binary/artefak, `scripts/protocol-demo.js` (nama di log/komentar).
 - Test: tidak ada (docs-only) + gates penuh.
 
-- [ ] **Step 1: Rename docs + scripts** (grep `agentic` case-insensitive sisa → takka; kecuali: `AGENTIC_*` legacy fallback docs, changelog history entries versi lama tetap `agentic` — catat eksplisit).
-- [ ] **Step 2: Skills dir fallback (triage dari Task 2 review — gap lintas plan)** — `takka-core/src/skills/discovery.rs`: tambah `~/.config/takka/skills` sebagai lokasi global pertama (new-wins), fallback legacy `~/.config/agentic/skills` bila takka kosong/tak ada. TANPA migrate (skills user-install jarang; fallback cukup). Update help text `takka-cli/src/cli.rs` yang menyebut `~/.config/agentic/skills` ke path baru + tool description `update_memory.rs:56` (`~/.config/agentic/memory.md` → takka). Test: new-wins + legacy-fallback.
-- [ ] **Step 3: Gates** — `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` + windows check (`cargo check -p takka-cli --target x86_64-pc-windows-gnu`, rustup target terinstal).
-- [ ] **Step 4: Commit** `docs: rebrand docs + installer to takka`.
+- [x] **Step 1: Rename docs + scripts** (grep `agentic` case-insensitive sisa → takka; kecuali: `AGENTIC_*` legacy fallback docs, changelog history entries versi lama tetap `agentic` — catat eksplisit).
+- [x] **Step 2: Skills dir fallback (triage dari Task 2 review — gap lintas plan)** — `takka-core/src/skills/discovery.rs`: tambah `~/.config/takka/skills` sebagai lokasi global pertama (new-wins), fallback legacy `~/.config/agentic/skills` bila takka kosong/tak ada. TANPA migrate (skills user-install jarang; fallback cukup). Update help text `takka-cli/src/cli.rs` yang menyebut `~/.config/agentic/skills` ke path baru + tool description `update_memory.rs:56` (`~/.config/agentic/memory.md` → takka). Test: new-wins + legacy-fallback.
+- [x] **Step 3: Gates** — `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` + windows check (`cargo check -p takka-cli --target x86_64-pc-windows-gnu`, rustup target terinstal).
+- [x] **Step 4: Commit** `docs: rebrand docs + installer to takka`.
 
 ## Self-Review
 

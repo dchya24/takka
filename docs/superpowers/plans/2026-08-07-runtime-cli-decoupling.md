@@ -1,6 +1,8 @@
 # Runtime-CLI Decoupling Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Bangun `agentic-runtime` (binary tipis + engine) dengan protocol JSON Lines stdout/stdin, refactor core ke instance-based handler, dan migrasi Rust CLI jadi pure renderer — sehingga core-agentic siap dipakai Node/VS Code/desktop.
 
@@ -41,7 +43,7 @@
   - `pub struct InitOverrides { config_path: Option<String>, permission_mode: Option<PermissionMode>, model: Option<String>, system_prompt: Option<String> }`
   - `Event` variants changed: `Thinking{content}`, `Planning{task}`, `ToolStarted{tool_call_id, tool_name, arguments}`, `ToolFinished{tool_call_id, tool_name, success}`, `AssistantDelta{content}`, `Warning{message}`, `QuestionRequest{questions: Vec<QuestionPrompt>}`, `TodoChanged{todos: Vec<TodoItem>}`, `Done{result}` (rename dari `Completed`).
 
-- [ ] **Step 1: Write failing golden test for `Event` serialization**
+- [x] **Step 1: Write failing golden test for `Event` serialization**
 
 ```rust
 // core-agentic/src/runtime/protocol.rs
@@ -76,12 +78,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run test → verify fail**
+- [x] **Step 2: Run test → verify fail**
 
 Run: `cargo test -p core-agentic runtime::protocol`
 Expected: FAIL karena `runtime` mod + `ToolStarted`/`ProtocolEvent` belum ada.
 
-- [ ] **Step 3: Ubah `events.rs`** — rename & tambah variant
+- [x] **Step 3: Ubah `events.rs`** — rename & tambah variant
 
 Ubah variant di `core-agentic/src/events.rs` (rangkum semua rename + penambahan):
 
@@ -103,7 +105,7 @@ TodoChanged { todos: Vec<crate::tools::TodoItem> },   // "todo_changed"
 Sync `EventType` enum + `event_type()` match. Pastikan `Event::ToolCall`, dan semua variant yang tidak di-rename, tetap.
 Hapus `Completed`, `Thought`, `ToolStart` (ganti semua referensi di `orchestrator/run.rs`, `tool_exec.rs`, `planner.rs`, dan `tests.rs` dengan nama baru).
 
-- [ ] **Step 4: Buat `runtime/mod.rs` + `runtime/protocol.rs`**
+- [x] **Step 4: Buat `runtime/mod.rs` + `runtime/protocol.rs`**
 
 `protocol.rs` berisi: konstanta, `ProtocolEvent`, `ProtocolRequest`, `Request`, `InitOverrides`, + implementasi `Debug`/`Serialize`/`Deserialize` via derive (pakai `#[serde(rename_all = "camelCase")]` pada struct level). `Attachment` dan `QuestionAnswer` sudah `Serialize`, jadi bisa langsung dimasukkan sebagai field.
 
@@ -117,12 +119,12 @@ Registrasi di `lib.rs`:
 pub mod runtime;
 ```
 
-- [ ] **Step 5: Run test untuk verif pass**
+- [x] **Step 5: Run test untuk verif pass**
 
 Run: `cargo test -p core-agentic runtime::protocol`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add core-agentic/src/events.rs core-agentic/src/runtime/
@@ -156,7 +158,7 @@ git commit -m "feat(core): protocol types + Event rename/new variants (golden ro
   pub fn builtin_tools() -> Vec<...>;  // wrapper memakai ToolDeps::new()
   ```
 
-- [ ] **Step 1: Ubah test yang ada ke instance-based (failing)**
+- [x] **Step 1: Ubah test yang ada ke instance-based (failing)**
 
 Di `core-agentic/src/tools/question.rs` test (sekitar baris 293), ubah ke instance:
 ```rust
@@ -166,7 +168,7 @@ let tool = QuestionTool::new().with_question_handler(Har {});
 ```
 Senada di `todowrite.rs`. Jalankan → diharapkan FAIL kompilasi karena field handler belum ada.
 
-- [ ] **Step 2: Refactor `QuestionTool`**
+- [x] **Step 2: Refactor `QuestionTool`**
 
 Ubah `QuestionTool` punya field `handler: Option<Box<dyn QuestionHandler>>`:
 ```rust
@@ -178,11 +180,11 @@ impl QuestionTool {
 ```
 Di `execute`: baca `self.handler` bukan (`self.handler.lock()...` → `match &self.handler { Some(h) => h.handle(&questions), None => fallback_answers(&questions) }`). Hapus static `QUESTION_HANDLER` + `set_question_handler` + `clear_question_handler`.
 
-- [ ] **Step 3: Refactor `TodowriteTool`**
+- [x] **Step 3: Refactor `TodowriteTool`**
 
 Sama: `TodowriteTool { todo: Arc<Mutex<Vec<TodoItem>>>, handler: Option<Box<dyn TodoChangeHandler>> }` — biarkan `TODO_LIST` static untuk test (atau pindah ke instance). Untuk v1 pertahankan static `TODO_LIST` sebagai sumber truth (banyak tempat baca), hapus `TODO_CHANGE_HANDLER` static. `execute` memakai `self.handler` untuk `on_change`.
 
-- [ ] **Step 4: Tambah `ToolDeps` + ganti `builtin_tools_with`**
+- [x] **Step 4: Tambah `ToolDeps` + ganti `builtin_tools_with`**
 
 ```rust
 #[derive(Default)]
@@ -190,7 +192,7 @@ pub struct ToolDeps { /* 4 field, Default → handler None */ }
 ```
 `builtin_tools()` → `builtin_tools_with(ToolDeps::new())`. Penjang `builtin_tools_with_tracker` dan `builtin_tools_with` (2-arg) diganti satu `builtin_tools_with(deps: ToolDeps)`. Update semua panggilan (di core test + `agentic-cli`). `QuestionTool::new().with_question_handler(...)` dan `TodowriteTool::new().with_todo_handler(...)` saat handler ada.
 
-- [ ] **Step 5: Update `agentic-cli` `ensure_orchestrator`**
+- [x] **Step 5: Update `agentic-cli` `ensure_orchestrator`**
 
 Di `commands.rs`, bangun `ToolDeps` di `ensure_orchestrator`:
 ```rust
@@ -201,16 +203,16 @@ for tool in core_agentic::builtin_tools_with(deps) { tools.register(tool); }
 ```
 Ganti pemanggilan `set_question_handler(...)` dan `set_todo_change_handler(...)` (yang sudah dihapus dari core) dengan menaruh handler ke dalam `ToolDeps`. `CliQuestionHandler` dan `CliTodoRenderer` tetap didefinisikan di `commands.rs`.
 
-- [ ] **Step 6: Update `lib.rs` exports**
+- [x] **Step 6: Update `lib.rs` exports**
 
 Hapus re-export `set_question_handler`, `clear_question_handler`, `set_todo_change_handler`, `clear_todo_change_handler`. Tambah `pub use tools::ToolDeps;`. Perbaiki `commands.rs` dan `interactive.rs`/`tui` yang masih memanggil `set_*_handler`.
 
-- [ ] **Step 7: Run semua test & verif**
+- [x] **Step 7: Run semua test & verif**
 
 Run: `cargo test -p core-agentic` lalu `cargo build -p agentic-cli --bins`.
 Expected: PASS; CLI tetap bisa `agentic run` in-process.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add core-agentic/src/tools/ agentic-cli/src/commands.rs
@@ -246,7 +248,7 @@ git commit -m "refactor(core): ToolDeps instance-based handlers; remove global s
   }
   ```
 
-- [ ] **Step 1: Tulis engine test (failing)**
+- [x] **Step 1: Tulis engine test (failing)**
 
 `core-agentic/tests/engine_loopback.rs` (pakai `ScriptedProvider` dari `tests/support/mod.rs`):
 ```rust
@@ -261,13 +263,13 @@ std::thread::spawn(move || engine.run());
 // assert event sequence mengandung "done" via event_rx
 ```
 
-- [ ] **Step 2: Run → verify fail** (`cargo test --test engine_loopback`). Diharap FAIL karena `RuntimeEngine` belum ada.
+- [x] **Step 2: Run → verify fail** (`cargo test --test engine_loopback`). Diharap FAIL karena `RuntimeEngine` belum ada.
 
-- [ ] **Step 3: Implement transport.rs**
+- [x] **Step 3: Implement transport.rs**
 
 `Transport` trait + `MemoryTransport` (pakai `std::sync::mpsc::Receiver`/`Sender`). Field: `request_rx: Receiver<ProtocolRequest>` (dari client), `event_tx: Sender<ProtocolEvent>` (ke client). `write_event` serde_json serialize + `event_tx.send`. `read_request` = `request_rx.recv()` pakai Option. Helper test: `MemoryTransport::push_request(&request_tx, Request)`, `MemoryTransport::take_events(event_rx)`.
 
-- [ ] **Step 4: Implement engine.rs (inti)**
+- [x] **Step 4: Implement engine.rs (inti)**
 
 - `emit(&self, ev)`: dapat `request_id` dari `current_request_id`, gabung jadi `ProtocolEvent`, `transport.write_event`.
 - `handle_init`: load config disk (`Config::load` / `Config::fallback`/override `config_path`), merge `InitOverrides` (permission_mode, model, system_prompt), `build_session`.
@@ -278,15 +280,15 @@ std::thread::spawn(move || engine.run());
 - Subpubatan `on_chunk_emits_assistant_delta`: `emit(Event::AssistantDelta{content: chunk})`.
 - Forward `on_event` orchestrator → `self.emit(...)` (terima semua Event, incl. pensar_event).
 
-- [ ] **Step 5: Tambah `MemoryTransport` + uniformly wire**
+- [x] **Step 5: Tambah `MemoryTransport` + uniformly wire**
 
 Definisikan di `transport.rs`. `request_tx`/`event_rx` (channel yang dipegang test) untuk mendorong request dan membaca event.
 
-- [ ] **Step 6: engine loopback test → PASS**
+- [x] **Step 6: engine loopback test → PASS**
 
 Ubah test untuk pakai MemoryTransport dua arah; jalankan `cargo test --test engine_loopback`. Pastikan sequence: `init_ok` → `done`. Tambah 3-4 scenario: valid happy, confirm round-trip, question round-trip, cancel.
 
-- [ ] **Step 7: Build & commit**
+- [x] **Step 7: Build & commit**
 
 ```bash
 cargo test -p core-agentic && cargo build -p core-agentic
@@ -310,7 +312,7 @@ git commit -m "feat(core): RuntimeEngine + transports + session builder; engine 
 - Produces binary `agentic-runtime` yang: baca stdin JSONL → engine → stdout JSONL; kirim `ready` dulu (tanpa diminta).
 - Env var (debug only) `AGENTIC_RUNTIME_SCRIPTED=1` → pakai `ScriptedProvider` injected (untuk test tanpa API key).
 
-- [ ] **Step 1: Cargo.toml**
+- [x] **Step 1: Cargo.toml**
 
 ```toml
 [package]
@@ -330,7 +332,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 
-- [ ] **Step 2: stdio.rs (StdioTransport)**
+- [x] **Step 2: stdio.rs (StdioTransport)**
 
 ```rust
 pub struct StdioTransport {
@@ -343,22 +345,22 @@ impl Transport for StdioTransport {
 }
 ```
 
-- [ ] **Step 3: main.rs — ready, loop engine**
+- [x] **Step 3: main.rs — ready, loop engine**
 
 - Setup subscriber (stderr).
 - `let mut eng = RuntimeEngine::new(StdioTransport::new()?);`
 - Setelah spawn: `eng.emit(Event::System{ ... })` atau kirim tps jalur `ready` sebelum loop. Desain: engine di Task 3 sudah emit `ready` saat `run()` mulai (add to design); tambahkan di sini.
 - `eng.run();` (blok). Tangani `Err` → exit 1.
 
-- [ ] **Step 4: Integration smoke test**
+- [x] **Step 4: Integration smoke test**
 
 `tests/protocol_smoke.rs`: spawn binary (`std::process::Command`), tulis `shutdown` ke stdin, tutup, assert exit 0 & ada baris `ready`. Pakai `AGENTIC_RUNTIME_SCRIPTED=1` untuk langkah non-interactive.
 
-- [ ] **Step 5: Run test & build**
+- [x] **Step 5: Run test & build**
 
 `cargo build -p agentic-runtime` ; `cargo test -p agentic-runtime`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml agentic-runtime/
@@ -376,7 +378,7 @@ git commit -m "feat(runtime): headless agentic-runtime binary (stdio JSONL daemo
 **Interfaces:**
 - Menggunakan binary `agentic-runtime` via path.
 
-- [ ] **Step 1: Tulis script**
+- [x] **Step 1: Tulis script**
 
 Node script (tanpa deps berat, pakai `child_process.spawn`, `readline`, `JSON.parse` per baris):
 
@@ -396,12 +398,12 @@ cp.stdin.write(JSON.stringify({v:1,id:'r1',type:'init'}) + '\n');
 cp.stdin.write(JSON.stringify({v:1,id:'r2',type:'run',task:'print hello'}) + '\n');
 ```
 
-- [ ] **Step 2: Jalankan & buktikan round-trip**
+- [x] **Step 2: Jalankan & buktikan round-trip**
 
 Run: `node scripts/protocol-demo.js`
 Expected: event stream terlihat; pada `confirmation_request` script replay, akhirnya `done`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add scripts/protocol-demo.js
@@ -431,17 +433,17 @@ git commit -m "feat(scripts): node proof-of-protocol client for agentic-runtime"
   ```
   Busy: `run` tidak di-spawn jika masih ada run aktif — pakai `current_run: Option<request_id>`.
 
-- [ ] **Step 1: Tulis failing test (client round-trip)**
+- [x] **Step 1: Tulis failing test (client round-trip)**
 
 Di `agentic-cli/tests/cli_client.rs`, spawn binary dengan mock, kirim init + run, assert event `done` diterima.
 
-- [ ] **Step 2: Jalankan → fail**
+- [x] **Step 2: Jalankan → fail**
 
-- [ ] **Step 3: Implement `StdioClient`**
+- [x] **Step 3: Implement `StdioClient`**
 
 Wrap child process: `send(&Request)` serialize + newline ke stdin; spawn `reader` task yang baca event dan dispatch ke `handlers` + resolve `pending` (match request_id). API `await_run` = subscribe ke `done`/`error` untuk request_id.
 
-- [ ] **Step 4: Refactor `commands.run()`**
+- [x] **Step 4: Refactor `commands.run()`**
 
 - Ganti `ensure_orchestrator` + `run_stream` + renderer thread → buat `StdioClient` (di `run` dan pakai saat `--mode plan`). Rute:
   - Bila `--mode plan` → init override `permission_mode=Plan` → kirim `run`.
@@ -450,11 +452,11 @@ Wrap child process: `send(&Request)` serialize + newline ke stdin; spawn `reader
   - question: event `question_request` → dialoguer → `question_response`.
 - Hapus `CliQuestionHandler`/`CliTodoRenderer`? Tidak — masih dipakai in-process selama `interactive` belum dimigrasi (Task 7); buat `run()` tetap berdampak pada keduanya via daemon. Pada Task 7 dihapus.
 
-- [ ] **Step 5: Verify `agentic run` works**
+- [x] **Step 5: Verify `agentic run` works**
 
 Run: `target/debug/agentic run "hello"` (dengan config valid / mock) → output stream seperti sebelumnya. Update test CLI jika perlu.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ---
 
@@ -465,17 +467,17 @@ Run: `target/debug/agentic run "hello"` (dengan config valid / mock) → output 
 - Delete: handler global wiring di keduanya
 - Modify: `agentic-cli/src/main.rs`
 
-- [ ] **Step 1–3:** Refactor `interactive` REPL: init client sekali, loop `send(run)` tiap turn, render event `assistant_delta`, confirmation/question round-trip. `/model` → init override.
+- [x] **Step 1–3:** Refactor `interactive` REPL: init client sekali, loop `send(run)` tiap turn, render event `assistant_delta`, confirmation/question round-trip. `/model` → init override.
 
-- [ ] **Step 4–6:** Refactor TUI: pakai `StdioClient.on_event` daripada `run_with_callbacks`. Hapus dua channel paralel (chunk + event) yang lama.
+- [x] **Step 4–6:** Refactor TUI: pakai `StdioClient.on_event` daripada `run_with_callbacks`. Hapus dua channel paralel (chunk + event) yang lama.
 
-- [ ] **Step 7:** Hapus `CliQuestionHandler` + `CliTodoRenderer` dari commands.rs (in-process tidak dipakai lagi). Update `lib` tidak.
+- [x] **Step 7:** Hapus `CliQuestionHandler` + `CliTodoRenderer` dari commands.rs (in-process tidak dipakai lagi). Update `lib` tidak.
 
-- [ ] **Step 8:** Update test interactive/TUI yang pakai mock provider → pakai mock runtime (env `AGENTIC_RUNTIME_SCRIPTED`).
+- [x] **Step 8:** Update test interactive/TUI yang pakai mock provider → pakai mock runtime (env `AGENTIC_RUNTIME_SCRIPTED`).
 
-- [ ] **Step 9:** Verify `agentic interactive` & `agentic tui` jalan lewat daemon.
+- [x] **Step 9:** Verify `agentic interactive` & `agentic tui` jalan lewat daemon.
 
-- [ ] **Step 10:** Commit
+- [x] **Step 10:** Commit
 
 ---
 
@@ -487,15 +489,15 @@ Run: `target/debug/agentic run "hello"` (dengan config valid / mock) → output 
 - Modify: docs (`PRD_Runtime_CLI_Decoupling.md`, `AGENT_ARCHITECTURE.md` — update struktur, bahas runtime)
 - Bump version: `agentic-runtime` 0.1.0 launch.
 
-- [ ] **Step 1:** Pindahkan metode `config_*` ke `commands/config.rs`, `skill_*` ke `skill.rs`, `status()`/`examples()`/`update()` ke `status.rs`, `run()`+planner ke `run.rs`, `client.rs` tetap. `ensure_orchestrator` dihapus (pindah ke engine). Update `main.rs` imports.
+- [x] **Step 1:** Pindahkan metode `config_*` ke `commands/config.rs`, `skill_*` ke `skill.rs`, `status()`/`examples()`/`update()` ke `status.rs`, `run()`+planner ke `run.rs`, `client.rs` tetap. `ensure_orchestrator` dihapus (pindah ke engine). Update `main.rs` imports.
 
-- [ ] **Step 2:** `cargo build -p agentic-cli --bins` clean.
+- [x] **Step 2:** `cargo build -p agentic-cli --bins` clean.
 
-- [ ] **Step 3:** Update docs: tandai `agentic-runtime` ada, CLI = renderer, phase jadi done; kunci semua event nama baru.
+- [x] **Step 3:** Update docs: tandai `agentic-runtime` ada, CLI = renderer, phase jadi done; kunci semua event nama baru.
 
-- [ ] **Step 4:** Final full test `cargo test --workspace` + `cargo clippy --workspace`.
+- [x] **Step 4:** Final full test `cargo test --workspace` + `cargo clippy --workspace`.
 
-- [ ] **Step 5:** Commit.
+- [x] **Step 5:** Commit.
 
 ---
 

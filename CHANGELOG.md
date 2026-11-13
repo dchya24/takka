@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Runtime: **ACP adapter (Fase 4)** — `takka-runtime --acp` speaks the Agent
+  Client Protocol v1 (JSON-RPC over stdio, the Zed editor integration
+  surface): v1 protocol negotiation with capability advertisement (image
+  prompts, `loadSession: false`, agent info), multi-session hosting bounded by
+  `--acp-max-sessions` (over-capacity → `session capacity reached` error),
+  `session/new` with cwd validation (single-cwd adapter, D11), `session/prompt`
+  turns streaming as ACP content blocks (thinking / assistant deltas / tool
+  calls / tool output), `session/set_mode` (default / plan / reply modes),
+  `session/cancel` mid-turn resolving the pending prompt as `cancelled`, a
+  turn-limit guard (D12), and clean EOF shutdown (stdin closed → all engines
+  joined, exit 0). The adapter is stdio-only and fully portable (no new
+  Windows cfg faces). A hermetic 14-check conformance run
+  (`scripts/acp-conformance.sh`) drives the real binary and is now a CI gate
+  on ubuntu + macOS (T-08); Windows compilation sanity stays with the test
+  matrix.
+
+### Fixed
+- Runtime: a plan-approval reply could be lost when the client answered the
+  instant the request appeared — the `Request::Plan` approval gate now
+  installs its reply channel **before** announcing `PlanApprovalRequest`
+  (same order as the other confirmation handlers), so an immediate answer is
+  never dropped as "no confirmation response is pending".
+- Test infra (issue #4): all `ENV_LOCK` consumers recover from poisoning
+  (`into_inner()`) so one panicking env test no longer cascades `PoisonError`
+  across the run, env-restoring guards hold the lock as their last-declared
+  field (drop order), and the event-wait helpers (`wait_for_tap_event_count`,
+  `recv_until`) use quiet-window activity deadlines instead of a fixed
+  wall-clock deadline that failed on busy runners while the run was still
+  making progress.
+
 ## [0.6.0] — 2026-11-10
 
 ### Added (REPL/TUI UX hardening)

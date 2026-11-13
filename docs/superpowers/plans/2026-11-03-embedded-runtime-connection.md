@@ -1,6 +1,8 @@
 # Embedded Runtime Connection Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Status:** LANDED — semua step selesai dieksekusi (checkbox disweep housekeeping 2026-11-12); fiturnya ada di CHANGELOG [0.6.0].
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Mode runtime **embedded** (engine berjalan sebagai thread in-process via `MemoryTransport`) menjadi default CLI, dengan jalur spawn proses `agentic-runtime` dipertahankan sebagai escape hatch `--runtime spawn` — keduanya di belakang satu abstraction `AgentConnection` tanpa perubahan protokol.
 
@@ -38,7 +40,7 @@
   - `pub struct InProcessClient` dengan `pub async fn start(overrides: InitOverrides) -> Result<Self>`, `pub async fn send(&mut self, request: Request) -> Result<String>`, `pub async fn next_event(&mut self) -> Result<ProtocolEvent>`, `pub async fn shutdown(&mut self) -> Result<()>`; mengimplementasikan `ConnectionIo`
   - `pub(crate) fn spawn_engine_thread<T, F>(make_engine: F, request_rx: std_mpsc::Receiver<ProtocolRequest>, event_tx: std_mpsc::Sender<ProtocolEvent>, panic_tx: std_mpsc::Sender<ProtocolEvent>) -> std::thread::JoinHandle<()>` — generik atas transport agar test bisa menyuntik transport panik
 
-- [ ] **Step 1: Tulis test gagal untuk handshake + ListTools embedded**
+- [x] **Step 1: Tulis test gagal untuk handshake + ListTools embedded**
 
 Tambahkan di akhir `agentic-cli/src/client.rs`:
 
@@ -115,12 +117,12 @@ mod in_process_tests {
 }
 ```
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p agentic-cli in_process -- --nocapture`
 Expected: COMPILE ERROR — `InProcessClient` tidak ditemukan (`cannot find type InProcessClient`).
 
-- [ ] **Step 3: Implementasi `ConnectionIo`, helper bersama, refactor `RuntimeClient`, dan `InProcessClient`**
+- [x] **Step 3: Implementasi `ConnectionIo`, helper bersama, refactor `RuntimeClient`, dan `InProcessClient`**
 
 Di `agentic-cli/src/client.rs`, tambahkan imports di bagian atas:
 
@@ -424,17 +426,17 @@ use core_agentic::runtime::transport::MemoryTransport;
 
 > Catatan: `shutdown` tidak me-drop `request_tx` secara eksplisit — pengirim itu drop alami bersama `self`. Engine keluar dari loop karena `Request::Shutdown => break` di `engine.rs`, bukan karena channel tertutup. Run yang sedang aktif tetap di-join oleh `engine.run()` sendiri (loop `run_threads.drain(..).join()`), sama seperti jalur spawn.
 
-- [ ] **Step 4: Jalankan test → verify pass**
+- [x] **Step 4: Jalankan test → verify pass**
 
 Run: `cargo test -p agentic-cli in_process`
 Expected: 2 passed (`in_process_handshake_and_list_tools_round_trip`, `shutdown_joins_engine_thread`).
 
-- [ ] **Step 5: Verify regresi jalur spawn (helper refactor tidak mengubah perilaku)**
+- [x] **Step 5: Verify regresi jalur spawn (helper refactor tidak mengubah perilaku)**
 
 Run: `cargo test -p agentic-cli` lalu `cargo test -p core-agentic --test runtime_engine`
 Expected: semua pass — termasuk 2 smoke e2e spawn (`smoke_run_with_callbacks_streams_daemon_lifecycle_events`, `smoke_run_through_daemon_does_not_deadlock`) dan golden test engine core tanpa modifikasi.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add agentic-cli/src/client.rs
@@ -452,7 +454,7 @@ git commit -m "feat(cli): add InProcessClient with shared ConnectionIo handshake
 - Consumes: `spawn_engine_thread` (Task 1), `trait Transport` (`read_request`, `write_event`), `ProtocolEvent::new`, `tokio_mpsc::unbounded_channel`.
 - Produces: bukti teruji bahwa panic di thread engine dikirim sebagai `Event::Error` berpesan `"embedded runtime engine panicked"` — kontrak yang diandalkan Task 3 (UX respawn).
 
-- [ ] **Step 1: Tulis test untuk jalur panic**
+- [x] **Step 1: Tulis test untuk jalur panic**
 
 Tambahkan ke mod `in_process_tests` di `agentic-cli/src/client.rs`. Kontraknya: `RuntimeEngine::run()` mengirim `Ready` via `write_event` **sebelum** membaca request pertama, jadi transport yang `write_event`-nya `Ok` dan `read_request`-nya panic menghasilkan urutan event `Ready` lalu `Error` (via `panic_tx` dari `catch_unwind`):
 
@@ -525,12 +527,12 @@ Tambahkan ke mod `in_process_tests` di `agentic-cli/src/client.rs`. Kontraknya: 
 
 > `AtomicBool`/state tidak diperlukan pada transport ini: `read_request` dipanggil tepat satu kali sebelum engine unwind, dan panic pertama langsung memicu jalur `catch_unwind` → `panic_tx`.
 
-- [ ] **Step 2: Jalankan test → verify pass**
+- [x] **Step 2: Jalankan test → verify pass**
 
 Run: `cargo test -p agentic-cli engine_panic -- --nocapture`
 Expected: 1 passed — `Error` berpesan panic diterima lewat channel, test process tetap hidup (catch_unwind bekerja).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add agentic-cli/src/client.rs
@@ -557,7 +559,7 @@ git commit -m "test(cli): embedded engine panic surfaces as terminal Error event
   - `Commands::with_runtime_mode(self, mode: RuntimeMode) -> Self`
 - Kontrak call site (dipakai renderer/REPL/TUI, tidak berubah perilaku): `send_and_wait(Request)` → `ProtocolEvent`, `send(Request)` → `String`, `next_event()` → `ProtocolEvent`, `run(task, attachments, on_chunk, on_event, responder)` → `String`, `shutdown()`.
 
-- [ ] **Step 1: Tulis test gagal untuk `AgentConnection::connect` dua mode**
+- [x] **Step 1: Tulis test gagal untuk `AgentConnection::connect` dua mode**
 
 Tambahkan ke mod `in_process_tests` di `client.rs`:
 
@@ -589,12 +591,12 @@ Tambahkan ke mod `in_process_tests` di `client.rs`:
     }
 ```
 
-- [ ] **Step 2: Jalankan test → verify gagal**
+- [x] **Step 2: Jalankan test → verify gagal**
 
 Run: `cargo test -p agentic-cli agent_connection -- --nocapture`
 Expected: COMPILE ERROR — `AgentConnection`/`RuntimeMode` tidak ditemukan.
 
-- [ ] **Step 3: Implementasi `RuntimeMode` + `AgentConnection`**
+- [x] **Step 3: Implementasi `RuntimeMode` + `AgentConnection`**
 
 Di `client.rs` (setelah impl `InProcessClient`):
 
@@ -681,12 +683,12 @@ impl ConnectionIo for AgentConnection {
 }
 ```
 
-- [ ] **Step 4: Jalankan test `agent_connection` → verify pass**
+- [x] **Step 4: Jalankan test `agent_connection` → verify pass**
 
 Run: `cargo test -p agentic-cli agent_connection`
 Expected: 1 passed (dua mode keduanya berhasil handshake + ListTools).
 
-- [ ] **Step 5: Flag CLI `--runtime`**
+- [x] **Step 5: Flag CLI `--runtime`**
 
 Di `cli.rs`, tambahkan enum + arg root (pola persis `PermissionModeArg`/`ColorChoice`):
 
@@ -724,7 +726,7 @@ Di struct `Cli`, sebelum field `command`:
     pub runtime: RuntimeModeArg,
 ```
 
-- [ ] **Step 6: Wiring `Commands` (field + builder + ensure_connection + rename call site)**
+- [x] **Step 6: Wiring `Commands` (field + builder + ensure_connection + rename call site)**
 
 Di `commands.rs`:
 
@@ -775,7 +777,7 @@ Default di konstruktor: `runtime_mode: crate::client::RuntimeMode::Embedded,` �
 
 6. Commit sementara belum — lanjut Step 7.
 
-- [ ] **Step 7: Wire `main.rs`**
+- [x] **Step 7: Wire `main.rs`**
 
 Di `main.rs` sekitar baris 254, tambahkan builder setelah `.with_permission_mode(...)`:
 
@@ -785,12 +787,12 @@ Di `main.rs` sekitar baris 254, tambahkan builder setelah `.with_permission_mode
 
 (ubah baris berantai yang ada, jangan duplikasi statement `let mut commands`).
 
-- [ ] **Step 8: Build + seluruh test CLI**
+- [x] **Step 8: Build + seluruh test CLI**
 
 Run: `cargo test -p agentic-cli`
 Expected: semua pass. Perhatikan: dua smoke e2e lama kini berjalan lewat **embedded** (default baru) — keduanya tetap harus hijau karena jalur event-nya identik.
 
-- [ ] **Step 9: Ubah smoke e2e menjadi matriks dua mode**
+- [x] **Step 9: Ubah smoke e2e menjadi matriks dua mode**
 
 Di `commands.rs` mod `e2e_tests`: ekstrak body kedua test menjadi helper privat yang menerima `RuntimeMode`, lalu duplikasi wrapper `#[tokio::test]` per mode. Pola:
 
@@ -837,12 +839,12 @@ Di `commands.rs` mod `e2e_tests`: ekstrak body kedua test menjadi helper privat 
 
 Hapus kedua test lama (`smoke_run_with_callbacks_streams_daemon_lifecycle_events`, `smoke_run_through_daemon_does_not_deadlock`) — body-nya sudah pindah ke helper.
 
-- [ ] **Step 10: Jalankan matriks e2e → verify pass**
+- [x] **Step 10: Jalankan matriks e2e → verify pass**
 
 Run: `cargo test -p agentic-cli smoke`
 Expected: 4 passed — lifecycle × {embedded, spawned}, deadlock × {embedded, spawned}.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add agentic-cli/src/client.rs agentic-cli/src/cli.rs agentic-cli/src/main.rs agentic-cli/src/commands.rs
@@ -862,7 +864,7 @@ git commit -m "feat(cli): embedded runtime default via AgentConnection + --runti
 - Consumes: perilaku final dari Task 1–3.
 - Produces: dokumentasi yang akurat + workspace lolos gate CI (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, seluruh test).
 
-- [ ] **Step 1: CHANGELOG — entri `[Unreleased]`**
+- [x] **Step 1: CHANGELOG — entri `[Unreleased]`**
 
 Tambahkan di bawah `## [Unreleased]` (sebelum `### Changed` yang ada):
 
@@ -878,7 +880,7 @@ Tambahkan di bawah `## [Unreleased]` (sebelum `### Changed` yang ada):
   mode).
 ```
 
-- [ ] **Step 2: README — perbarui narasi dua binary**
+- [x] **Step 2: README — perbarui narasi dua binary**
 
 Di `README.md`, bagian "Installation" paragraf yang menjelaskan dua binary, tambahkan penjelasan setelah daftar binary:
 
@@ -892,7 +894,7 @@ next to `agentic`, or via the `AGENTIC_RUNTIME_BIN` environment variable).
 
 > Catatan: nomor versi (`v0.6.0`) adalah asumsi rilis berikutnya — sesuaikan saat rilis.
 
-- [ ] **Step 3: Tandai Fase 1 selesai di BENCHMARK_CODEX.md**
+- [x] **Step 3: Tandai Fase 1 selesai di BENCHMARK_CODEX.md**
 
 Di `docs/BENCHMARK_CODEX.md`, pada tabel "Perbandingan Side-by-Side" ubah baris headless runner dan client abstraction:
 
@@ -906,7 +908,7 @@ Di `docs/BENCHMARK_CODEX.md`, pada tabel "Perbandingan Side-by-Side" ubah baris 
 
 Dan di section "Fase 1 — Dual-mode connection di CLI *(gap utama, effort kecil)*" tambahkan tandasi selesai, contoh: ubah judul menjadi `### Fase 1 — Dual-mode connection di CLI ✅ (landed 2026-11)` dan sisakan Fase 2–4 sebagai backlog.
 
-- [ ] **Step 4: fmt + clippy + full test**
+- [x] **Step 4: fmt + clippy + full test**
 
 Run:
 ```bash
@@ -916,7 +918,7 @@ cargo test --workspace
 ```
 Expected: fmt bersih (atau hanya menyusun ulang import — commit hasilnya), clippy 0 warning, semua test pass. Jika clippy menemukan pelanggaran di kode baru (mis. `field_reassign_with_default`, `redundant_clone`), perbaiki di file terkait sampai bersih.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add CHANGELOG.md README.md docs/BENCHMARK_CODEX.md agentic-cli/src
