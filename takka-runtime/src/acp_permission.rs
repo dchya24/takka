@@ -7,17 +7,52 @@ use agent_client_protocol_schema::v1 as acp;
 
 use takka_core::runtime::protocol::Request;
 
-/// D8: satu pasangan default `allow_once`/`reject_once`;
-/// `*_always` hanya muncul bila tool ada di jalur auto-approve (T-05 dialan).
+/// What the client answered to one permission gate (the bridge's answer
+/// currency between the turn thread and the framing loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionAnswer {
+    /// Allow this one call.
+    AllowOnce,
+    /// Allow this call AND every equivalent future call this session
+    /// (persisted engine-side as a dynamic auto-approve entry).
+    AllowAlways,
+    /// Deny (reject or cancelled or dropped).
+    Deny,
+}
+
+/// D8 (revisi 2026-11-13): `allow_once`/`allow_always`/`reject_once`.
+/// `allow_always` mempersist perintah itu ke daftar auto-approve
+/// dinamis engine untuk sisa sesi (in-session; tidak ditulis ke config).
 pub(crate) fn permission_options() -> Vec<acp::PermissionOption> {
     vec![
         acp::PermissionOption::new("allow_once", "Allow", acp::PermissionOptionKind::AllowOnce),
+        acp::PermissionOption::new(
+            "allow_always",
+            "Always allow",
+            acp::PermissionOptionKind::AllowAlways,
+        ),
         acp::PermissionOption::new(
             "reject_once",
             "Reject",
             acp::PermissionOptionKind::RejectOnce,
         ),
     ]
+}
+
+/// Outcome klien -> jawaban permission (approve + persistensi).
+pub(crate) fn outcome_answer(outcome: &acp::RequestPermissionOutcome) -> PermissionAnswer {
+    match outcome {
+        acp::RequestPermissionOutcome::Selected(selected) => match &*selected.option_id.0 {
+            "allow_once" => PermissionAnswer::AllowOnce,
+            "allow_always" => PermissionAnswer::AllowAlways,
+            // Enum ACP `#[non_exhaustive]`: option lain (reject_*) → deny.
+            _ => PermissionAnswer::Deny,
+        },
+        acp::RequestPermissionOutcome::Cancelled => PermissionAnswer::Deny,
+        // Outcome lain di versi protokol berikutnya default ke tolak
+        // (fail-closed).
+        _ => PermissionAnswer::Deny,
+    }
 }
 
 /// ConfirmationRequest.action → ToolKind yang dirender editor:
@@ -55,21 +90,6 @@ pub(crate) fn permission_request(
     )
 }
 
-/// Outcome klien → approved?
-/// Cancelled → false; Selected("allow_once"/"allow_always") → true;
-/// Selected lainnya (reject_*) → false.
-pub(crate) fn outcome_approves(outcome: &acp::RequestPermissionOutcome) -> bool {
-    match outcome {
-        acp::RequestPermissionOutcome::Selected(selected) => {
-            matches!(&*selected.option_id.0, "allow_once" | "allow_always")
-        }
-        acp::RequestPermissionOutcome::Cancelled => false,
-        // Enum ACP `#[non_exhaustive]`: outcome lain yang muncul di versi
-        // protokol berikutnya default ke tolak (fail-closed).
-        _ => false,
-    }
-}
-
 /// Outcome → Request::ConfirmResponse yang kembali ke engine (approved bool).
 pub(crate) fn confirm_response(request_id: Option<String>, approved: bool) -> Request {
     Request::ConfirmResponse {
@@ -101,22 +121,40 @@ mod tests {
         assert_eq!(value["toolCall"]["kind"], "execute");
 
         let options = value["options"].as_array().expect("options array");
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
         assert_eq!(options[0]["optionId"], "allow_once");
         assert_eq!(options[0]["name"], "Allow");
         assert_eq!(options[0]["kind"], "allow_once");
-        assert_eq!(options[1]["optionId"], "reject_once");
-        assert_eq!(options[1]["name"], "Reject");
-        assert_eq!(options[1]["kind"], "reject_once");
+        assert_eq!(options[1]["optionId"], "allow_always");
+        assert_eq!(options[1]["name"], "Always allow");
+        assert_eq!(options[1]["kind"], "allow_always");
+        assert_eq!(options[2]["optionId"], "reject_once");
+        assert_eq!(options[2]["name"], "Reject");
+        assert_eq!(options[2]["kind"], "reject_once");
     }
 
     #[test]
-    fn outcome_approves_matches_allow_variants() {
-        assert!(outcome_approves(&selected("allow_once")));
-        assert!(outcome_approves(&selected("allow_always")));
-        assert!(!outcome_approves(&selected("reject_once")));
-        assert!(!outcome_approves(&selected("reject_always")));
-        assert!(!outcome_approves(&RequestPermissionOutcome::Cancelled));
+    fn outcome_answer_matches_allow_variants() {
+        assert_eq!(
+            outcome_answer(&selected("allow_once")),
+            PermissionAnswer::AllowOnce
+        );
+        assert_eq!(
+            outcome_answer(&selected("allow_always")),
+            PermissionAnswer::AllowAlways
+        );
+        assert_eq!(
+            outcome_answer(&selected("reject_once")),
+            PermissionAnswer::Deny
+        );
+        assert_eq!(
+            outcome_answer(&selected("reject_always")),
+            PermissionAnswer::Deny
+        );
+        assert_eq!(
+            outcome_answer(&RequestPermissionOutcome::Cancelled),
+            PermissionAnswer::Deny
+        );
     }
 
     #[test]

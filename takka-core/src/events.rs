@@ -72,10 +72,16 @@ pub enum Event {
     Warning { message: String },
 
     #[serde(rename = "confirmation_request")]
+    #[serde(rename_all = "camelCase")]
     ConfirmationRequest {
         action: String,
         description: String,
         risk_level: String,
+        /// Raw target being scored (the command line, the file path), for
+        /// "always allow" persistence. Absent on frames written before
+        /// this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
     },
 
     #[serde(rename = "question_request")]
@@ -297,6 +303,12 @@ pub enum Event {
     #[serde(rename = "session_loaded")]
     #[serde(rename_all = "camelCase")]
     SessionLoaded { session_id: String },
+
+    /// Ack of `Request::SetSessionModel` (ACP `session/set_config_option`
+    /// on the `model` option): the session now runs `model` on `provider`.
+    #[serde(rename = "session_model_changed")]
+    #[serde(rename_all = "camelCase")]
+    SessionModelChanged { provider: String, model: String },
 }
 
 /// Which limit ended the turn (payload of [`Event::TurnLimitExceeded`]).
@@ -379,6 +391,7 @@ pub enum EventType {
     PermissionModeChanged,
     HistoryReplay,
     SessionLoaded,
+    SessionModelChanged,
 }
 
 impl Event {
@@ -428,6 +441,7 @@ impl Event {
             Event::PermissionModeChanged { .. } => EventType::PermissionModeChanged,
             Event::HistoryReplay { .. } => EventType::HistoryReplay,
             Event::SessionLoaded { .. } => EventType::SessionLoaded,
+            Event::SessionModelChanged { .. } => EventType::SessionModelChanged,
         }
     }
 }

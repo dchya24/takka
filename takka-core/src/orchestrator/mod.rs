@@ -323,6 +323,14 @@ impl Orchestrator {
         self.provider.clone()
     }
 
+    /// Replace the provider (ACP model switching: a different config
+    /// provider entry means a different endpoint). Needs `&mut` — hosts
+    /// call it between runs. The next loop iteration uses the new
+    /// provider with the current `model`.
+    pub fn set_provider(&mut self, provider: Arc<dyn LLMProvider>) {
+        self.provider = provider;
+    }
+
     /// Override the maximum number of agent loop iterations.
     pub fn set_max_iterations(&mut self, max: u32) {
         self.max_iterations = max.max(1);
@@ -544,6 +552,14 @@ impl Orchestrator {
     /// Get the active permission mode.
     pub fn permission_mode(&self) -> crate::safety::PermissionMode {
         self.safety.mode()
+    }
+
+    /// Allow `command` to run without a confirmation prompt for the rest
+    /// of this orchestrator's lifetime (the client's "always allow"
+    /// permission answer). The safety engine's strict matching rules still
+    /// apply: chained or destructive commands keep prompting.
+    pub fn allow_command(&self, command: &str) {
+        self.safety.allow_command(command);
     }
 
     pub(super) fn require_confirmation(&self, request: ConfirmationRequest) -> bool {

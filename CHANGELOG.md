@@ -22,13 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint's history from the sessions store as `session/update`
   notifications before the response, `session/resume` re-attaches a still-live
   session, and the ACP session id doubles as the checkpoint filename so a
-  client's saved session id keeps working across agent restarts — and clean
-  EOF shutdown (stdin closed → all engines joined, exit 0). The adapter is
-  stdio-only and fully portable (no new Windows cfg faces). A hermetic
-  conformance run (`scripts/acp-conformance.sh`, now 18 checks) drives the
-  real binary and is now a CI gate
-  on ubuntu + macOS (T-08); Windows compilation sanity stays with the test
-  matrix.
+  client's saved session id keeps working across agent restarts — config
+  options (`session/set_config_option`): a `model` select grouped by provider
+  (switching rebuilds the provider, refreshes `spawn_subagent`, and persists
+  the reorder to the config file) plus a `mode` select carrying the
+  permission modes, `UsageUpdate` telemetry (context used vs. the active
+  model's window) rendered by clients as the context-usage indicator, an
+  `Always allow` permission option that persists the approved command on the
+  safety engine's dynamic auto-approve list for the session (in-session; not
+  written to config), and clean EOF shutdown (stdin closed → all engines
+  joined, exit 0). The adapter is stdio-only and fully portable (no new
+  Windows cfg faces). A hermetic conformance run
+  (`scripts/acp-conformance.sh`, now 23 checks) drives the real binary and is
+  now a CI gate on ubuntu + macOS (T-08); Windows compilation sanity stays
+  with the test matrix.
 
 ### Fixed
 - Runtime: a plan-approval reply could be lost when the client answered the
