@@ -11,16 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Runtime: **ACP adapter (Fase 4)** — `takka-runtime --acp` speaks the Agent
   Client Protocol v1 (JSON-RPC over stdio, the Zed editor integration
   surface): v1 protocol negotiation with capability advertisement (image
-  prompts, `loadSession: false`, agent info), multi-session hosting bounded by
+  prompts, `loadSession: true` + `sessionCapabilities.resume`, agent info),
+  multi-session hosting bounded by
   `--acp-max-sessions` (over-capacity → `session capacity reached` error),
   `session/new` with cwd validation (single-cwd adapter, D11), `session/prompt`
   turns streaming as ACP content blocks (thinking / assistant deltas / tool
   calls / tool output), `session/set_mode` (default / plan / reply modes),
   `session/cancel` mid-turn resolving the pending prompt as `cancelled`, a
-  turn-limit guard (D12), and clean EOF shutdown (stdin closed → all engines
-  joined, exit 0). The adapter is stdio-only and fully portable (no new
-  Windows cfg faces). A hermetic 14-check conformance run
-  (`scripts/acp-conformance.sh`) drives the real binary and is now a CI gate
+  turn-limit guard (D12), stored-session lifecycle — `session/load` replays a
+  checkpoint's history from the sessions store as `session/update`
+  notifications before the response, `session/resume` re-attaches a still-live
+  session, and the ACP session id doubles as the checkpoint filename so a
+  client's saved session id keeps working across agent restarts — and clean
+  EOF shutdown (stdin closed → all engines joined, exit 0). The adapter is
+  stdio-only and fully portable (no new Windows cfg faces). A hermetic
+  conformance run (`scripts/acp-conformance.sh`, now 18 checks) drives the
+  real binary and is now a CI gate
   on ubuntu + macOS (T-08); Windows compilation sanity stays with the test
   matrix.
 

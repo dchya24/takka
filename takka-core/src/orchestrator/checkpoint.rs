@@ -44,6 +44,13 @@ impl Orchestrator {
         self.session_id.lock().unwrap().clone()
     }
 
+    /// Adopt a caller-supplied session id (ACP `session/load` / hosts with
+    /// a stable session identity): the next run checkpoints under this id
+    /// instead of minting a fresh uuid.
+    pub fn adopt_session_id(&mut self, id: impl Into<String>) {
+        *self.session_id.lock().unwrap() = Some(id.into());
+    }
+
     // ------------------------------------------------------------------
     // Lifecycle hooks (called from `run.rs`)
     // ------------------------------------------------------------------
@@ -167,6 +174,15 @@ impl Orchestrator {
             let mut mem = self.memory.lock().unwrap();
             mem.clear();
             for message in session.messages {
+                // Frontends replay the textual history as stream updates
+                // before the load ack; tool turns carry no standalone text
+                // and are skipped.
+                if matches!(message.role, crate::memory::MessageRole::User | crate::memory::MessageRole::Assistant) {
+                    self.events.emit(Event::HistoryReplay {
+                        role: message.role.as_str().to_string(),
+                        content: message.content.clone(),
+                    });
+                }
                 mem.add_message(message);
             }
         }

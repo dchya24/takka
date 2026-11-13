@@ -1025,6 +1025,7 @@ mod in_process_tests {
             config_path: Some(path.to_string_lossy().into_owned()),
             permission_mode: Some(takka_core::PermissionMode::Yolo),
             model: None,
+            session_id: None,
             system_prompt: None,
         }
     }

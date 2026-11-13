@@ -459,6 +459,68 @@ impl<T: Transport> RuntimeEngine<T> {
                     self.handle_plan(request.id, goal, require_approval);
                 }
                 Request::Shutdown => break,
+                // ACP `session/load` / `session/resume`: load a stored
+                // checkpoint onto this session's orchestrator. The stored
+                // history streams out as `HistoryReplay` events before the
+                // `SessionLoaded` ack; a failed load answers as `Error`.
+                Request::LoadSession { session_id } => {
+                    if self.orchestrator.is_none() {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "not initialized".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    // `resume_session` needs `&mut`: the orchestrator is
+                    // only safely exclusive while no run is active (a run
+                    // clones the Arc into its event handler). Same busy gate
+                    // as `Request::Run`.
+                    if self.running.swap(true, Ordering::SeqCst) {
+                        self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: "busy: another run is active".to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    self.running.store(false, Ordering::SeqCst);
+                    let orchestrator = Arc::get_mut(self.orchestrator.as_mut().expect("checked above"))
+                        .expect("no run holds the orchestrator between runs");
+                    orchestrator.reset_cancel();
+                    // Outside a run the orchestrator has no event
+                    // subscribers: forward the replayed history to this
+                    // request's reply stream, then drop the handler again
+                    // (a run re-subscribes its own handlers anyway).
+                    let sink = self.sink.clone();
+                    let reply_id = request.id.clone();
+                    orchestrator.clear_event_handlers();
+                    orchestrator.on_event(move |event| {
+                        if matches!(event, Event::HistoryReplay { .. }) {
+                            sink.send(Some(reply_id.clone()), event);
+                        }
+                    });
+                    let store =
+                        crate::session::SessionStore::new(session_store_root(&self.current_overrides));
+                    let outcome = orchestrator.resume_session(store, &session_id);
+                    orchestrator.clear_event_handlers();
+                    match outcome {
+                        Ok(()) => self.emit(
+                            Some(request.id),
+                            Event::SessionLoaded {
+                                session_id: session_id.clone(),
+                            },
+                        ),
+                        Err(error) => self.emit(
+                            Some(request.id),
+                            Event::Error {
+                                message: error.to_string(),
+                            },
+                        ),
+                    }
+                }
                 // ACP `session/set_mode` (D9): switch the permission mode of
                 // the running session. Safety is consulted per boundary, so
                 // the new mode governs the next turn.
@@ -571,6 +633,14 @@ impl<T: Transport> RuntimeEngine<T> {
         orchestrator.set_model(model);
         orchestrator.set_system_prompt(system_prompt);
         orchestrator.set_permission_mode(overrides.permission_mode.unwrap_or_default());
+        if let Some(session_id) = overrides.session_id.as_deref() {
+            // Stable session identity (ACP): persist under the adopted id so
+            // `Request::LoadSession` can find the checkpoint later.
+            orchestrator.set_session_store(crate::session::SessionStore::new(
+                session_store_root(&overrides),
+            ));
+            orchestrator.adopt_session_id(session_id);
+        }
         if config.agent.auto_compact_with_llm {
             orchestrator.set_auto_compact_with_llm(true);
         }
@@ -943,5 +1013,26 @@ impl<T: Transport> TodoChangeHandler for RuntimeTodoHandler<T> {
                 todos: todos.to_vec(),
             },
         );
+    }
+}
+
+/// Root of the session checkpoint store for a connection. With a pinned
+/// config file (hermetic tests, per-config deployments) sessions live in a
+/// unique sibling directory of the config; otherwise the shared user
+/// sessions directory applies.
+fn session_store_root(overrides: &super::protocol::InitOverrides) -> std::path::PathBuf {
+    match overrides.config_path.as_deref() {
+        Some(path) => {
+            let config = std::path::Path::new(path);
+            let stem = config
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("takka");
+            config
+                .parent()
+                .unwrap_or(config)
+                .join(format!("{stem}-sessions"))
+        }
+        None => crate::config::sessions_dir(),
     }
 }
