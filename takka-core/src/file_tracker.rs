@@ -13,6 +13,7 @@
 //!     // Before edit_file:
 //!     tracker.check_fresh(&path)?;
 
+use crate::sync;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -49,7 +50,7 @@ impl FileTracker {
     /// Silently ignores files that don't exist or whose mtime can't be read.
     pub fn mark_read(&self, path: &Path) {
         if let Some((key, mtime)) = key_and_mtime(path) {
-            self.seen.lock().unwrap().insert(key, mtime);
+            sync::lock(&self.seen).insert(key, mtime);
         }
     }
 
@@ -58,7 +59,7 @@ impl FileTracker {
     pub fn mark_written(&self, path: &Path) {
         // After our own write, refresh mtime so subsequent edits see "fresh".
         if let Some((key, mtime)) = key_and_mtime(path) {
-            self.seen.lock().unwrap().insert(key, mtime);
+            sync::lock(&self.seen).insert(key, mtime);
         }
     }
 
@@ -68,7 +69,7 @@ impl FileTracker {
             Some(km) => km,
             None => return Freshness::NeverRead,
         };
-        let map = self.seen.lock().unwrap();
+        let map = sync::lock(&self.seen);
         match map.get(&key) {
             None => Freshness::NeverRead,
             Some(&last_read) => {
@@ -83,16 +84,16 @@ impl FileTracker {
 
     /// Drop all tracking state (e.g. on session reset).
     pub fn clear(&self) {
-        self.seen.lock().unwrap().clear();
+        sync::lock(&self.seen).clear();
     }
 
     /// Number of files currently tracked. Mostly useful in tests.
     pub fn len(&self) -> usize {
-        self.seen.lock().unwrap().len()
+        sync::lock(&self.seen).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.seen.lock().unwrap().is_empty()
+        sync::lock(&self.seen).is_empty()
     }
 }
 
@@ -184,6 +185,28 @@ mod tests {
         // Without mark_written, this would now be Stale.
         t.mark_written(&path);
         assert_eq!(t.check(&path), Freshness::Fresh);
+    }
+
+    /// A panic while another thread holds the tracker's map must not turn
+    /// every later access into a `PoisonError` panic: the map is bookkeeping,
+    /// so recovering the poisoned guard is always safe (H-02).
+    #[test]
+    fn survives_a_poisoned_map() {
+        let t = std::sync::Arc::new(FileTracker::new());
+        let poisoner = std::sync::Arc::clone(&t);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.seen.lock().unwrap();
+            panic!("poison the tracker map on purpose");
+        });
+        assert!(handle.join().is_err(), "poisoner thread should panic");
+
+        // Reads and writes keep working instead of cascading the panic.
+        let path = tmp_file("poisoned.txt", "hi");
+        t.mark_read(&path);
+        assert_eq!(t.check(&path), Freshness::Fresh);
+        assert_eq!(t.len(), 1);
+        t.clear();
+        assert!(t.is_empty());
     }
 
     #[test]
