@@ -889,11 +889,6 @@ impl LLMProvider for AnthropicProvider {
             })
             .collect())
     }
-
-    fn count_tokens(&self, text: &str) -> usize {
-        // Claude uses a different tokenizer, but ~3.5 chars per token is reasonable
-        (text.len() as f32 / 3.5) as usize
-    }
 }
 
 #[cfg(test)]

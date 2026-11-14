@@ -40,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded fenced blocks, image files as engine attachments, directories as a
   path note).
 
+### Changed
+- Core: `estimate_tokens` is the single token estimator again (the byte-based
+  copies on the provider trait are gone) and no longer divides raw UTF-8 bytes
+  by 4: ASCII counts at ~4 bytes/token, non-ASCII at ~1 token per char, so CJK
+  text is no longer under-counted by ~25%. Since the estimate feeds
+  `needs_compaction`, the context budget, and the 85% autocompact threshold,
+  non-ASCII sessions now compact slightly earlier — expected, and the safe
+  direction (a low estimate risks a provider-side context error).
+
 ### Fixed
 - Runtime: a plan-approval reply could be lost when the client answered the
   instant the request appeared — the `Request::Plan` approval gate now
