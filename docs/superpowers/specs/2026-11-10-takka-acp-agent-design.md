@@ -93,7 +93,7 @@ updaters, mirroring daemon's slot/drain ideas but in stdio form.
 |---|---|---|
 | `initialize` | — | pick `protocolVersion: 1`; respond capabilities per D7/D9 |
 | `session/new { cwd, mcpServers }` | put session + engine spawn | `cwd` recorded; **per-session cwd is an open question (see §7)**; `mcpServers` accepted-but-unused in phase 1 (client-configured MCP lands in phase 2) |
-| `session/prompt { sessionId, prompt }` | `Request::Run` | content blocks: `text` → user message; `image {data,mimeType}` → `Attachment` (PNG/JPEG/GIF/WebP); `resource_link`/`resource` → error "unsupported content type" (embeddedContext=false) |
+| `session/prompt { sessionId, prompt }` | `Request::Run` | content blocks: `text` → user message; `image {data,mimeType}` → `Attachment` (PNG/JPEG/GIF/WebP); `resource_link` `file://` → inlined (text files as fenced blocks bounded at 128 KiB, image files as `Attachment`s, directories as a path note — the editor's @-file mentions; 2026-11-14); `resource`/`audio`/non-file URIs → error "unsupported content type" (embeddedContext stays false) |
 | `session/cancel` | cooperative cancel `Arc<AtomicBool>` | mid-turn only; silence if idle per spec |
 | `session/set_mode { modeId }` | `InitOverrides.permission_mode` (applied next turn) | D9 |
 
@@ -169,6 +169,7 @@ this phase — no `.github/` change is allowed without asking first).
 - Client-provided `mcpServers` at `session/new` (takka-core already has an MCP client — wire config through)
 - `available_commands_update`: expose takka slash commands to the editor's "/" menu
 - v1 `elicitation` for the `question` tool (structured ask UI)
+- `EmbeddedResource` prompt blocks (`resource` with inline text/blob payloads) — `resource_link` is already inlined (2026-11-14, pulled forward)
 - ACP v2 support behind explicit negotiation (per the v1+v2 side-by-side guide)
 - `Usage` details + context-compaction notifications via `_meta`/future ACP fields
 

@@ -1629,7 +1629,10 @@ fn request_permission(
 ///
 /// `Text` blocks join with newlines into the task; `Image` blocks become
 /// engine `Attachment`s (data-URL source, whitelisted vision MIME types
-/// only); everything else (`resource_link`, `resource`, `audio`, future
+/// only); `ResourceLink` blocks are the editor's @-file mentions and are
+/// inlined (`file://` URIs only: text files become fenced blocks, image
+/// files become engine attachments, directories become a path note);
+/// everything else (`resource`, `audio`, future
 /// variants) is rejected — the adapter advertises `image: true` and nothing
 /// else (D7). An empty prompt is a parameter error.
 fn prompt_content(prompt: &[acp::ContentBlock]) -> Result<(String, Vec<Attachment>), acp::Error> {
@@ -1659,6 +1662,15 @@ fn prompt_content(prompt: &[acp::ContentBlock]) -> Result<(String, Vec<Attachmen
                     size_bytes: base64_decoded_len(&image.data),
                 });
             }
+            acp::ContentBlock::ResourceLink(link) => match resource_link_content(link)? {
+                ResourceLinkContent::Text(text) => {
+                    if !task.is_empty() {
+                        task.push('\n');
+                    }
+                    task.push_str(&text);
+                }
+                ResourceLinkContent::Image(attachment) => attachments.push(attachment),
+            },
             other => {
                 return Err(unsupported_content_type(
                     content_block_kind(other),
@@ -1686,6 +1698,117 @@ fn content_block_kind(block: &acp::ContentBlock) -> &'static str {
         acp::ContentBlock::Resource(_) => "resource",
         _ => "unknown content block",
     }
+}
+
+/// What a `file://` resource link contributes to the prompt.
+enum ResourceLinkContent {
+    Text(String),
+    Image(Attachment),
+}
+
+/// Upper bound on inlined resource-link text (128 KiB of characters) —
+/// beyond it the block is truncated with a note, mirroring the tool-result
+/// budget.
+const MAX_RESOURCE_LINK_CHARS: usize = 128 * 1024;
+
+/// Map one `file://` resource link (an editor @-mention) onto prompt
+/// content: text files inline as fenced blocks (bounded), image files
+/// become engine image attachments, directories become a path note.
+/// Non-`file://` URIs stay an honest rejection (D7: no embedded context).
+fn resource_link_content(link: &acp::ResourceLink) -> Result<ResourceLinkContent, acp::Error> {
+    let rest = link.uri.strip_prefix("file://").ok_or_else(|| {
+        unsupported_content_type(
+            "resource_link (non-file URI)",
+            "only file:// resource links are supported; inline the text instead",
+        )
+    })?;
+    // Strip the query (`?symbol=...` on symbol mentions) and the fragment
+    // (`#L12:20` line ranges), then percent-decode the path.
+    let raw_path = rest.split(['?', '#']).next().unwrap_or(rest);
+    let path = std::path::PathBuf::from(percent_decode(raw_path));
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        acp::Error::invalid_params().data(serde_json::json!({
+            "method": SESSION_PROMPT,
+            "reason": "resource not found",
+            "uri": link.uri,
+            "detail": error.to_string(),
+        }))
+    })?;
+    if metadata.is_dir() {
+        return Ok(ResourceLinkContent::Text(format!(
+            "[directory: {}] — explore it with the glob tool",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(&path).map_err(|error| {
+        acp::Error::invalid_params().data(serde_json::json!({
+            "method": SESSION_PROMPT,
+            "reason": "resource unreadable",
+            "uri": link.uri,
+            "detail": error.to_string(),
+        }))
+    })?;
+    let declared_mime = link
+        .mime_type
+        .as_ref()
+        .map(|mime| mime.to_ascii_lowercase())
+        .unwrap_or_default();
+    if declared_mime.starts_with("image/") {
+        if !ALLOWED_IMAGE_MIME.contains(&declared_mime.as_str()) {
+            return Err(unsupported_content_type(
+                &format!("resource_link ({declared_mime})"),
+                "supported image MIME types: image/png, image/jpeg, image/gif, image/webp",
+            ));
+        }
+        return Ok(ResourceLinkContent::Image(Attachment {
+            kind: AttachmentKind::Image,
+            mime_type: declared_mime,
+            data_base64: {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            },
+            source: AttachmentSource::FilePath {
+                path: path.to_string_lossy().into_owned(),
+            },
+            size_bytes: bytes.len(),
+        }));
+    }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Err(unsupported_content_type(
+            "resource_link (binary file)",
+            "binary files cannot be inlined; attach them as images (PNG/JPEG/GIF/WebP) instead",
+        ));
+    };
+    let mut body = text;
+    if body.chars().count() > MAX_RESOURCE_LINK_CHARS {
+        body = body.chars().take(MAX_RESOURCE_LINK_CHARS - 1).collect();
+        body.push_str("\n… (truncated at the resource-link budget)");
+    }
+    Ok(ResourceLinkContent::Text(format!(
+        "[file: {}]\n```\n{}\n```",
+        path.display(),
+        body
+    )))
+}
+
+/// Minimal percent-decoding for `file://` URI paths (`%20` → space, …).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &input[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Decoded byte-length estimate for a standard-base64 payload — feeds the
@@ -3526,10 +3649,22 @@ mod tests {
         acp.close_and_join();
     }
 
-    /// T-03: `resource_link` content is refused — only text + image are
-    /// advertised (D7).
+    /// `file://` resource links (the editor's @-file mentions) are inlined:
+    /// text files become fenced blocks with a path header. This prompt is
+    /// accepted by the adapter — the turn then fails against the pinned
+    /// discard provider, proving the CONTENT passed validation (any
+    /// invalid-params error would fail this test).
     #[test]
-    fn prompt_with_a_resource_link_is_rejected_as_unsupported() {
+    fn prompt_with_a_file_resource_link_is_inlined() {
+        let file = std::env::temp_dir().join(format!(
+            "takka-mention-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&file, "the mentioned note\n").expect("write mention fixture");
         let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
         let session = new_session(&acp, 1);
         send_prompt(
@@ -3537,13 +3672,75 @@ mod tests {
             2,
             &session,
             serde_json::json!([
-                { "type": "resource_link", "name": "notes", "uri": "file:///tmp/notes.md" }
+                {
+                    "type": "resource_link",
+                    "name": "notes",
+                    "mime_type": "text/markdown",
+                    "uri": format!("file://{}", file.display())
+                }
+            ]),
+        );
+        let response = acp.response(2);
+        assert!(
+            response["error"]["code"] != serde_json::json!(-32602),
+            "file mentions must pass content validation: {response}"
+        );
+        acp.close_and_join();
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// `file://` paths arrive percent-encoded (`%20` for spaces) and
+    /// symbol mentions carry a query/fragment — both are stripped and
+    /// decoded before the file is read.
+    #[test]
+    fn resource_link_paths_are_decoded_and_fragments_stripped() {
+        assert_eq!(percent_decode("/a%20b/c.rs"), "/a b/c.rs");
+        assert_eq!(percent_decode("/plain/path.rs"), "/plain/path.rs");
+        assert_eq!(percent_decode("bad%2z"), "bad%2z");
+    }
+
+    /// A `file://` resource link pointing at a missing file answers
+    /// invalid params with the reason (never a silent drop).
+    #[test]
+    fn prompt_with_a_missing_file_resource_link_is_invalid_params() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let session = new_session(&acp, 1);
+        send_prompt(
+            &acp,
+            2,
+            &session,
+            serde_json::json!([
+                {
+                    "type": "resource_link",
+                    "name": "gone",
+                    "uri": "file:///definitely/not/a/real/path.md"
+                }
             ]),
         );
         let response = acp.response(2);
         assert_eq!(response["error"]["code"], serde_json::json!(-32602));
         let text = serde_json::to_string(&response["error"]).expect("error serializes");
-        assert!(text.contains("unsupported content type"), "{text}");
+        assert!(text.contains("resource not found"), "{text}");
+        acp.close_and_join();
+    }
+
+    /// Non-`file://` resource links stay an honest rejection (D7).
+    #[test]
+    fn prompt_with_a_non_file_resource_link_is_rejected() {
+        let acp = TestAcp::spawn(DEFAULT_MAX_SESSIONS);
+        let session = new_session(&acp, 1);
+        send_prompt(
+            &acp,
+            2,
+            &session,
+            serde_json::json!([
+                { "type": "resource_link", "name": "notes", "uri": "https://example.com/notes.md" }
+            ]),
+        );
+        let response = acp.response(2);
+        assert_eq!(response["error"]["code"], serde_json::json!(-32602));
+        let text = serde_json::to_string(&response["error"]).expect("error serializes");
+        assert!(text.contains("non-file URI"), "{text}");
         acp.close_and_join();
     }
 
