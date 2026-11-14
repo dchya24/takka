@@ -5,6 +5,7 @@ pub mod git_query;
 pub mod glob;
 pub mod grep;
 pub mod list_files;
+pub mod process;
 pub mod question;
 pub mod read_file;
 pub mod run_command;
@@ -43,6 +44,7 @@ pub use write_file::WriteFileTool;
 
 use crate::file_tracker::FileTracker;
 use crate::safety::UrlPolicy;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -53,6 +55,8 @@ pub struct ToolDeps {
     pub question_handler: Option<Arc<dyn QuestionHandler>>,
     /// Per-instance todo-change UI handler.
     pub todo_handler: Option<Box<dyn TodoChangeHandler>>,
+    /// Cooperative cancel flag observed by the shell tools.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ToolDeps {
@@ -62,6 +66,7 @@ impl ToolDeps {
             url_policy: UrlPolicy::default(),
             question_handler: None,
             todo_handler: None,
+            cancel: None,
         }
     }
 
@@ -72,6 +77,12 @@ impl ToolDeps {
 
     pub fn with_url_policy(mut self, url_policy: UrlPolicy) -> Self {
         self.url_policy = url_policy;
+        self
+    }
+
+    /// Wire the cancel flag the shell tools poll while a child runs.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -127,9 +138,18 @@ pub fn builtin_tools_with_deps(deps: ToolDeps) -> Vec<Box<dyn crate::tool::Tool 
         None => TodowriteTool::new(),
     };
     let url_policy = deps.url_policy;
+    let cancel = deps.cancel;
+    let run_command = match cancel.clone() {
+        Some(flag) => RunCommandTool::new().with_cancel(flag),
+        None => RunCommandTool::new(),
+    };
+    let run_script = match cancel {
+        Some(flag) => RunScriptTool::new().with_cancel(flag),
+        None => RunScriptTool::new(),
+    };
 
     vec![
-        Box::new(RunCommandTool::new()),
+        Box::new(run_command),
         Box::new(ReadFileTool::with_tracker(tracker.clone())),
         Box::new(WriteFileTool::new()),
         Box::new(EditFileTool::with_tracker(tracker.clone())),
@@ -138,7 +158,7 @@ pub fn builtin_tools_with_deps(deps: ToolDeps) -> Vec<Box<dyn crate::tool::Tool 
         Box::new(GlobTool::new()),
         Box::new(GrepTool::new()),
         Box::new(SearchFilesTool::new()),
-        Box::new(RunScriptTool::new()),
+        Box::new(run_script),
         Box::new(RunTestsTool::new()),
         Box::new(GitStatusTool::new()),
         Box::new(GitDiffTool::new()),

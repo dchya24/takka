@@ -2,13 +2,18 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
+use super::process::{self, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 use crate::tool::{
     Concurrency, Mutability, SideEffects, Tool, ToolError, ToolMetadata, ToolParam, ToolResult,
     ToolSchema,
 };
 
-pub struct RunCommandTool;
+pub struct RunCommandTool {
+    cancel: Option<Arc<AtomicBool>>,
+}
 
 impl Default for RunCommandTool {
     fn default() -> Self {
@@ -18,7 +23,13 @@ impl Default for RunCommandTool {
 
 impl RunCommandTool {
     pub fn new() -> Self {
-        Self
+        Self { cancel: None }
+    }
+
+    /// Observe the orchestrator's cooperative cancel flag while running.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 }
 
@@ -49,6 +60,17 @@ impl Tool for RunCommandTool {
                 default: None,
             },
         );
+        params.insert(
+            "timeout".to_string(),
+            ToolParam {
+                param_type: "number".to_string(),
+                description: Some(format!(
+                    "Timeout in seconds (default {}, max {})",
+                    DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+                )),
+                default: Some(serde_json::json!(DEFAULT_TIMEOUT_SECS)),
+            },
+        );
 
         ToolSchema {
             name: "run_command".to_string(),
@@ -59,30 +81,7 @@ impl Tool for RunCommandTool {
     }
 
     fn execute(&self, args: serde_json::Value) -> ToolResult<serde_json::Value> {
-        let args_obj = args
-            .as_object()
-            .ok_or_else(|| ToolError::new("Invalid arguments: expected object"))?;
-
-        let command = args_obj
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::new("Missing required parameter: command"))?;
-
-        let cwd = args_obj.get("cwd").and_then(|v| v.as_str());
-
-        let output = Self::build_command(command, cwd)
-            .output()
-            .map_err(|e| ToolError::new(format!("Failed to execute command: {}", e)))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        Ok(serde_json::json!({
-            "success": output.status.success(),
-            "exit_code": output.status.code().unwrap_or(-1),
-            "stdout": stdout,
-            "stderr": stderr,
-        }))
+        self.run_command_impl(args, None)
     }
 
     fn execute_streaming(
@@ -90,74 +89,7 @@ impl Tool for RunCommandTool {
         args: serde_json::Value,
         on_progress: &dyn Fn(&str),
     ) -> ToolResult<serde_json::Value> {
-        let args_obj = args
-            .as_object()
-            .ok_or_else(|| ToolError::new("Invalid arguments: expected object"))?;
-
-        let command = args_obj
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::new("Missing required parameter: command"))?;
-
-        let cwd = args_obj.get("cwd").and_then(|v| v.as_str());
-
-        let mut child = Self::build_command(command, cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| ToolError::new(format!("Failed to execute command: {}", e)))?;
-
-        use std::io::{BufRead, BufReader};
-
-        // Streaming stdout, lalu stderr (berurutan). Interleave dua stream
-        // tidak ditangani di Fase 1 — run_command jarang memakai keduanya
-        // sekaligus, dan hasil akhir tetap akurat di `stdout`/`stderr`.
-        let stdout_acc = if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            let mut acc = String::new();
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        on_progress(&line);
-                        acc.push_str(&line);
-                        acc.push('\n');
-                    }
-                    Err(_) => break,
-                }
-            }
-            acc
-        } else {
-            String::new()
-        };
-
-        let stderr_acc = if let Some(stderr) = child.stderr.take() {
-            let reader = BufReader::new(stderr);
-            let mut acc = String::new();
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        on_progress(&line);
-                        acc.push_str(&line);
-                        acc.push('\n');
-                    }
-                    Err(_) => break,
-                }
-            }
-            acc
-        } else {
-            String::new()
-        };
-
-        let status = child
-            .wait()
-            .map_err(|e| ToolError::new(format!("Failed to wait command: {}", e)))?;
-
-        Ok(serde_json::json!({
-            "success": status.success(),
-            "exit_code": status.code().unwrap_or(-1),
-            "stdout": stdout_acc,
-            "stderr": stderr_acc,
-        }))
+        self.run_command_impl(args, Some(on_progress))
     }
 
     fn metadata(&self) -> ToolMetadata {
@@ -172,6 +104,46 @@ impl Tool for RunCommandTool {
 }
 
 impl RunCommandTool {
+    /// Shared implementation: parse args, run bounded, map to the JSON
+    /// contract both `execute` and `execute_streaming` return.
+    fn run_command_impl(
+        &self,
+        args: serde_json::Value,
+        on_progress: Option<&dyn Fn(&str)>,
+    ) -> ToolResult<serde_json::Value> {
+        let args_obj = args
+            .as_object()
+            .ok_or_else(|| ToolError::new("Invalid arguments: expected object"))?;
+
+        let command = args_obj
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::new("Missing required parameter: command"))?;
+
+        let cwd = args_obj.get("cwd").and_then(|v| v.as_str());
+        let timeout_secs = args_obj
+            .get("timeout")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+        let mut cmd = Self::build_command(command, cwd);
+        let output = process::run_bounded(
+            &mut cmd,
+            process::clamp_timeout(timeout_secs),
+            process::OUTPUT_CAP_BYTES,
+            self.cancel.as_deref(),
+            on_progress,
+        )
+        .map_err(|e| ToolError::new(format!("Failed to execute command: {}", e)))?;
+
+        Ok(serde_json::json!({
+            "success": output.success,
+            "exit_code": output.exit_code,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
+        }))
+    }
+
     /// Build a `sh -c` / `cmd /C` `Command` for the given command string.
     fn build_command(command: &str, cwd: Option<&str>) -> Command {
         if cfg!(target_os = "windows") {
@@ -196,6 +168,23 @@ impl RunCommandTool {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn run_command_honours_timeout() {
+        let tool = RunCommandTool::new();
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "sleep 5",
+                "timeout": 1,
+            }))
+            .unwrap();
+        assert_eq!(result["success"], false);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "command timeout was ignored"
+        );
+    }
 
     #[test]
     fn run_command_streams_and_keeps_json() {
