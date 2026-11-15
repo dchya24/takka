@@ -26,8 +26,9 @@ parking_lot = "0.12"
 base64 = "0.22"
 
 # Optional: real BPE tokenizer for accurate token counts.
-# Without this feature, estimate_tokens uses a ~4-chars-per-token heuristic,
-# which is fast and dependency-free but can be off by 20–30% for code.
+# Without this feature, estimate_tokens uses a char-class heuristic (ASCII at
+# ~4 bytes/token, non-ASCII at ~1 token/char): fast and dependency-free, but
+# can be off by 20–30% for code.
 tiktoken-rs = { version = "0.6", optional = true }
 
 [features]

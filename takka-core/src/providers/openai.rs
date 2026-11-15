@@ -583,11 +583,6 @@ impl LLMProvider for OpenAIProvider {
             })
             .collect())
     }
-
-    fn count_tokens(&self, text: &str) -> usize {
-        // OpenAI uses BPE, ~4 chars per token is a decent approximation
-        text.len() / 4
-    }
 }
 
 /// Serialize a list of `ChatMessageRequest`s into the OpenAI wire

@@ -309,13 +309,6 @@ pub trait LLMProvider: Send + Sync {
     fn list_models(&self) -> ProviderResult<Vec<ModelInfo>> {
         Ok(vec![])
     }
-
-    /// Estimate the token count for the given text.
-    /// Default: rough estimate of ~4 characters per token.
-    fn count_tokens(&self, text: &str) -> usize {
-        // Rough BPE approximation: ~4 chars per token for English
-        text.len() / 4
-    }
 }
 
 /// Metadata about a model available from a provider.

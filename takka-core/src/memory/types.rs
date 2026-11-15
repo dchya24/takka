@@ -379,8 +379,9 @@ pub(super) fn new_id() -> String {
 /// Estimate token count from text.
 ///
 /// Two backends:
-/// - Default: heuristic ~4 chars per token. Fast, dependency-free, but
-///   off by up to 30% for code-heavy content.
+/// - Default: char-class heuristic — ASCII at ~4 chars per token, non-ASCII
+///   at ~1 token per char. Fast, allocation-free, dependency-free, but off
+///   by up to 30% for code-heavy content.
 /// - With the `tiktoken` cargo feature: real BPE encoder (`cl100k_base`,
 ///   the OpenAI/Anthropic/Z.AI tokenizer family). Within ~2% of actual
 ///   usage, at the cost of a one-time encoder load (~50ms, ~10MB binary).
@@ -400,5 +401,69 @@ pub fn estimate_tokens(text: &str) -> u32 {
     }
 
     // Heuristic fallback (also the default when the feature is off).
-    (text.len() as u32 / 4).max(1)
+    //
+    // `len()` is UTF-8 *bytes*, and dividing it by 4 is wrong for scripts
+    // where one char spans 3 bytes but still costs ~1 BPE token (CJK
+    // under-counted ~25%). Under-counting is the dangerous direction: this
+    // number feeds `needs_compaction`, the context budget, and the 85%
+    // autocompact threshold, so a too-low estimate risks a provider-side
+    // context error. Split the text into two classes in one allocation-free
+    // pass instead:
+    // - ASCII bytes: ~4 bytes per token (English/Indonesian prose, code).
+    // - non-ASCII chars: ~1 token per char. One UTF-8 *lead* byte marks one
+    //   scalar; continuation bytes (`10xxxxxx`) are skipped.
+    let mut ascii_bytes: u32 = 0;
+    let mut non_ascii_chars: u32 = 0;
+    for byte in text.bytes() {
+        if byte.is_ascii() {
+            ascii_bytes += 1;
+        } else if byte & 0xC0 != 0x80 {
+            non_ascii_chars += 1;
+        }
+    }
+    (ascii_bytes / 4 + non_ascii_chars).max(1)
+}
+
+#[cfg(test)]
+mod token_estimate_tests {
+    use super::estimate_tokens;
+
+    /// An Indonesian paragraph (ASCII-only in UTF-8). BPE folds the common
+    /// words, so a byte-based estimate tracks `cl100k_base` closely here.
+    const INDONESIAN: &str = "Kami sedang memperbaiki penghitungan token pada agen ini karena estimasi yang lama menghitung byte alih-alih karakter. Akibatnya teks berbahasa Indonesia dinilai terlalu rendah dan sesi tidak dipadatkan tepat waktu, sehingga percakapan bisa melewati batas jendela konteks model.";
+
+    /// `cl100k_base` token count for `INDONESIAN`, measured with the
+    /// `tiktoken` feature enabled (the encoder is what the estimate models).
+    const INDONESIAN_REFERENCE: u32 = 80;
+
+    /// The same thought in Chinese: every char is 3 UTF-8 bytes but costs
+    /// roughly one BPE token.
+    const CJK: &str = "我们正在修复这个代理的令牌计数，因为旧的估算方式统计的是字节而不是字符。这让中文文本被严重低估，会话没有及时压缩，最终可能超出模型的上下文窗口。";
+
+    /// `cl100k_base` token count for `CJK`.
+    const CJK_REFERENCE: u32 = 79;
+
+    /// Under-counting is the dangerous direction: the estimate feeds
+    /// `needs_compaction`, the context budget, and the autocompact
+    /// threshold, so being too low risks a provider-side context error.
+    /// Allow at most 20% below the BPE reference.
+    fn assert_within_tolerance(text: &str, reference: u32) {
+        let estimate = estimate_tokens(text);
+        let floor = reference * 8 / 10;
+        assert!(
+            estimate >= floor,
+            "estimate {estimate} is more than 20% below the cl100k_base \
+             reference {reference} (floor {floor}) for: {text:.40}..."
+        );
+    }
+
+    #[test]
+    fn ascii_estimate_matches_bpe_within_tolerance() {
+        assert_within_tolerance(INDONESIAN, INDONESIAN_REFERENCE);
+    }
+
+    #[test]
+    fn non_ascii_is_not_underestimated() {
+        assert_within_tolerance(CJK, CJK_REFERENCE);
+    }
 }
