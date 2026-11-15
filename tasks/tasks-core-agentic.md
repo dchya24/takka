@@ -1,30 +1,35 @@
-# Tasks: Core Agentic Library
+# Tasks: takka-core — Core Agentic Library
 
-**Feature**: core-agentic — Rust library for AI agent orchestration
-**Status**: Foundation complete; ~95% architecture coverage; Phase 9–11 planned
+**Feature**: `takka-core` — Rust library for AI agent orchestration (renamed from
+`core-agentic` in the 2026-11 `takka` rebrand)
+**Status**: Foundation complete; ~95% architecture coverage; Phases 9–11 landed.
+ACP v1 adapter merged as PRs #16–#19; harness hardening H-01..H-03 merged as
+PRs #20–#22.
+**Open work**: [`14112026-harness-hardening-backlog.md`](14112026-harness-hardening-backlog.md)
+(H-04–H-07) — see also `docs/ROADMAP.md` "Open work".
 **Created**: 2026-04-20
-**Updated**: 2026-06-03
+**Updated**: 2026-11-14
 
 ---
 
 ## Relevant Files
 
-- `core-agentic/Cargo.toml` — Library manifest
-- `core-agentic/src/lib.rs` — Public re-exports
-- `core-agentic/src/orchestrator/` — Agent loop (mod, messages, tool_exec, compaction, run)
-- `core-agentic/src/agent.rs` — Higher-level Agent wrapper
-- `core-agentic/src/tool.rs` — Tool trait
-- `core-agentic/src/tool_registry.rs` — Tool registration
-- `core-agentic/src/memory/` — Context/memory (mod, types, store, compaction, persist)
-- `core-agentic/src/safety/` — Risk + permissions (mod, risk, config, audit, engine)
-- `core-agentic/src/events.rs` — Event emitter + types
-- `core-agentic/src/providers/` — `openai`, `anthropic`
-- `core-agentic/src/tools/` — Built-in tools (read, write, edit, list, search, glob, grep, run_command, run_script, fetch, web_search, update_memory, spawn_subagent)
-- `core-agentic/src/prompts.rs` — Default system prompt + AGENT.md loading
-- `core-agentic/src/file_tracker.rs` — Read/edit staleness detection
-- `core-agentic/src/memory_file.rs` — Persistent user/project memory.md
-- `core-agentic/src/diff_util.rs` — Unified-diff producer (consumed by widgets::diff)
-- `core-agentic/src/mcp/` — MCP client (transport, types, client)
+- `takka-core/Cargo.toml` — Library manifest
+- `takka-core/src/lib.rs` — Public re-exports
+- `takka-core/src/orchestrator/` — Agent loop (mod, messages, tool_exec, compaction, run)
+- `takka-core/src/agent.rs` — Higher-level Agent wrapper
+- `takka-core/src/tool.rs` — Tool trait
+- `takka-core/src/tool_registry.rs` — Tool registration
+- `takka-core/src/memory/` — Context/memory (mod, types, store, compaction, persist)
+- `takka-core/src/safety/` — Risk + permissions (mod, risk, config, audit, engine)
+- `takka-core/src/events.rs` — Event emitter + types
+- `takka-core/src/providers/` — `openai`, `anthropic`
+- `takka-core/src/tools/` — Built-in tools (read, write, edit, list, search, glob, grep, run_command, run_script, fetch, web_search, update_memory, spawn_subagent)
+- `takka-core/src/prompts.rs` — Default system prompt + AGENT.md loading
+- `takka-core/src/file_tracker.rs` — Read/edit staleness detection
+- `takka-core/src/memory_file.rs` — Persistent user/project memory.md
+- `takka-core/src/diff_util.rs` — Unified-diff producer (consumed by widgets::diff)
+- `takka-core/src/mcp/` — MCP client (transport, types, client)
 
 ---
 
@@ -37,7 +42,7 @@
 ### Phase 1 — Foundation (✅ done)
 
 - [x] 0.0 Project setup
-  - [x] 0.1 Create core-agentic crate
+  - [x] 0.1 Create takka-core crate
   - [x] 0.2 Cargo manifest + workspace integration
   - [x] 0.3 Public exports in `lib.rs`
 - [x] 1.0 Core types
@@ -115,7 +120,7 @@
   - [x] 10.1 `fetch` tool — HTML→text + per-session cache
   - [x] 10.2 `web_search` tool — Tavily / Brave / DuckDuckGo backends
 - [x] 11.0 Persistent memory
-  - [x] 11.1 User-global `~/.config/agentic/memory.md`
+  - [x] 11.1 User-global `~/.config/takka/memory.md`
   - [x] 11.2 Project-local `<cwd>/memory.md` walk-up
   - [x] 11.3 `update_memory` tool
 
@@ -149,7 +154,7 @@
 
 ### Phase 9 — Planner Agent
 
-- [x] 17.0 Planner core (implemented in `core-agentic/src/planner.rs`)
+- [x] 17.0 Planner core (implemented in `takka-core/src/planner.rs`)
   - [x] 17.1 `PlannerAgent` struct: `create_plan()` (LLM-driven), `execute_plan()`, `replan()`
   - [x] 17.2 Plan representation: `Plan`, `Step`, `PlanStatus`, `StepStatus`, `PlanResult` with deps
   - [x] 17.3 ~~`plan` tool~~ (not needed — planner is invoked by user via `/plan`, not by agent tool call)
@@ -163,7 +168,7 @@
 ### Phase 9b — Planner Agent (completed items from remaining list)
 
 - [x] 17.7 Subagent delegation: steps with `tool: "spawn_subagent"` delegate to `SpawnSubagentTool` instead of direct execution
-- [x] 17.8 Config wiring: `planner.max_steps`, `planner.max_replan_attempts`, `planner.require_approval`, `planner.model`, `planner.provider` in `core_agentic::Config::agent.planner`
+- [x] 17.8 Config wiring: `planner.max_steps`, `planner.max_replan_attempts`, `planner.require_approval`, `planner.model`, `planner.provider` in `takka_core::Config::agent.planner`
 - [x] 17.11 `PlanProgress` event type: specific event with plan_id, step_id, step_status, steps_total/completed/failed/pending
 - [x] 17.12 Wire planner events to CLI/TUI renderer: `planner.on()` handler in `plan_inline()` with labeled_bar + step description
 
@@ -173,14 +178,14 @@
   - [x] 18.1 Define `SKILL.md` schema (frontmatter: name, description; body: instructions) per Agent Skills standard
   - [x] 18.2 Discovery paths:
     - [x] 18.2a Global: `~/.agents/skills/` (cross-agent: pi, opencode, codex)
-    - [x] 18.2b Global: `~/.config/agentic/skills/` (agentic-specific)
+    - [x] 18.2b Global: `~/.config/takka/skills/` (takka-specific)
     - [x] 18.2c Project: `.agents/skills/` walk-up from cwd (cross-agent)
-    - [x] 18.2d Project: `.agentic/skills/` walk-up from cwd (agentic-specific)
+    - [x] 18.2d Project: `.agentic/skills/` walk-up from cwd (takka-specific)
     - [x] 18.2e Extra: `skills.compat_dirs` from config (e.g. `~/.claude/skills/`)
     - [x] 18.2f Scan order + name collision: project overrides global, first-found wins
   - [x] 18.3 `SkillIndex` — in-memory index of discovered skills (name, description, path, files)
   - [x] 18.4 Config: `SkillsConfig` with `blocklist: Vec<String>` and `compat_dirs: Vec<String>`
-      in `core_agentic::Config`
+      in `takka_core::Config`
   - [x] 18.5 System prompt integration: inject `📦 Skills: <name> (<description>)` for indexed skills
   - [x] 18.6 Blocklist filter: excluded skills not added to index
   - [ ] 18.7 File watching / refresh for skill directories (optional, v2)
@@ -230,4 +235,6 @@
 - [x] 24.6 Test: lifecycle events sync + stream path (dengan `StreamingScriptedProvider` di test support)
 
 > Spec: `docs/superpowers/specs/2026-08-06-interactive-live-progress-and-steering-design.md`
-> Next: Fase 2 — steering queue + REPL non-blokir.
+> Next: hardening items H-04–H-07 in
+> [`14112026-harness-hardening-backlog.md`](14112026-harness-hardening-backlog.md)
+> — the live-output/steering work described by this spec is landed.

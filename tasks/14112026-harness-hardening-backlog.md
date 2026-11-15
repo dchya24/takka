@@ -66,7 +66,7 @@ sign-off): packaging (C), Fase 3b multiplexing, LSP integration, file watching.
 
 **Evidence**
 
-- 212 `.lock().unwrap()` sites in `src`; **93** of them outside `#[cfg(test)]`
+- 212 `.lock().unwrap()` sites in `src`; **119** of them outside `#[cfg(test)]`
   blocks. Hot spots: `takka-core/src/runtime/engine.rs` (20),
   `takka-core/src/orchestrator/mod.rs` (13),
   `takka-core/src/safety/engine.rs` (9),
