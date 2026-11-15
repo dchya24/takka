@@ -20,6 +20,7 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::safety::UrlPolicy;
+use crate::sync;
 use crate::tool::{
     Concurrency, Mutability, SideEffects, Tool, ToolError, ToolMetadata, ToolParam, ToolResult,
     ToolSchema,
@@ -142,7 +143,7 @@ impl Tool for FetchTool {
         // Cache hit?
         let mut cached = false;
         let body = {
-            let map = cache().lock().unwrap();
+            let map = sync::lock(cache());
             map.get(url).cloned()
         };
 

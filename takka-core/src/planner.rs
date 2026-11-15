@@ -11,6 +11,7 @@ use std::fmt;
 
 use crate::events::EventEmitter;
 use crate::providers::{ChatMessageRequest, ChatRequest, LLMProvider};
+use crate::sync;
 use crate::tool::Tool;
 use crate::tool_registry::ToolRegistry;
 use crate::AgenticError;
@@ -335,7 +336,7 @@ impl PlannerAgent {
     where
         F: Fn(&Plan) -> bool + Send + Sync + 'static,
     {
-        let mut cb = self.approval_callback.lock().unwrap();
+        let mut cb = sync::lock(&self.approval_callback);
         *cb = Some(Box::new(callback));
     }
 
@@ -545,7 +546,7 @@ impl PlannerAgent {
             risk_level: "medium".to_string(),
         });
 
-        let cb = self.approval_callback.lock().unwrap();
+        let cb = sync::lock(&self.approval_callback);
         if let Some(ref callback) = *cb {
             callback(plan)
         } else {

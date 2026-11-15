@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::sync;
 use crate::tool::{
     Concurrency, Mutability, SideEffects, Tool, ToolError, ToolMetadata, ToolParam, ToolResult,
     ToolSchema,
@@ -155,12 +156,12 @@ pub trait TodoChangeHandler: Send + Sync {
 
 /// Get a snapshot of the current todo list.
 pub fn current_todos() -> Vec<TodoItem> {
-    TODO_LIST.lock().unwrap().clone()
+    sync::lock(&TODO_LIST).clone()
 }
 
 /// Clear the todo list.
 pub fn clear_todos() {
-    TODO_LIST.lock().unwrap().clear();
+    sync::lock(&TODO_LIST).clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -275,13 +276,13 @@ impl Tool for TodowriteTool {
 
         // Replace the global list.
         {
-            let mut list = TODO_LIST.lock().unwrap();
+            let mut list = sync::lock(&TODO_LIST);
             *list = todos;
         }
 
         // Notify the instance handler if present.
         if let Some(handler) = self.handler.as_ref() {
-            let list = TODO_LIST.lock().unwrap();
+            let list = sync::lock(&TODO_LIST);
             handler.on_change(&list);
         }
 

@@ -8,6 +8,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::sync;
+
 use super::audit::{AuditDecision, AuditEntry, RateLimitState};
 use super::config::SafetyConfig;
 use super::risk::{
@@ -167,12 +169,12 @@ impl Safety {
 
     /// Switch the active permission mode at runtime.
     pub fn set_mode(&self, mode: PermissionMode) {
-        *self.mode.lock().unwrap() = mode;
+        *sync::lock(&self.mode) = mode;
     }
 
     /// Get the active permission mode.
     pub fn mode(&self) -> PermissionMode {
-        *self.mode.lock().unwrap()
+        *sync::lock(&self.mode)
     }
 
     // -----------------------------------------------------------------------
@@ -440,7 +442,7 @@ impl Safety {
             None => return true, // no limit configured → allowed
         };
 
-        let mut states = self.rate_limit_states.lock().unwrap();
+        let mut states = sync::lock(&self.rate_limit_states);
         let state = states
             .entry(tool_name.to_string())
             .or_insert_with(RateLimitState::new);
@@ -454,7 +456,7 @@ impl Safety {
 
     /// Should the user be prompted for confirmation?
     pub fn needs_confirmation(&self, action: &str, target: Option<&str>) -> bool {
-        let mode = *self.mode.lock().unwrap();
+        let mode = *sync::lock(&self.mode);
         match mode {
             // Yolo never asks.
             PermissionMode::Yolo => false,
@@ -531,7 +533,7 @@ impl Safety {
         // The floor may only *raise* the confirmation bar in modes where
         // confirmations exist at all. Yolo auto-approves (except hard
         // blocks) and Plan decides by allow/deny — never prompt.
-        let confirmation_required = match *self.mode.lock().unwrap() {
+        let confirmation_required = match *sync::lock(&self.mode) {
             PermissionMode::Yolo | PermissionMode::Plan => decision.needs_confirmation,
             PermissionMode::Default => {
                 if auto_approved {
@@ -559,7 +561,7 @@ impl Safety {
     }
 
     pub fn evaluate(&self, action: &str, target: Option<&str>) -> SafetyDecision {
-        let mode = *self.mode.lock().unwrap();
+        let mode = *sync::lock(&self.mode);
 
         // Plan mode: read-only `run_command`s (git log, grep, …) stay allowed —
         // exploring is what plan mode is for. Everything that mutates state is
@@ -734,7 +736,7 @@ impl Safety {
             reason: String::new(),
         };
 
-        let mut log = self.audit_log.lock().unwrap();
+        let mut log = sync::lock(&self.audit_log);
         if log.len() >= self.config.audit_capacity {
             log.remove(0); // ring buffer
         }
@@ -774,7 +776,7 @@ impl Safety {
 
     /// Get recent audit entries (newest first).
     pub fn audit_log(&self) -> Vec<AuditEntry> {
-        let log = self.audit_log.lock().unwrap();
+        let log = sync::lock(&self.audit_log);
         let mut entries: Vec<AuditEntry> = log.clone();
         entries.reverse();
         entries
@@ -782,7 +784,7 @@ impl Safety {
 
     /// Clear audit log.
     pub fn clear_audit_log(&self) {
-        self.audit_log.lock().unwrap().clear();
+        sync::lock(&self.audit_log).clear();
     }
 
     // -----------------------------------------------------------------------

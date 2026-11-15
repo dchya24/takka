@@ -6,6 +6,8 @@ use std::io;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::{mpsc, Mutex};
 
+use crate::sync;
+
 pub trait Transport: Send + Sync + 'static {
     fn read_request(&self) -> io::Result<Option<ProtocolRequest>>;
     fn write_event(&self, event: &ProtocolEvent) -> io::Result<()>;
@@ -30,7 +32,7 @@ impl MemoryTransport {
 
 impl Transport for MemoryTransport {
     fn read_request(&self) -> io::Result<Option<ProtocolRequest>> {
-        match self.request_rx.lock().unwrap().recv() {
+        match sync::lock(&self.request_rx).recv() {
             Ok(request) => Ok(Some(request)),
             Err(_) => Ok(None),
         }
@@ -79,7 +81,7 @@ impl Transport for UnixSocketTransport {
     fn read_request(&self) -> io::Result<Option<ProtocolRequest>> {
         loop {
             let mut line = String::new();
-            let bytes = self.input.lock().unwrap().read_line(&mut line)?;
+            let bytes = sync::lock(&self.input).read_line(&mut line)?;
             if bytes == 0 {
                 return Ok(None);
             }
@@ -93,7 +95,7 @@ impl Transport for UnixSocketTransport {
     }
 
     fn write_event(&self, event: &ProtocolEvent) -> io::Result<()> {
-        let mut output = self.output.lock().unwrap();
+        let mut output = sync::lock(&self.output);
         serde_json::to_writer(&mut *output, event)?;
         output.write_all(b"\n")?;
         output.flush()
@@ -127,7 +129,7 @@ impl Transport for SocketConnectionTransport {
     fn read_request(&self) -> io::Result<Option<ProtocolRequest>> {
         loop {
             let mut line = String::new();
-            let bytes = self.input.lock().unwrap().read_line(&mut line)?;
+            let bytes = sync::lock(&self.input).read_line(&mut line)?;
             if bytes == 0 {
                 return Ok(None);
             }
@@ -141,7 +143,7 @@ impl Transport for SocketConnectionTransport {
     }
 
     fn write_event(&self, event: &ProtocolEvent) -> io::Result<()> {
-        let mut output = self.output.lock().unwrap();
+        let mut output = sync::lock(&self.output);
         serde_json::to_writer(&mut *output, event)?;
         output.write_all(b"\n")?;
         output.flush()
