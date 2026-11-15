@@ -102,13 +102,10 @@ impl Orchestrator {
 
     pub(super) fn handle_tool_calls(&self, content: &str, tool_calls: &[(String, String, String)]) {
         let tool_call_responses = build_tool_call_responses(tool_calls);
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(Message::assistant_with_tool_calls(
-                content,
-                tool_call_responses,
-            ));
+        sync::lock(&self.memory).add_message(Message::assistant_with_tool_calls(
+            content,
+            tool_call_responses,
+        ));
         // P1-2: the tool turn is observable — entry marks ExecutingTools;
         // confirmations below temporarily move to WaitingForUser.
         self.set_state(OrchestratorState::ExecutingTools);
@@ -348,13 +345,10 @@ impl Orchestrator {
         tool_calls: &[(String, String, String)],
     ) {
         let tool_call_responses = build_tool_call_responses(tool_calls);
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(Message::assistant_with_tool_calls(
-                content,
-                tool_call_responses,
-            ));
+        sync::lock(&self.memory).add_message(Message::assistant_with_tool_calls(
+            content,
+            tool_call_responses,
+        ));
         // P1-2: the tool turn is observable — entry marks ExecutingTools;
         // confirmations below temporarily move to WaitingForUser.
         self.set_state(OrchestratorState::ExecutingTools);

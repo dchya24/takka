@@ -533,10 +533,7 @@ impl Orchestrator {
     }
 
     pub fn add_system_message(&self, content: String) {
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(crate::memory::Message::system(content));
+        sync::lock(&self.memory).add_message(crate::memory::Message::system(content));
     }
 
     /// Set a custom system prompt for all LLM requests.

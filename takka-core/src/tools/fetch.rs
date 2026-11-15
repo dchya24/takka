@@ -189,10 +189,7 @@ impl Tool for FetchTool {
                     raw
                 };
 
-                cache()
-                    .lock()
-                    .unwrap()
-                    .insert(url.to_string(), cleaned.clone());
+                sync::lock(cache()).insert(url.to_string(), cleaned.clone());
                 cleaned
             }
         };
