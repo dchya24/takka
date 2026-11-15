@@ -23,7 +23,7 @@ pub fn prompt_confirmation(request: &ConfirmationRequest) -> Option<Confirmation
     // not race the spinner's MoveUp/Clear redraws in REPL mode, and in
     // TUI mode the draw loop must stay parked so the panel survives on
     // the primary screen until the operator answers.
-    let _render_gate = crate::commands::RENDER_GATE.lock().unwrap();
+    let _render_gate = takka_core::sync::lock(&crate::commands::RENDER_GATE);
     let tui_active = crate::commands::TUI_ACTIVE.load(Ordering::Relaxed);
     if tui_active {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
