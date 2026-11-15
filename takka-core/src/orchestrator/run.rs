@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use crate::memory::Message;
 use crate::providers::ChatRequest;
+use crate::sync;
 use crate::AgenticError;
 
 use super::{Orchestrator, OrchestratorState};
@@ -60,14 +61,11 @@ impl Orchestrator {
             self.check_attachment_capability(&attachments)?;
         }
 
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(if attachments.is_empty() {
-                Message::user(input)
-            } else {
-                Message::user_with_attachments(input, attachments)
-            });
+        sync::lock(&self.memory).add_message(if attachments.is_empty() {
+            Message::user(input)
+        } else {
+            Message::user_with_attachments(input, attachments)
+        });
 
         let tool_defs = self.tools.tool_definitions();
         let mut iteration: u32 = 0;
@@ -198,10 +196,7 @@ impl Orchestrator {
                     kind: crate::events::TurnLimitKind::MaxTurnRequests,
                 });
                 self.clear_loop_detection();
-                self.memory
-                    .lock()
-                    .unwrap()
-                    .add_message(Message::assistant(&content));
+                sync::lock(&self.memory).add_message(Message::assistant(&content));
                 self.set_state(OrchestratorState::Completed);
                 return Ok(content);
             }
@@ -269,10 +264,7 @@ impl Orchestrator {
                     });
                 }
 
-                self.memory
-                    .lock()
-                    .unwrap()
-                    .add_message(Message::assistant(&content));
+                sync::lock(&self.memory).add_message(Message::assistant(&content));
 
                 self.set_state(OrchestratorState::Completed);
                 return Ok(content);
@@ -328,14 +320,11 @@ impl Orchestrator {
             self.check_attachment_capability(&attachments)?;
         }
 
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(if attachments.is_empty() {
-                Message::user(input)
-            } else {
-                Message::user_with_attachments(input, attachments)
-            });
+        sync::lock(&self.memory).add_message(if attachments.is_empty() {
+            Message::user(input)
+        } else {
+            Message::user_with_attachments(input, attachments)
+        });
 
         let tool_defs = self.tools.tool_definitions();
         let mut iteration: u32 = 0;
@@ -520,10 +509,7 @@ impl Orchestrator {
                     kind: crate::events::TurnLimitKind::MaxTurnRequests,
                 });
                 self.clear_loop_detection();
-                self.memory
-                    .lock()
-                    .unwrap()
-                    .add_message(Message::assistant(&content_buf));
+                sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
                 self.set_state(OrchestratorState::Completed);
                 return Ok(content_buf);
             }
@@ -578,10 +564,7 @@ impl Orchestrator {
                 });
             }
 
-            self.memory
-                .lock()
-                .unwrap()
-                .add_message(Message::assistant(&content_buf));
+            sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
 
             self.set_state(OrchestratorState::Completed);
 
@@ -606,10 +589,7 @@ impl Orchestrator {
                     len = message.len(),
                     "steering message injected at iteration boundary"
                 );
-                self.memory
-                    .lock()
-                    .unwrap()
-                    .add_message(crate::memory::Message::user(message.clone()));
+                sync::lock(&self.memory).add_message(crate::memory::Message::user(message.clone()));
                 self.events
                     .emit(crate::events::Event::Steered { content: message });
             }

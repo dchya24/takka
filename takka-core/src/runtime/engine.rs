@@ -5,6 +5,7 @@ use super::protocol::{
 use super::transport::Transport;
 use crate::events::Event;
 use crate::providers::{LLMProvider, OpenAIProvider};
+use crate::sync;
 use crate::{
     Config, Orchestrator, QuestionAnswer, QuestionHandler, QuestionPrompt, SkillTool,
     SpawnSubagentTool, TodoChangeHandler, TodoItem, ToolDeps, ToolRegistry,
@@ -36,7 +37,7 @@ impl<T: Transport> EventSink<T> {
 
     /// Replace the opt-out set (connection-level, set at `Init`).
     pub fn set_opt_outs(&self, kinds: &[NotificationKind]) {
-        *self.opt_outs.lock().unwrap() = kinds.iter().copied().collect();
+        *sync::lock(&self.opt_outs) = kinds.iter().copied().collect();
     }
 
     fn suppressed(&self, event: &Event) -> bool {
@@ -47,7 +48,7 @@ impl<T: Transport> EventSink<T> {
             Event::TodoChanged { .. } => NotificationKind::TodoChanged,
             _ => return false,
         };
-        self.opt_outs.lock().unwrap().contains(&kind)
+        sync::lock(&self.opt_outs).contains(&kind)
     }
 
     pub fn send(&self, request_id: Option<String>, event: Event) {
@@ -203,8 +204,8 @@ impl<T: Transport> RuntimeEngine<T> {
         let pending_confirmation = engine.pending_confirmation.clone();
         orchestrator.set_confirmation_handler(move |request| {
             let (sender, receiver) = mpsc::channel();
-            *pending_confirmation.lock().unwrap() = Some(sender);
-            let request_id = current_request_id.lock().unwrap().clone();
+            *sync::lock(&pending_confirmation) = Some(sender);
+            let request_id = sync::lock(&current_request_id).clone();
             sink.send(
                 request_id,
                 Event::ConfirmationRequest {
@@ -370,7 +371,7 @@ impl<T: Transport> RuntimeEngine<T> {
                             },
                         );
                     } else {
-                        self.steer_queue.lock().unwrap().push_back(content.clone());
+                        sync::lock(&self.steer_queue).push_back(content.clone());
                         self.emit(Some(request.id), Event::SteerQueued { content });
                     }
                 }
@@ -626,7 +627,7 @@ impl<T: Transport> RuntimeEngine<T> {
                     }
                 }
                 Request::QuestionResponse { answers, .. } => {
-                    if let Some(sender) = self.pending_question.lock().unwrap().take() {
+                    if let Some(sender) = sync::lock(&self.pending_question).take() {
                         let _ = sender.send(answers);
                     } else {
                         self.emit(
@@ -638,7 +639,7 @@ impl<T: Transport> RuntimeEngine<T> {
                     }
                 }
                 Request::ConfirmResponse { approved, .. } => {
-                    if let Some(sender) = self.pending_confirmation.lock().unwrap().take() {
+                    if let Some(sender) = sync::lock(&self.pending_confirmation).take() {
                         let _ = sender.send(approved);
                     } else {
                         self.emit(
@@ -754,8 +755,7 @@ impl<T: Transport> RuntimeEngine<T> {
     /// across the engine field and this closure.
     fn install_steering_source(&self, orchestrator: &mut Orchestrator) {
         let queue = self.steer_queue.clone();
-        orchestrator
-            .set_steering_source(Box::new(move || queue.lock().unwrap().drain(..).collect()));
+        orchestrator.set_steering_source(Box::new(move || sync::lock(&queue).drain(..).collect()));
     }
 
     fn runtime_tool_deps(&self) -> ToolDeps {
@@ -778,8 +778,8 @@ impl<T: Transport> RuntimeEngine<T> {
         let pending_confirmation = self.pending_confirmation.clone();
         orchestrator.set_confirmation_handler(move |request| {
             let (sender, receiver) = mpsc::channel();
-            *pending_confirmation.lock().unwrap() = Some(sender);
-            let request_id = current_request_id.lock().unwrap().clone();
+            *sync::lock(&pending_confirmation) = Some(sender);
+            let request_id = sync::lock(&current_request_id).clone();
             sink.send(
                 request_id,
                 Event::ConfirmationRequest {
@@ -894,11 +894,11 @@ impl<T: Transport> RuntimeEngine<T> {
         let current_request_id = self.current_request_id.clone();
         let running = self.running.clone();
 
-        *self.current_request_id.lock().unwrap() = Some(request_id.clone());
+        *sync::lock(&self.current_request_id) = Some(request_id.clone());
 
         let handle = std::thread::spawn(move || {
             let write = |event: crate::events::Event| {
-                sink.send(current_request_id.lock().unwrap().clone(), event);
+                sink.send(sync::lock(&current_request_id).clone(), event);
             };
 
             let planner = crate::PlannerAgent::new(provider).with_config(crate::PlannerConfig {
@@ -911,7 +911,7 @@ impl<T: Transport> RuntimeEngine<T> {
                 let sink = sink.clone();
                 let current_request_id = current_request_id.clone();
                 planner.on(move |event| {
-                    sink.send(current_request_id.lock().unwrap().clone(), event);
+                    sink.send(sync::lock(&current_request_id).clone(), event);
                 });
             }
 
@@ -943,9 +943,9 @@ impl<T: Transport> RuntimeEngine<T> {
                     // `install_confirmation_handler` and the question
                     // handler.
                     let (sender, receiver) = mpsc::channel();
-                    *pending.lock().unwrap() = Some(sender);
+                    *sync::lock(&pending) = Some(sender);
                     sink.send(
-                        current_request_id.lock().unwrap().clone(),
+                        sync::lock(&current_request_id).clone(),
                         Event::PlanApprovalRequest {
                             plan_id: plan.id.clone(),
                             goal: plan.goal.clone(),
@@ -998,7 +998,7 @@ impl<T: Transport> RuntimeEngine<T> {
             return;
         };
 
-        *self.current_request_id.lock().unwrap() = Some(request_id.clone());
+        *sync::lock(&self.current_request_id) = Some(request_id.clone());
         orchestrator.reset_cancel();
         orchestrator.clear_event_handlers();
 
@@ -1053,7 +1053,7 @@ impl<T: Transport> RuntimeEngine<T> {
             };
             sink.send(Some(request_id), event);
             running.store(false, Ordering::SeqCst);
-            *current_request_id.lock().unwrap() = None;
+            *sync::lock(&current_request_id) = None;
         }));
     }
 
@@ -1070,9 +1070,9 @@ struct RuntimeQuestionHandler<T: Transport> {
 
 impl<T: Transport> QuestionHandler for RuntimeQuestionHandler<T> {
     fn handle(&self, questions: &[QuestionPrompt]) -> Vec<QuestionAnswer> {
-        let request_id = self.current_request_id.lock().unwrap().clone();
+        let request_id = sync::lock(&self.current_request_id).clone();
         let (sender, receiver) = mpsc::channel();
-        *self.pending.lock().unwrap() = Some(sender);
+        *sync::lock(&self.pending) = Some(sender);
         self.sink.send(
             request_id,
             Event::QuestionRequest {
@@ -1099,7 +1099,7 @@ struct RuntimeTodoHandler<T: Transport> {
 
 impl<T: Transport> TodoChangeHandler for RuntimeTodoHandler<T> {
     fn on_change(&self, todos: &[TodoItem]) {
-        let request_id = self.current_request_id.lock().unwrap().clone();
+        let request_id = sync::lock(&self.current_request_id).clone();
         self.sink.send(
             request_id,
             Event::TodoChanged {

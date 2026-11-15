@@ -2,6 +2,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::sync::Mutex;
 use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
 use takka_core::runtime::transport::Transport;
+use takka_core::sync;
 
 pub struct StdioTransport {
     input: Mutex<BufReader<io::Stdin>>,
@@ -27,7 +28,7 @@ impl Transport for StdioTransport {
     fn read_request(&self) -> io::Result<Option<ProtocolRequest>> {
         loop {
             let mut line = String::new();
-            let bytes = self.input.lock().unwrap().read_line(&mut line)?;
+            let bytes = sync::lock(&self.input).read_line(&mut line)?;
             if bytes == 0 {
                 return Ok(None);
             }
@@ -41,7 +42,7 @@ impl Transport for StdioTransport {
     }
 
     fn write_event(&self, event: &ProtocolEvent) -> io::Result<()> {
-        let mut output = self.output.lock().unwrap();
+        let mut output = sync::lock(&self.output);
         serde_json::to_writer(&mut *output, event).map_err(io::Error::other)?;
         output.write_all(b"\n")?;
         output.flush()

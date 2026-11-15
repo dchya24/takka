@@ -10,6 +10,7 @@
 //!   applies Layer 2 compression and the sanitization passes).
 
 use crate::providers::{ChatMessageRequest, ChatRequest};
+use crate::sync;
 use crate::AgenticError;
 
 use super::{Orchestrator, OrchestratorState};
@@ -27,7 +28,7 @@ impl Orchestrator {
         }
         // Cheap check first to avoid prompt construction work.
         {
-            let mem = self.memory.lock().unwrap();
+            let mem = sync::lock(&self.memory);
             if !mem.needs_compaction() {
                 return;
             }
@@ -37,7 +38,7 @@ impl Orchestrator {
             // Build the prompt before calling the LLM (no lock held during
             // the network call).
             let prompt = {
-                let mem = self.memory.lock().unwrap();
+                let mem = sync::lock(&self.memory);
                 mem.build_summarization_prompt()
             };
             if let Some(prompt) = prompt {
@@ -45,7 +46,7 @@ impl Orchestrator {
                 self.events.emit(crate::events::Event::CompactionStarted);
                 match self.summarize_via_provider(&prompt) {
                     Ok(summary) => {
-                        let mut mem = self.memory.lock().unwrap();
+                        let mut mem = sync::lock(&self.memory);
                         let r = mem.compact_with_summary(&summary);
                         tracing::info!(
                             summarized = r.summarized_count,
@@ -63,7 +64,7 @@ impl Orchestrator {
         }
 
         // Heuristic path (default and fallback).
-        let mut mem = self.memory.lock().unwrap();
+        let mut mem = sync::lock(&self.memory);
         if mem.needs_compaction() {
             self.set_state(OrchestratorState::Compacting);
             self.events.emit(crate::events::Event::CompactionStarted);
@@ -109,7 +110,7 @@ impl Orchestrator {
         // group) so a tool_call/result pair is never split, eliminating
         // the orphan-tool / dangling-tool_calls / no-user-anchor cases
         // that previously produced HTTP 400 from the provider.
-        let memory = self.memory.lock().unwrap();
+        let memory = sync::lock(&self.memory);
         crate::context::ContextEngine::build(
             &memory,
             crate::context::BuildOptions::new(&memory, self.keep_recent_tool_results),

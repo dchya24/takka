@@ -11,6 +11,7 @@ use ratatui::text::{Line as RLine, Span as RSpan};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use takka_core::sync;
 use takka_core::Config;
 use termcolor::{Color, ColorSpec, StandardStream, WriteColor};
 
@@ -97,7 +98,7 @@ impl takka_core::QuestionHandler for CliQuestionHandler {
         // dialoguer list (messy options), then erase the answer badge
         // after submission — and on Windows the two writers racing over
         // the console is what looks like a flickering dim lamp.
-        let _render_gate = RENDER_GATE.lock().unwrap();
+        let _render_gate = sync::lock(&RENDER_GATE);
         // Same stdin ownership as `prompt_confirmation`: the REPL key loop must
         // not consume the keystrokes dialoguer is waiting for.
         let _input_guard = InteractivePromptGuard::activate();
@@ -925,7 +926,7 @@ impl Commands {
                 }
             }
             QueueMode::FollowUp => {
-                self.pending_follow_ups.lock().unwrap().push_back(content);
+                sync::lock(&self.pending_follow_ups).push_back(content);
             }
         }
     }
@@ -2070,12 +2071,12 @@ impl Commands {
                 let commit_spinner = {
                     let painter = painter.clone();
                     let r_progress = r_progress.clone();
-                    move || painter.lock().unwrap().commit(&r_progress)
+                    move || sync::lock(&painter).commit(&r_progress)
                 };
                 let redraw_spinner = {
                     let painter = painter.clone();
                     let r_progress = r_progress.clone();
-                    move || painter.lock().unwrap().redraw(&r_progress)
+                    move || sync::lock(&painter).redraw(&r_progress)
                 };
 
                 // Live-preview state (story 1.1 machinery, unchanged): the
@@ -2130,7 +2131,7 @@ impl Commands {
                                 let _ = s.execute(Clear(ClearType::FromCursorDown));
                             }
                             crate::widgets::log_writer::write_line_to_stderr(bytes);
-                            let mut painter = hook_painter.lock().unwrap();
+                            let mut painter = sync::lock(&hook_painter);
                             painter.commit(&hook_progress);
                         });
                     _log_hook_guard = crate::widgets::log_writer::SpinnerHookGuard::install(hook);
@@ -2175,7 +2176,7 @@ impl Commands {
                     let input_rows = input_rows.clone();
                     let input_buffer_shared = input_buffer_shared.clone();
                     move || {
-                        let buffer = input_buffer_shared.lock().unwrap().clone();
+                        let buffer = sync::lock(&input_buffer_shared).clone();
                         if buffer.is_empty() {
                             input_rows.store(0, Ordering::Relaxed);
                             return;
@@ -2213,7 +2214,7 @@ impl Commands {
                     // user it owns this gate and we park here without
                     // writing, so the dialoguer list never races the
                     // spinner's MoveUp/Clear redraws.
-                    let _render_gate = RENDER_GATE.lock().unwrap();
+                    let _render_gate = sync::lock(&RENDER_GATE);
 
                     if !r_stop.load(Ordering::Relaxed) {
                         redraw_spinner();
@@ -2233,11 +2234,11 @@ impl Commands {
                     let mut pending_text = false;
                     if !updates_done {
                         loop {
-                            match update_rx.lock().unwrap().try_recv() {
+                            match sync::lock(&update_rx).try_recv() {
                                 Ok(RendererUpdate::InputEcho(text)) => {
                                     // Story 2.1: the transient input line.
                                     input_buffer = text;
-                                    *input_buffer_shared.lock().unwrap() = input_buffer.clone();
+                                    *sync::lock(&input_buffer_shared) = input_buffer.clone();
                                     if input_active || !input_buffer.is_empty() {
                                         // Erase the transient band (status
                                         // + prior input row) via the shared
@@ -2254,7 +2255,7 @@ impl Commands {
                                 }
                                 Ok(RendererUpdate::Chunk(chunk)) => {
                                     if !chunk.is_empty() {
-                                        block_text.lock().unwrap().push_str(&chunk);
+                                        sync::lock(&block_text).push_str(&chunk);
                                         pending_text = true;
                                     }
                                 }
@@ -2263,7 +2264,7 @@ impl Commands {
                                     // text queued before this event first,
                                     // so its row prints BELOW that text.
                                     if pending_text {
-                                        let block_guard = block_text.lock().unwrap();
+                                        let block_guard = sync::lock(&block_text);
                                         preview.announce(
                                             block_guard.as_str(),
                                             &erase_transient,
@@ -2366,7 +2367,7 @@ impl Commands {
                     // their completed paragraphs here (unchanged rule for
                     // ticks without events).
                     if pending_text {
-                        let block_guard = block_text.lock().unwrap();
+                        let block_guard = sync::lock(&block_text);
                         preview.announce(
                             block_guard.as_str(),
                             &erase_transient,
@@ -2554,9 +2555,7 @@ impl Commands {
                                             // the queueing visible in the
                                             // same transient band the
                                             // notices use.
-                                            pending_follow_ups_shared
-                                                .lock()
-                                                .unwrap()
+                                            sync::lock(&pending_follow_ups_shared)
                                                 .push_back(line.clone());
                                             mid_run_notice(format!(
                                                 "\n\u{21b3} queued for the next run: \"{}\"",
@@ -2610,7 +2609,7 @@ impl Commands {
                 |chunk| {
                     if !chunk.is_empty() {
                         {
-                            let mut p = phase_progress.lock().unwrap();
+                            let mut p = sync::lock(&phase_progress);
                             p.set_phase(progress::Phase::Streaming);
                             p.add_stream_chars(chunk.chars().count());
                         }
@@ -2660,7 +2659,7 @@ impl Commands {
                             cache_creation_input_tokens,
                         } = &event
                         {
-                            e_usage.lock().unwrap().add(
+                            sync::lock(&e_usage).add(
                                 *prompt_tokens,
                                 *completion_tokens,
                                 cache_read_input_tokens.unwrap_or(0),
@@ -2752,7 +2751,7 @@ impl Commands {
         // while this flag is set, so it never touches the screen in modes
         // where no transient spinner exists (e.g. the full-screen TUI).
         SPINNER_ACTIVE.store(false, Ordering::Relaxed);
-        progress.lock().unwrap().stop();
+        sync::lock(&progress).stop();
 
         // Cursor cleanup + final result.  The renderer always runs in
         // "spinner mode" (we never wrote chunks to stdout), so cleanup
@@ -2775,7 +2774,7 @@ impl Commands {
         let _ = std::io::Write::flush(&mut s);
 
         let usage = {
-            let totals = run_usage.lock().unwrap();
+            let totals = sync::lock(&run_usage);
             (
                 totals.measured,
                 totals.prompt,
@@ -3018,15 +3017,13 @@ impl Commands {
     pub fn pending_follow_ups(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<String>> {
-        self.pending_follow_ups.lock().unwrap()
+        sync::lock(&self.pending_follow_ups)
     }
 
     /// Snapshot of the pending follow-ups (story 2.4 tests): avoids a
     /// live guard crossing an async boundary.
     pub fn pending_follow_ups_snapshot(&self) -> Vec<String> {
-        self.pending_follow_ups
-            .lock()
-            .unwrap()
+        sync::lock(&self.pending_follow_ups)
             .iter()
             .cloned()
             .collect()
@@ -3054,7 +3051,7 @@ impl Commands {
                 Ok(true)
             }
             QueueMode::FollowUp => {
-                self.pending_follow_ups.lock().unwrap().push_back(text);
+                sync::lock(&self.pending_follow_ups).push_back(text);
                 Ok(true)
             }
         }
@@ -3087,7 +3084,7 @@ impl Commands {
 
     async fn drain_follow_ups_loop(&mut self) -> Result<()> {
         loop {
-            let next = self.pending_follow_ups.lock().unwrap().pop_front();
+            let next = sync::lock(&self.pending_follow_ups).pop_front();
             let Some(next) = next else { break };
             self.run(&next).await?;
         }
@@ -4355,7 +4352,7 @@ impl StatusPainter {
         state: &std::sync::Mutex<crate::widgets::progress::ProgressState>,
     ) -> RLine<'static> {
         let mut line = {
-            let mut progress = state.lock().unwrap();
+            let mut progress = sync::lock(state);
             progress.tick();
             crate::widgets::spinner::status_line(&progress, self.show_cancel_hint)
         };

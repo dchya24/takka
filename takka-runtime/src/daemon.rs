@@ -64,6 +64,7 @@ use takka_core::runtime::engine::RuntimeEngine;
 use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
 #[cfg(unix)]
 use takka_core::runtime::transport::MemoryTransport;
+use takka_core::sync;
 
 /// Daemon endpoints, both explicit (the CLI resolves defaults before
 /// calling [`serve`]): the unix socket to listen on and the discovery
@@ -178,7 +179,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
                     if !should_forward(&event) {
                         continue;
                     }
-                    let mut guard = slot.lock().unwrap();
+                    let mut guard = sync::lock(&slot);
                     if let Some((_, writer)) = guard.as_mut() {
                         if write_frame(writer, &event).is_err() {
                             *guard = None; // client vanished mid-stream
@@ -269,7 +270,7 @@ fn handle_connection(
         }
     };
 
-    if slot.lock().unwrap().is_some() {
+    if sync::lock(slot).is_some() {
         let mut writer = BufWriter::new(stream);
         let _ = write_frame(
             &mut writer,
@@ -290,7 +291,7 @@ fn handle_connection(
             return None;
         }
     };
-    *slot.lock().unwrap() = Some((generation, writer));
+    *sync::lock(slot) = Some((generation, writer));
 
     let pump_slot = slot.clone();
     let pump_tx = req_tx.clone();
@@ -326,7 +327,7 @@ fn pump_requests(
                 // Mirror the engine's transport-level error shape so
                 // malformed frames surface to the frontend too.
                 Err(error) => {
-                    let mut guard = slot.lock().unwrap();
+                    let mut guard = sync::lock(&slot);
                     if let Some((_, writer)) = guard.as_mut() {
                         let _ = write_frame(
                             writer,
@@ -354,7 +355,7 @@ fn pump_requests(
             Err(_) => break, // read error → treat as detach
         }
     }
-    let mut guard = slot.lock().unwrap();
+    let mut guard = sync::lock(&slot);
     if matches!(guard.as_ref(), Some((owner, _)) if *owner == generation) {
         *guard = None;
     }

@@ -16,6 +16,7 @@
 
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, OnceLock};
+use takka_core::sync;
 
 /// Callback invoked with one complete log line. It owns all terminal work:
 /// erase the transient spinner, print the bytes, then repaint the spinner.
@@ -28,11 +29,11 @@ fn hook_slot() -> &'static Mutex<Option<SpinnerHook>> {
 
 /// Install (or clear) the spinner guard used by [`ConsoleLogWriter`].
 pub fn set_spinner_hook(hook: Option<SpinnerHook>) {
-    *hook_slot().lock().unwrap() = hook;
+    *sync::lock(hook_slot()) = hook;
 }
 
 fn current_hook() -> Option<SpinnerHook> {
-    hook_slot().lock().unwrap().clone()
+    sync::lock(hook_slot()).clone()
 }
 
 /// RAII guard that installs a [`SpinnerHook`] and clears it on drop, so a
@@ -116,7 +117,7 @@ pub struct NoticeSink(pub std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 #[allow(unused_variables)]
 pub fn write_notice_dispatch(line: String, caller_sink: Option<NoticeSink>) {
     if let Some(sink) = caller_sink {
-        (sink.0).lock().unwrap().push(line);
+        sync::lock(&sink.0).push(line);
         return;
     }
     write_notice_to_stderr(line.as_bytes());

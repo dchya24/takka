@@ -2129,7 +2129,7 @@ pub async fn run_tui(commands: Arc<tokio::sync::Mutex<Commands>>) -> Result<()> 
         // without drawing or reading keys, so dialoguer's UI is never
         // overwritten and its keystrokes are never stolen.
         let key = {
-            let _render_gate = crate::commands::RENDER_GATE.lock().unwrap();
+            let _render_gate = takka_core::sync::lock(&crate::commands::RENDER_GATE);
 
             // After an interactive prompt re-entered the alternate screen,
             // ratatui's diff would only repaint cells that changed vs its

@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::safety::PermissionMode;
+use crate::sync;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -463,11 +464,11 @@ impl EventEmitter {
     where
         F: Fn(Event) + Send + Sync + 'static,
     {
-        self.handlers.lock().unwrap().push(Box::new(handler));
+        sync::lock(&self.handlers).push(Box::new(handler));
     }
 
     pub fn emit(&self, event: Event) {
-        let handlers = self.handlers.lock().unwrap();
+        let handlers = sync::lock(&self.handlers);
         for handler in handlers.iter() {
             handler(event.clone());
         }
@@ -475,7 +476,7 @@ impl EventEmitter {
 
     #[allow(dead_code)]
     pub fn clear(&self) {
-        self.handlers.lock().unwrap().clear();
+        sync::lock(&self.handlers).clear();
     }
 }
 

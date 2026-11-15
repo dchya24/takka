@@ -15,6 +15,7 @@
 use crate::events::Event;
 use crate::memory::Message;
 use crate::orchestrator::progress::DeltaThrottler;
+use crate::sync;
 
 use std::sync::Arc;
 
@@ -101,13 +102,10 @@ impl Orchestrator {
 
     pub(super) fn handle_tool_calls(&self, content: &str, tool_calls: &[(String, String, String)]) {
         let tool_call_responses = build_tool_call_responses(tool_calls);
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(Message::assistant_with_tool_calls(
-                content,
-                tool_call_responses,
-            ));
+        sync::lock(&self.memory).add_message(Message::assistant_with_tool_calls(
+            content,
+            tool_call_responses,
+        ));
         // P1-2: the tool turn is observable — entry marks ExecutingTools;
         // confirmations below temporarily move to WaitingForUser.
         self.set_state(OrchestratorState::ExecutingTools);
@@ -304,7 +302,7 @@ impl Orchestrator {
         // Push results in original order. Emit ToolOutput events only
         // for Pending slots (PreResolved already emitted theirs above).
         {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = sync::lock(&self.memory);
             for (idx, entry) in results.into_iter().enumerate() {
                 if let Some(outcome) = entry {
                     if matches!(slots[idx], Slot::Pending { .. }) {
@@ -347,13 +345,10 @@ impl Orchestrator {
         tool_calls: &[(String, String, String)],
     ) {
         let tool_call_responses = build_tool_call_responses(tool_calls);
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(Message::assistant_with_tool_calls(
-                content,
-                tool_call_responses,
-            ));
+        sync::lock(&self.memory).add_message(Message::assistant_with_tool_calls(
+            content,
+            tool_call_responses,
+        ));
         // P1-2: the tool turn is observable — entry marks ExecutingTools;
         // confirmations below temporarily move to WaitingForUser.
         self.set_state(OrchestratorState::ExecutingTools);
@@ -654,7 +649,7 @@ impl Orchestrator {
         // events for any executed (Pending) slots; PreResolved slots
         // already emitted their outcome above.
         {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = sync::lock(&self.memory);
             for (idx, entry) in results.into_iter().enumerate() {
                 if let Some(outcome) = entry {
                     // Only Pending slots produce real tool output; PreResolved

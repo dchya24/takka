@@ -19,6 +19,7 @@ use crate::events::EventEmitter;
 use crate::memory::Memory;
 use crate::providers::LLMProvider;
 use crate::safety::{ConfirmationRequest, Safety};
+use crate::sync;
 use crate::tool_registry::ToolRegistry;
 
 mod checkpoint;
@@ -314,7 +315,7 @@ impl Orchestrator {
 
     /// Cap the conversation token budget (subagent policy, P2-3).
     pub fn set_memory_token_budget(&mut self, max_tokens: u32) {
-        self.memory.lock().unwrap().max_tokens = max_tokens;
+        sync::lock(&self.memory).max_tokens = max_tokens;
     }
 
     /// Shared provider handle (runtime daemon builds its planner on
@@ -368,7 +369,7 @@ impl Orchestrator {
             }
         }
 
-        let mut recent = self.recent_tool_calls.lock().unwrap();
+        let mut recent = sync::lock(&self.recent_tool_calls);
         recent.extend(new_sigs.iter().cloned());
 
         // Trim to a sliding window. Must be >= threshold so a full
@@ -410,7 +411,7 @@ impl Orchestrator {
 
     /// Clear the loop detection history (e.g. after a successful non-tool response).
     fn clear_loop_detection(&self) {
-        self.recent_tool_calls.lock().unwrap().clear();
+        sync::lock(&self.recent_tool_calls).clear();
     }
 
     /// Check if we're approaching the iteration limit (>= 80%).
@@ -496,24 +497,24 @@ impl Orchestrator {
     /// Park the loop at the next iteration boundary (P1-1). Blocking
     /// tool calls finish first; [`Self::resume`] releases the park.
     pub fn pause(&self) {
-        *self.pause_gate.lock().unwrap() = true;
+        *sync::lock(&self.pause_gate) = true;
     }
 
     /// Release a parked loop.
     pub fn resume(&self) {
-        *self.pause_gate.lock().unwrap() = false;
+        *sync::lock(&self.pause_gate) = false;
         self.pause_cv.notify_all();
     }
 
     /// Whether the loop is parked.
     pub fn is_paused(&self) -> bool {
-        *self.pause_gate.lock().unwrap()
+        *sync::lock(&self.pause_gate)
     }
 
     /// Block while parked. Wakes periodically so a concurrent
     /// [`Self::cancel`] is honored even mid-park.
     fn wait_if_paused(&self) {
-        let mut paused = self.pause_gate.lock().unwrap();
+        let mut paused = sync::lock(&self.pause_gate);
         while *paused && !self.cancel.load(std::sync::atomic::Ordering::SeqCst) {
             let (guard, _) = self
                 .pause_cv
@@ -527,15 +528,12 @@ impl Orchestrator {
     where
         F: Fn(ConfirmationRequest) -> bool + Send + Sync + 'static,
     {
-        let mut h = self.confirmation_handler.lock().unwrap();
+        let mut h = sync::lock(&self.confirmation_handler);
         *h = Some(Box::new(handler));
     }
 
     pub fn add_system_message(&self, content: String) {
-        self.memory
-            .lock()
-            .unwrap()
-            .add_message(crate::memory::Message::system(content));
+        sync::lock(&self.memory).add_message(crate::memory::Message::system(content));
     }
 
     /// Set a custom system prompt for all LLM requests.
@@ -563,7 +561,7 @@ impl Orchestrator {
     }
 
     pub(super) fn require_confirmation(&self, request: ConfirmationRequest) -> bool {
-        let handler = self.confirmation_handler.lock().unwrap();
+        let handler = sync::lock(&self.confirmation_handler);
         if let Some(ref h) = *handler {
             h(request)
         } else {
@@ -572,7 +570,7 @@ impl Orchestrator {
     }
 
     pub fn get_state(&self) -> OrchestratorState {
-        *self.state.lock().unwrap()
+        *sync::lock(&self.state)
     }
 
     /// Transition the lifecycle state and observe the change via
@@ -583,7 +581,7 @@ impl Orchestrator {
     /// unit tests so the matrix itself is enforced.
     fn set_state(&self, next: OrchestratorState) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = sync::lock(&self.state);
             if *state == next {
                 return;
             }
@@ -618,7 +616,7 @@ impl Orchestrator {
     }
 
     pub fn clear_memory(&self) {
-        self.memory.lock().unwrap().clear();
+        sync::lock(&self.memory).clear();
     }
 
     /// Borrow the orchestrator's tool registry. Useful for callers that
@@ -635,7 +633,7 @@ impl Orchestrator {
     /// Each result is `(role, content)`. The newest matches come last,
     /// matching insertion order in `Memory`.
     pub fn search_memory(&self, query: &str) -> Vec<(crate::memory::MessageRole, String)> {
-        let mem = self.memory.lock().unwrap();
+        let mem = sync::lock(&self.memory);
         mem.search(query)
             .into_iter()
             .map(|m| (m.role.clone(), m.content.clone()))

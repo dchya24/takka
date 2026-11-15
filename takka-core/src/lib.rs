@@ -35,6 +35,7 @@ pub mod runtime;
 pub mod safety;
 pub mod session;
 pub mod skills;
+pub mod sync;
 pub mod tool;
 pub mod tool_registry;
 pub mod tools;
