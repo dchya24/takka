@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use super::{Orchestrator, OrchestratorState};
 use crate::events::Event;
 use crate::session::{AgentSession, SessionStore};
+use crate::sync;
 use crate::AgenticError;
 
 impl Orchestrator {
@@ -36,19 +37,19 @@ impl Orchestrator {
     /// Drop the tracked session id — the next run opens a fresh
     /// session document (REPL turn separation).
     pub fn reset_session(&mut self) {
-        *self.session_id.lock().unwrap() = None;
+        *sync::lock(&self.session_id) = None;
     }
 
     /// Id of the session being tracked, if any.
     pub fn session_id(&self) -> Option<String> {
-        self.session_id.lock().unwrap().clone()
+        sync::lock(&self.session_id).clone()
     }
 
     /// Adopt a caller-supplied session id (ACP `session/load` / hosts with
     /// a stable session identity): the next run checkpoints under this id
     /// instead of minting a fresh uuid.
     pub fn adopt_session_id(&mut self, id: impl Into<String>) {
-        *self.session_id.lock().unwrap() = Some(id.into());
+        *sync::lock(&self.session_id) = Some(id.into());
     }
 
     // ------------------------------------------------------------------
@@ -67,7 +68,7 @@ impl Orchestrator {
         }
 
         // Adopt an existing id (resume) or mint a fresh one per run.
-        let mut current = self.session_id.lock().unwrap();
+        let mut current = sync::lock(&self.session_id);
         if current.is_none() {
             *current = Some(uuid::Uuid::new_v4().to_string());
         }
@@ -121,11 +122,11 @@ impl Orchestrator {
 
     fn write_checkpoint(&self, state: &str, extra_result: Option<&str>) {
         let store_guard = match &self.session_store {
-            Some(s) => s.lock().unwrap(),
+            Some(s) => sync::lock(s),
             None => return,
         };
 
-        let session_id = match self.session_id.lock().unwrap().clone() {
+        let session_id = match sync::lock(&self.session_id).clone() {
             Some(id) => id,
             None => return,
         };
@@ -138,7 +139,7 @@ impl Orchestrator {
         };
 
         let mut messages: Vec<crate::memory::Message> =
-            self.memory.lock().unwrap().get_messages().to_vec();
+            sync::lock(&self.memory).get_messages().to_vec();
         if let Some(final_text) = extra_result {
             if let Some(last) = messages.last_mut() {
                 if last.role.as_str() == "assistant" && last.content.is_empty() {
@@ -171,7 +172,7 @@ impl Orchestrator {
         let session = store.load(session_id)?;
         let message_count = session.messages.len();
         {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = sync::lock(&self.memory);
             mem.clear();
             for message in session.messages {
                 // Frontends replay the textual history as stream updates
@@ -191,7 +192,7 @@ impl Orchestrator {
         }
         self.model = session.model;
         self.session_store = Some(Mutex::new(store));
-        *self.session_id.lock().unwrap() = Some(session.session_id.clone());
+        *sync::lock(&self.session_id) = Some(session.session_id.clone());
         tracing::info!(
             session = %session.session_id,
             messages = message_count,

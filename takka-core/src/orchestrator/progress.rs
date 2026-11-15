@@ -6,6 +6,7 @@
 //! drown the event channel or the terminal, while the full result still
 //! reaches the final `ToolOutput` (and memory) unchanged.
 
+use crate::sync;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -38,7 +39,7 @@ impl DeltaThrottler {
     /// Call for each incoming delta piece. Returns `true` when it should
     /// be surfaced to the event emitter as a `ToolDelta`.
     pub fn accept(&self, delta: &str) -> bool {
-        let mut s = self.state.lock().unwrap();
+        let mut s = sync::lock(&self.state);
 
         // Budget exhausted — the final chunk may still be surfaced so the
         // tail of the output isn't cut off mid-word.

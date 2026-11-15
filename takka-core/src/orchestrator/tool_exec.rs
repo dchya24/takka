@@ -15,6 +15,7 @@
 use crate::events::Event;
 use crate::memory::Message;
 use crate::orchestrator::progress::DeltaThrottler;
+use crate::sync;
 
 use std::sync::Arc;
 
@@ -304,7 +305,7 @@ impl Orchestrator {
         // Push results in original order. Emit ToolOutput events only
         // for Pending slots (PreResolved already emitted theirs above).
         {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = sync::lock(&self.memory);
             for (idx, entry) in results.into_iter().enumerate() {
                 if let Some(outcome) = entry {
                     if matches!(slots[idx], Slot::Pending { .. }) {
@@ -654,7 +655,7 @@ impl Orchestrator {
         // events for any executed (Pending) slots; PreResolved slots
         // already emitted their outcome above.
         {
-            let mut mem = self.memory.lock().unwrap();
+            let mut mem = sync::lock(&self.memory);
             for (idx, entry) in results.into_iter().enumerate() {
                 if let Some(outcome) = entry {
                     // Only Pending slots produce real tool output; PreResolved
