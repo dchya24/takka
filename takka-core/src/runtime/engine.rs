@@ -187,14 +187,17 @@ impl<T: Transport> RuntimeEngine<T> {
             sink: engine.sink.clone(),
             current_request_id: engine.current_request_id.clone(),
         };
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut deps = ToolDeps::new();
         deps.question_handler = Some(Arc::new(question_handler));
         deps.todo_handler = Some(Box::new(todo_handler));
+        deps.cancel = Some(cancel.clone());
         let tools = ToolRegistry::new();
         for tool in crate::tools::builtin_tools_with_deps(deps) {
             tools.register(tool);
         }
         let mut orchestrator = Orchestrator::new(provider, tools);
+        orchestrator.set_cancel_handle(cancel);
         let sink = engine.sink.clone();
         let current_request_id = engine.current_request_id.clone();
         let pending_confirmation = engine.pending_confirmation.clone();
@@ -671,8 +674,10 @@ impl<T: Transport> RuntimeEngine<T> {
             .unwrap_or_else(|| provider_config.default_model.clone());
         let provider: Arc<dyn LLMProvider> = Arc::new(OpenAIProvider::new(provider_config));
 
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut deps = self.runtime_tool_deps();
         deps.url_policy = config.url_policy();
+        deps.cancel = Some(cancel.clone());
         let tools = ToolRegistry::new();
         for tool in crate::tools::builtin_tools_with_deps(deps) {
             tools.register(tool);
@@ -716,6 +721,7 @@ impl<T: Transport> RuntimeEngine<T> {
         }
 
         let mut orchestrator = Orchestrator::new(provider, tools);
+        orchestrator.set_cancel_handle(cancel);
         orchestrator.set_model(model);
         orchestrator.set_system_prompt(system_prompt);
         orchestrator.set_permission_mode(overrides.permission_mode.unwrap_or_default());

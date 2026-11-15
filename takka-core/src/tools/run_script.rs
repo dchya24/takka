@@ -6,13 +6,18 @@
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
+use super::process::{self, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 use crate::tool::{
     Concurrency, Mutability, SideEffects, Tool, ToolError, ToolMetadata, ToolParam, ToolResult,
     ToolSchema,
 };
 
-pub struct RunScriptTool;
+pub struct RunScriptTool {
+    cancel: Option<Arc<AtomicBool>>,
+}
 
 impl Default for RunScriptTool {
     fn default() -> Self {
@@ -22,7 +27,13 @@ impl Default for RunScriptTool {
 
 impl RunScriptTool {
     pub fn new() -> Self {
-        Self
+        Self { cancel: None }
+    }
+
+    /// Observe the orchestrator's cooperative cancel flag while running.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 }
 
@@ -57,8 +68,11 @@ impl Tool for RunScriptTool {
             "timeout".to_string(),
             ToolParam {
                 param_type: "number".to_string(),
-                description: Some("Timeout in seconds (default 30)".to_string()),
-                default: Some(serde_json::json!(30)),
+                description: Some(format!(
+                    "Timeout in seconds (default {}, max {})",
+                    DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+                )),
+                default: Some(serde_json::json!(DEFAULT_TIMEOUT_SECS)),
             },
         );
         params.insert(
@@ -125,7 +139,7 @@ impl RunScriptTool {
         let timeout_secs = args_obj
             .get("timeout")
             .and_then(|v| v.as_u64())
-            .unwrap_or(30);
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
         let interpreter = args_obj
             .get("interpreter")
             .and_then(|v| v.as_str())
@@ -168,7 +182,7 @@ impl RunScriptTool {
         interpreter: &str,
         script_path: &std::path::Path,
         cwd: Option<&str>,
-        _timeout_secs: u64,
+        timeout_secs: u64,
         on_progress: Option<&dyn Fn(&str)>,
     ) -> ToolResult<serde_json::Value> {
         let mut cmd = Command::new(interpreter);
@@ -178,73 +192,20 @@ impl RunScriptTool {
             cmd.current_dir(dir);
         }
 
-        let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| ToolError::new(format!("Failed to execute script: {}", e)))?;
-
-        use std::io::{BufRead, BufReader};
-
-        // Read a stream incrementally; stream each line through on_progress
-        // when present. Generic over ChildStdout/ChildStderr.
-        fn read_into<R: std::io::Read>(reader: R, on: Option<&dyn Fn(&str)>) -> String {
-            let reader = BufReader::new(reader);
-            let mut acc = String::new();
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        if let Some(on) = on {
-                            on(&line);
-                        }
-                        acc.push_str(&line);
-                        acc.push('\n');
-                    }
-                    Err(_) => break,
-                }
-            }
-            acc
-        }
-
-        let stdout = match child.stdout.take() {
-            Some(s) => read_into(s, on_progress),
-            None => String::new(),
-        };
-        let stderr = match child.stderr.take() {
-            Some(s) => read_into(s, on_progress),
-            None => String::new(),
-        };
-
-        let status = child
-            .wait()
-            .map_err(|e| ToolError::new(format!("Failed to wait script: {}", e)))?;
-
-        // Truncate output if too large (64KB limit)
-        let max_output = 65536;
-        let stdout_truncated = if stdout.len() > max_output {
-            format!(
-                "{}... (truncated, {} bytes total)",
-                &stdout[..max_output],
-                stdout.len()
-            )
-        } else {
-            stdout
-        };
-        let stderr_truncated = if stderr.len() > max_output {
-            format!(
-                "{}... (truncated, {} bytes total)",
-                &stderr[..max_output],
-                stderr.len()
-            )
-        } else {
-            stderr
-        };
+        let output = process::run_bounded(
+            &mut cmd,
+            process::clamp_timeout(timeout_secs),
+            process::OUTPUT_CAP_BYTES,
+            self.cancel.as_deref(),
+            on_progress,
+        )
+        .map_err(|e| ToolError::new(format!("Failed to execute script: {}", e)))?;
 
         Ok(serde_json::json!({
-            "success": status.success(),
-            "exit_code": status.code().unwrap_or(-1),
-            "stdout": stdout_truncated,
-            "stderr": stderr_truncated,
+            "success": output.success,
+            "exit_code": output.exit_code,
+            "stdout": output.stdout,
+            "stderr": output.stderr,
             "interpreter": interpreter,
         }))
     }
@@ -309,6 +270,23 @@ mod tests {
         let output = result.unwrap();
         assert_eq!(output["success"], false);
         assert_eq!(output["exit_code"], 42);
+    }
+
+    #[test]
+    fn run_script_honours_timeout() {
+        let tool = RunScriptTool::new();
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute(serde_json::json!({
+                "script": "sleep 5",
+                "timeout": 1,
+            }))
+            .unwrap();
+        assert_eq!(result["success"], false);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "script timeout was ignored"
+        );
     }
 
     #[test]
