@@ -17,6 +17,11 @@
 #
 # Usage: scripts/acp-conformance.sh [--verbose]
 # Exit:  0 = every check passed, 1 = at least one check failed.
+#
+# The trailing summary reports the number of checks this run executed. That
+# count is the source of truth quoted in the docs (.github/workflows/ci.yml,
+# docs/ROADMAP.md, docs/BENCHMARK_CODEX.md) — quote it from a real run, never
+# hardcode it elsewhere.
 
 set -uo pipefail
 
@@ -468,8 +473,11 @@ fi
 ACP_PID=""
 
 # --- summary -------------------------------------------------------------
+# Counted from the checks that actually ran, so it stays correct as checks are
+# added or removed.
+CHECKS=$((PASS + FAIL))
 echo
-echo "== $PASS passed, $FAIL failed =="
+echo "== $CHECKS checks: $PASS passed, $FAIL failed =="
 if [ "$FAIL" -ne 0 ]; then
     printf 'failed checks:%s\n' "$FAILED_CHECKS"
     echo "(stderr from the agent: $WORKDIR/stderr.log — kept only on failure)"

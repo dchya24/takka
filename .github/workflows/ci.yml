@@ -47,7 +47,7 @@ jobs:
       - run: cargo test --workspace --all-targets
 
   # T-08 (ACP design spec §6): CI sanity for the ACP adapter — the
-  # hermetic 14-check conformance run over `takka-runtime --acp` on the
+  # hermetic 24-check conformance run over `takka-runtime --acp` on the
   # POSIX runners. Windows compilation ("no new cfg faces") stays
   # covered by the `test` matrix above; the script's FIFO transport is
   # POSIX-only by design.
