@@ -1,24 +1,29 @@
-# Tasks: Agentic CLI
+# Tasks: takka-cli — Agentic CLI
 
-**Feature**: agentic-cli — Standalone CLI binary using core-agentic
-**Status**: Foundation done; shared widgets stack landed; alignment refactor merged; Phase 9–11 planned
+**Feature**: `takka-cli` — the `takka` binary, built on `takka-core` and
+`takka-runtime` (renamed from `agentic-cli` in the 2026-11 `takka` rebrand)
+**Status**: Foundation done; shared widgets stack landed; alignment refactor
+merged; Phases 9–11 landed. ACP v1 adapter merged as PRs #16–#19; harness
+hardening H-01..H-03 merged as PRs #20–#22.
+**Open work**: [`14112026-harness-hardening-backlog.md`](14112026-harness-hardening-backlog.md)
+(H-04–H-07) — see also `docs/ROADMAP.md` "Open work".
 **Created**: 2026-04-20
-**Updated**: 2026-06-03
+**Updated**: 2026-11-14
 **Depends on**: `tasks-core-agentic.md`
 
 ---
 
 ## Relevant Files
 
-- `agentic-cli/Cargo.toml` — Binary manifest
-- `agentic-cli/src/main.rs` — Entry point + Ctrl+C handler + `--color` flag
-- `agentic-cli/src/cli.rs` — clap argument tree
-- `agentic-cli/src/commands.rs` — Command handlers (run, interactive, config, models, mcp, tools, …)
-- `agentic-cli/src/interactive.rs` — Reedline REPL + slash-command parser
-- `agentic-cli/src/confirmation.rs` — Risk-coloured confirmation panel
-- `agentic-cli/src/file_ref.rs` — `@`-completion for file references
-- `agentic-cli/src/widgets/` — Shared ratatui widgets (markdown, spinner, progress, components, tool_call, diff, inline, capabilities)
-- `agentic-cli/src/tui/` — Full-screen TUI mode (app, ui, dropdown, input)
+- `takka-cli/Cargo.toml` — Binary manifest
+- `takka-cli/src/main.rs` — Entry point + Ctrl+C handler + `--color` flag
+- `takka-cli/src/cli.rs` — clap argument tree
+- `takka-cli/src/commands.rs` — Command handlers (run, interactive, config, models, mcp, tools, …)
+- `takka-cli/src/interactive.rs` — Reedline REPL + slash-command parser
+- `takka-cli/src/confirmation.rs` — Risk-coloured confirmation panel
+- `takka-cli/src/file_ref.rs` — `@`-completion for file references
+- `takka-cli/src/widgets/` — Shared ratatui widgets (markdown, spinner, progress, components, tool_call, diff, inline, capabilities)
+- `takka-cli/src/tui/` — Full-screen TUI mode (app, ui, dropdown, input)
 
 ---
 
@@ -31,20 +36,20 @@
 ### Phase 1 — Foundation (✅ done)
 
 - [x] 0.0 Project setup
-  - [x] 0.1 Crate skeleton with `core-agentic`, `clap`, `tokio`
+  - [x] 0.1 Crate skeleton with `takka-core`, `clap`, `tokio`
   - [x] 0.2 Cargo manifest + workspace integration
 - [x] 1.0 CLI argument parsing
   - [x] 1.1 Subcommands (`run`, `interactive`, `tui`, `config`, `models`, …)
   - [x] 1.2 Options (`--provider`, `--model`, `--config`, `--mode`, `--color`, …)
 - [x] 2.0 Configuration
-  - [x] 2.1 Reads `core_agentic::Config` (multi-provider). The legacy single-provider shape was deleted.
+  - [x] 2.1 Reads `takka_core::Config` (multi-provider). The legacy single-provider shape was deleted.
   - [x] 2.2 Env-var substitution
   - [x] 2.3 Config wizard / templates / setup commands
 
 ### Phase 2 — Run loop & output (✅ done)
 
 - [x] 3.0 Single-task run
-  - [x] 3.1 `agentic run <task>` integrates with `Orchestrator`
+  - [x] 3.1 `takka run <task>` integrates with `Orchestrator`
   - [x] 3.2 Streaming output through `widgets::inline`
   - [x] 3.3 Confirmation handler wired into `Safety`
 - [x] 4.0 Interactive REPL
@@ -56,7 +61,7 @@
   - [x] 4.6 Status bar (model, provider, tokens, elapsed)
   - [x] 4.7 Resize-safe full-width prompt
 - [x] 5.0 Full-screen TUI mode
-  - [x] 5.1 `agentic tui` launches alternate-screen ratatui app
+  - [x] 5.1 `takka tui` launches alternate-screen ratatui app
   - [x] 5.2 Subscribes to orchestrator events; renders tool calls + diffs through shared widgets
   - [x] 5.3 Dropdown widget for `@` and `/`
   - [x] 5.4 Live transient spinner shared with inline mode
@@ -71,7 +76,7 @@
   - [x] 6.5 Unified-diff renderer + summary line
   - [x] 6.6 Spinner + progress widgets
   - [x] 6.7 Panels, badges, headers, gradients, tables, sparklines
-  - [x] 6.8 Zero raw `\x1b[` escapes remain in `agentic-cli/src/`
+  - [x] 6.8 Zero raw `\x1b[` escapes remain in `takka-cli/src/`
 
 ### Phase 4 — Safety / permissions (✅ done)
 
@@ -105,8 +110,8 @@
 ### Phase 8 — Testing & docs
 
 - [x] 12.0 Unit tests for argument parsing + widget helpers
-- [x] 12.1 README in `agentic-cli/`
-- [x] 12.2 End-to-end smoke test for `agentic run` against a mock provider
+- [x] 12.1 README in `takka-cli/`
+- [x] 12.2 End-to-end smoke test for `takka run` against a mock provider
   - 3 tests in `commands.rs`: basic tool→text flow, event emission, ScriptedProvider
 
 ### Phase 9 — Planner Agent (CLI integration)
@@ -117,14 +122,14 @@
   - [x] 13.3 Conversation tracking: plan entries pushed to conversation history with timing
 
 - [x] 13.0b TUI & inline enhancements
-  - [x] 13.4 TUI panel widget created (`agentic-cli/src/tui/plan_panel.rs`) — integration blocked by pre-existing TUI build errors (crossterm in dev-dependencies)
+  - [x] 13.4 TUI panel widget created (`takka-cli/src/tui/plan_panel.rs`) — integration blocked by pre-existing TUI build errors (crossterm in dev-dependencies)
   - [x] 13.5 Plan progress bar in inline mode: live `labeled_bar` + step description rendering during execution
   - [x] 13.6 Replan notification: surface when planner revises remaining steps (requires event extension)
   - [x] 13.7 Wire planner events (`PlanProgress`) to inline widget renderer via `planner.on()` callback
 
 - [x] 14.0 Plan mode integration
-  - [x] 14.1 `agentic run --mode plan` works with the new planner (not just deny writes)
-  - [x] 14.2 `agentic run --plan "<goal>"` shorthand for plan-then-execute without entering interactive mode
+  - [x] 14.1 `takka run --mode plan` works with the new planner (not just deny writes)
+  - [x] 14.2 `takka run --plan "<goal>"` shorthand for plan-then-execute without entering interactive mode
 
 ### Phase 10 — Skill System (CLI integration) (✅ done)
 
@@ -132,8 +137,8 @@
   - [x] 15.1 List available skills with name, description, source directory
   - [x] 15.2 `/skills <name>` — show skill details (instructions preview)
   - [x] 15.3 Auto-complete skill names in `/skills <name>`
-- [x] 16.0 `agentic skill create <name>` wizard
-  - [x] 16.1 Scaffold `SKILL.md` in `~/.config/agentic/skills/<name>/` with frontmatter template (`--global` flag)
+- [x] 16.0 `takka skill create <name>` wizard
+  - [x] 16.1 Scaffold `SKILL.md` in `~/.config/takka/skills/<name>/` with frontmatter template (`--global` flag)
   - [x] 16.2 Name validation + directory creation + template file
 - [x] 17.0 Status bar indicators
   - [x] 17.1 Show `⚡ <name>` chip when a skill is active in session
@@ -150,7 +155,7 @@
   - [x] 19.2 Add cached token counts to `/stats` output
   - [x] 19.3 Show cache savings in response summary + goodbye panel
 - [ ] ~~20.0 Config integration~~ (deferred — caching works via manual config.toml edit)
-  - [ ] ~~20.1 Expose `provider.cache.*` settings in `agentic config` wizard~~ (deferred)
+  - [ ] ~~20.1 Expose `provider.cache.*` settings in `takka config` wizard~~ (deferred)
 
 > **Note:** The cache metrics (cache_read_tokens, cache_creation_tokens) flow through `ChatUsage` but are not yet wired from provider responses to `SessionStats`. This requires emitting usage events from the orchestrator in a follow-up task.
 
@@ -164,4 +169,6 @@
 - [x] 21.2 TUI: role `MessageRole::ToolActivity` + `AppMessage::ToolDelta` + rendering indent DIM (kedua match site + `/search` label)
 
 > Spec: `docs/superpowers/specs/2026-08-06-interactive-live-progress-and-steering-design.md`
-> Next: Fase 2 — steering + REPL non-blokir (interactive mode).
+> Next: hardening items H-04–H-07 in
+> [`14112026-harness-hardening-backlog.md`](14112026-harness-hardening-backlog.md)
+> — live tool output, steering and the non-blocking REPL are landed.

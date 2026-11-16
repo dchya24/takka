@@ -178,7 +178,7 @@ Keputusan 2026-11-10: permukaan integrasi editor yang benar adalah **ACP v1**
 tinggal client JSONL di atas protokol yang sama, dan ACP memberi integrasi Zed
 gratis. Landed sebagai PR #10–#15: adapter `takka-runtime --acp` (sesi multi
 bounded, prompt streaming, mode, cancel, turn-limit), conformance hermetik
-14-check (`scripts/acp-conformance.sh`, T-03–T-07) kini gate CI ubuntu+macOS
+24-check (`scripts/acp-conformance.sh`, T-03–T-07) kini gate CI ubuntu+macOS
 (T-08, PR #15). Sisa: **bukti sesi Zed nyata** (manual).
 
 ---
