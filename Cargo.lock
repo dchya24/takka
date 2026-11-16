@@ -2314,6 +2314,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol-schema",
  "base64 0.22.1",
+ "getrandom 0.4.2",
  "serde",
  "serde_json",
  "takka-core",

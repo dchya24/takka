@@ -869,7 +869,7 @@ fn write_frame(writer: &mut BufWriter<LocalStream>, event: &ProtocolEvent) -> io
 }
 
 /// 32 hex chars (16 bytes) from the OS CSPRNG (`/dev/urandom`, or
-/// `ProcessPrng` on Windows). This is the shared secret of the auth
+/// `ProcessPrng` via getrandom on Windows). This is the shared secret of the auth
 /// handshake, so it must never fall back to a userspace PRNG.
 #[cfg(any(unix, windows))]
 fn generate_token() -> io::Result<String> {
@@ -884,21 +884,11 @@ fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
     std::fs::File::open("/dev/urandom")?.read_exact(bytes)
 }
 
-/// `ProcessPrng` (available since Windows 10 1809) is the OS CSPRNG
-/// entry point bcryptprimitives exposes; reaching it directly avoids
-/// pulling in a RNG crate for 16 bytes.
+// getrandom reaches `ProcessPrng` without a hand-rolled `#[link]`, which has no
+// import library and fails to link (`LNK1181: bcryptprimitives.lib`).
 #[cfg(windows)]
 fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
-    #[link(name = "bcryptprimitives")]
-    extern "system" {
-        fn ProcessPrng(data: *mut u8, length: usize) -> i32;
-    }
-    // SAFETY: `bytes` is a valid, writable, correctly sized buffer.
-    let ok = unsafe { ProcessPrng(bytes.as_mut_ptr(), bytes.len()) };
-    if ok == 0 {
-        return Err(io::Error::other("ProcessPrng failed"));
-    }
-    Ok(())
+    getrandom::fill(bytes).map_err(|err| io::Error::other(err.to_string()))
 }
 
 /// Version reported in the info file. `takka_core` exposes no version
