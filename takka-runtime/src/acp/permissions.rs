@@ -47,18 +47,12 @@ impl PermissionWaiters {
 
     pub(crate) fn insert(&self, outbound_id: String, waiter: PermissionWaiter) {
         // Called with a fresh id from `next_outbound_id` — never a collision.
-        self.inner
-            .lock()
-            .expect("permission waiters lock")
-            .insert(outbound_id, waiter);
+        lock(&self.inner).insert(outbound_id, waiter);
     }
 
     /// Take the waiter for an answered request (framing loop).
     pub(crate) fn remove(&self, outbound_id: &str) -> Option<PermissionWaiter> {
-        self.inner
-            .lock()
-            .expect("permission waiters lock")
-            .remove(outbound_id)
+        lock(&self.inner).remove(outbound_id)
     }
 
     /// Deny every waiter of one session (`session/cancel` mid-gate): the
@@ -66,7 +60,7 @@ impl PermissionWaiters {
     /// terminal instead of dead-locking on the gate.
     pub(crate) fn deny_session(&self, session_id: &str) {
         let denied: Vec<PermissionWaiter> = {
-            let mut waiters = self.inner.lock().expect("permission waiters lock");
+            let mut waiters = lock(&self.inner);
             let ids: Vec<String> = waiters
                 .iter()
                 .filter(|(_, waiter)| waiter.session_id == session_id)
@@ -83,10 +77,7 @@ impl PermissionWaiters {
 
     /// Deny everything (EOF teardown, T-07).
     pub(crate) fn deny_all(&self) {
-        let denied: Vec<PermissionWaiter> = self
-            .inner
-            .lock()
-            .expect("permission waiters lock")
+        let denied: Vec<PermissionWaiter> = lock(&self.inner)
             .drain()
             .map(|(_, waiter)| waiter)
             .collect();
@@ -232,5 +223,65 @@ mod tests {
             "the engine must receive ConfirmResponse(approved=false)"
         );
         acp.close_and_join();
+    }
+
+    /// H-02: the waiter map is bookkeeping shared by the turn threads, the
+    /// framing loop, and the cancel/teardown paths. A panic while it was
+    /// held must not make every later permission answer panic — the
+    /// recovered guard is used, so the gate still opens.
+    #[test]
+    fn a_poisoned_waiter_map_still_answers_and_denies() {
+        let waiters = PermissionWaiters::new();
+        poison(&waiters.inner);
+
+        // Insert → take → answer: the normal gate round trip.
+        let (answer_tx, answer_rx) = mpsc::sync_channel::<PermissionAnswer>(1);
+        waiters.insert(
+            waiters.next_outbound_id(),
+            PermissionWaiter {
+                session_id: "sess-1".to_owned(),
+                answer_tx,
+            },
+        );
+        assert_eq!(lock(&waiters.inner).len(), 1);
+        let waiter = waiters.remove("acp-perm-1").expect("the inserted waiter");
+        waiter.answer_tx.send(PermissionAnswer::AllowOnce).unwrap();
+        assert_eq!(answer_rx.recv().unwrap(), PermissionAnswer::AllowOnce);
+
+        // Deny paths survive the poison too.
+        let (_tx, rx) = mpsc::sync_channel::<PermissionAnswer>(1);
+        waiters.insert(
+            "acp-perm-2".to_owned(),
+            PermissionWaiter {
+                session_id: "sess-2".to_owned(),
+                answer_tx: _tx,
+            },
+        );
+        waiters.deny_session("sess-2");
+        assert_eq!(rx.recv().unwrap(), PermissionAnswer::Deny);
+
+        let (_tx, rx) = mpsc::sync_channel::<PermissionAnswer>(1);
+        waiters.insert(
+            "acp-perm-3".to_owned(),
+            PermissionWaiter {
+                session_id: "sess-3".to_owned(),
+                answer_tx: _tx,
+            },
+        );
+        waiters.deny_all();
+        assert_eq!(rx.recv().unwrap(), PermissionAnswer::Deny);
+        assert!(lock(&waiters.inner).is_empty());
+    }
+
+    /// H-02: a poisoned sink lock must not stop the connection's only
+    /// output path — later frames are still recorded.
+    #[test]
+    fn a_poisoned_sink_lock_still_records_frames() {
+        let sink = VecSink::default();
+        poison(&sink.lines);
+        sink.send_line(&serde_json::json!({ "jsonrpc": "2.0", "id": 5, "result": {} }));
+        assert_eq!(lock(&sink.lines).len(), 1);
+        assert!(sink.response_for(5).is_some());
+        assert!(sink.updates().is_empty());
     }
 }

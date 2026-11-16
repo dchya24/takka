@@ -247,7 +247,7 @@ impl AcpService {
     pub(crate) fn shutdown(&self) {
         let deadline = Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
         let sessions: Vec<Arc<Session>> = {
-            let mut registry = self.sessions.lock().expect("session registry lock");
+            let mut registry = lock(&self.sessions);
             self.closed.store(true, Ordering::SeqCst);
             for session in registry.values() {
                 session.cancel_requested.store(true, Ordering::SeqCst);
@@ -261,11 +261,11 @@ impl AcpService {
         };
         let turn_handles: Vec<std::thread::JoinHandle<()>> = sessions
             .iter()
-            .filter_map(|session| session.turn.lock().expect("session turn lock").take())
+            .filter_map(|session| lock(&session.turn).take())
             .collect();
         let engine_handles: Vec<std::thread::JoinHandle<()>> = sessions
             .iter()
-            .filter_map(|session| session.engine.lock().expect("session engine lock").take())
+            .filter_map(|session| lock(&session.engine).take())
             .collect();
         // Dropping the sessions drops the last `req_tx` clones: engines
         // that are still winding down see the closed channel and exit.
@@ -459,5 +459,60 @@ mod tests {
             1,
             "the gated session's engine must be joined at EOF"
         );
+    }
+
+    /// H-02: the session registry is bookkeeping shared by the framing
+    /// loop and every turn thread — one panicking request must not turn
+    /// every later lookup into a `PoisonError` panic that kills unrelated
+    /// sessions. The registry is poisoned in place, then the real routing
+    /// paths (`session/new`, `session/prompt`, the EOF teardown) must keep
+    /// working.
+    #[test]
+    fn a_poisoned_session_registry_stays_usable() {
+        let sink: Arc<dyn AcpSink> = Arc::new(VecSink::default());
+        let service = AcpService::new(
+            AcpConfig {
+                max_sessions: DEFAULT_MAX_SESSIONS,
+                config_path: Some(hermetic_config_path()),
+            },
+            sink.clone(),
+        );
+
+        // Register a live session, then poison the registry behind it.
+        let cwd = std::env::current_dir().expect("process cwd");
+        let request = acp::NewSessionRequest::new(cwd);
+        let first = service.session_new(&request).expect("session/new boots");
+        assert_eq!(first.session_id.to_string(), "sess-1");
+        poison(&service.sessions);
+        assert!(service.sessions.lock().is_err(), "registry is poisoned");
+
+        // Routing lookups recover: a prompt for the live session reaches
+        // its engine (the turn thread answers, not a poisoned panic), and
+        // an unknown session still gets its typed error.
+        let prompt = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_PROMPT,
+            "params": { "sessionId": "sess-1", "prompt": [{ "type": "text", "text": "hi" }] }
+        });
+        assert!(matches!(
+            service.route_frame(&prompt),
+            RouteOutcome::Deferred
+        ));
+        let unknown = serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": SESSION_PROMPT,
+            "params": { "sessionId": "sess-404", "prompt": [{ "type": "text", "text": "hi" }] }
+        });
+        let RouteOutcome::Error(error) = service.route_frame(&unknown) else {
+            panic!("an unknown session must be a typed error");
+        };
+        assert_eq!(i32::from(error.code), -32002);
+
+        // A capacity check on the recovered registry still holds.
+        let second = service.session_new(&request).expect("second session boots");
+        assert_eq!(second.session_id.to_string(), "sess-2");
+
+        // The EOF teardown drains the recovered registry and joins.
+        service.shutdown();
+        assert!(lock(&service.sessions).is_empty());
+        assert!(service.closed.load(Ordering::SeqCst));
     }
 }

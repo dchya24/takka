@@ -44,13 +44,10 @@ pub(crate) fn run_prompt_turn(
     // Take the parked stream — the busy flag guarantees we are the only
     // taker. `None` means the stream is already gone (engine died): the
     // session is beyond repair and is torn down.
-    let receiver = match session.events.lock().expect("session events lock").take() {
+    let receiver = match lock(&session.events).take() {
         Some(receiver) => receiver,
         None => {
-            sessions
-                .lock()
-                .expect("session registry lock")
-                .remove(&session.id);
+            lock(&sessions).remove(&session.id);
             session.busy.store(false, Ordering::SeqCst);
             respond(&Err(internal_error(
                 "session engine stream is not available",
@@ -63,10 +60,7 @@ pub(crate) fn run_prompt_turn(
     let run = ProtocolRequest::new(run_id, Request::Run { task, attachments });
     if session.req_tx.send(run).is_err() {
         // Engine thread is gone — no session without an engine.
-        sessions
-            .lock()
-            .expect("session registry lock")
-            .remove(&session.id);
+        lock(&sessions).remove(&session.id);
         session.busy.store(false, Ordering::SeqCst);
         respond(&Err(internal_error(
             "runtime engine died before the turn started",
@@ -177,12 +171,9 @@ pub(crate) fn run_prompt_turn(
     // response hits the wire — a client that saw the response must be
     // able to prompt again right away (T-03: no poisoned sessions).
     if engine_died {
-        sessions
-            .lock()
-            .expect("session registry lock")
-            .remove(&session.id);
+        lock(&sessions).remove(&session.id);
     } else {
-        *session.events.lock().expect("session events lock") = Some(receiver);
+        *lock(&session.events) = Some(receiver);
     }
     session.busy.store(false, Ordering::SeqCst);
 

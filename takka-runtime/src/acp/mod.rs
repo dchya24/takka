@@ -75,6 +75,7 @@ use std::time::Duration;
 
 use agent_client_protocol_schema::{v1 as acp, ProtocolVersion};
 use serde_json::Value;
+use takka_core::sync::lock;
 
 /// Default session capacity of one ACP connection (spec D6: bounded
 /// engine-per-session; the `--acp-max-sessions` flag lands with the
