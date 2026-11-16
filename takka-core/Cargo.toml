@@ -31,6 +31,10 @@ base64 = "0.22"
 # can be off by 20–30% for code.
 tiktoken-rs = { version = "0.6", optional = true }
 
+# Process-group signals for bounded shell execution (Unix only).
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
 [features]
 default = []
 # Enable to use tiktoken's cl100k_base encoder for token counting. Adds

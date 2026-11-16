@@ -289,6 +289,78 @@ mod tests {
         );
     }
 
+    /// True while a process whose command line contains `tag` is alive.
+    #[cfg(unix)]
+    fn tag_is_alive(tag: &str) -> bool {
+        let status = Command::new("pgrep")
+            .args(["-f", tag])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("pgrep should run");
+        status.success()
+    }
+
+    #[cfg(unix)]
+    fn wait_until_gone(tag: &str, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        while std::time::Instant::now() < deadline {
+            if !tag_is_alive(tag) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        !tag_is_alive(tag)
+    }
+
+    /// A multi-line script's grandchildren outlive a plain child kill:
+    /// `sh /tmp/x.sh` does not exec the script body, so the `sleep` it
+    /// spawned in the background is not the killed pid. The whole process
+    /// group must be killed on timeout.
+    #[cfg(unix)]
+    #[test]
+    fn script_grandchildren_die_on_timeout() {
+        let tag = format!("takka-test-grandchild-{}", uuid::Uuid::new_v4());
+        let tool = RunScriptTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "script": format!("sh -c 'exec -a {} sleep 4242' &\nsleep 4242", tag),
+                "timeout": 1,
+            }))
+            .unwrap();
+        assert_eq!(result["success"], false);
+        assert!(
+            wait_until_gone(&tag, std::time::Duration::from_secs(3)),
+            "grandchild process outlived the timeout kill (tag {})",
+            tag
+        );
+    }
+
+    /// Same guarantee for cooperative cancellation.
+    #[cfg(unix)]
+    #[test]
+    fn script_grandchildren_die_on_cancel() {
+        let tag = format!("takka-test-grandchild-{}", uuid::Uuid::new_v4());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flipper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            flipper.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let tool = RunScriptTool::new().with_cancel(cancel);
+        let result = tool
+            .execute(serde_json::json!({
+                "script": format!("sh -c 'exec -a {} sleep 4242' &\nsleep 4242", tag),
+                "timeout": 30,
+            }))
+            .unwrap();
+        assert_eq!(result["success"], false);
+        assert!(
+            wait_until_gone(&tag, std::time::Duration::from_secs(3)),
+            "grandchild process outlived the cancel kill (tag {})",
+            tag
+        );
+    }
+
     #[test]
     fn run_script_streams_echo_lines() {
         use std::sync::{Arc, Mutex};
