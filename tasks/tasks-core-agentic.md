@@ -3,12 +3,11 @@
 **Feature**: `takka-core` — Rust library for AI agent orchestration (renamed from
 `core-agentic` in the 2026-11 `takka` rebrand)
 **Status**: Foundation complete; ~95% architecture coverage; Phases 9–11 landed.
-ACP v1 adapter merged as PRs #16–#19; harness hardening H-01..H-03 merged as
-PRs #20–#22.
-**Open work**: [`14112026-harness-hardening-backlog.md`](14112026-harness-hardening-backlog.md)
-(H-04–H-07) — see also `docs/ROADMAP.md` "Open work".
+ACP v1 adapter merged as PRs #16–#19; harness hardening H-01..H-07 fully merged
+as PRs #20–#26 (backlog exhausted).
+**Open work**: see `docs/ROADMAP.md` "Open work".
 **Created**: 2026-04-20
-**Updated**: 2026-11-14
+**Updated**: 2026-11-16
 
 ---
 
