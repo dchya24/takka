@@ -1406,3 +1406,250 @@ async fn streaming_token_truncated_final_answer_emits_max_tokens() {
         "expected exactly one MaxTokens event on the stream path, got {limit_events:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// H-06: spend ceiling (`agent.max_cost_usd` / `Event::CostLimitExceeded`).
+// ---------------------------------------------------------------------------
+
+/// Build the orchestrator the ceiling tests share: a model with a known list
+/// price (`claude-3-5-sonnet`) and the real builtin tool set.
+fn ceiling_orchestrator(provider: Arc<dyn LLMProvider>) -> Orchestrator {
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("claude-3-5-sonnet");
+    orch
+}
+
+fn captured_events(orch: &Orchestrator) -> Arc<Mutex<Vec<Event>>> {
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    orch.on_event(move |event| sink.lock().unwrap().push(event));
+    events
+}
+
+fn cost_limits(events: &Arc<Mutex<Vec<Event>>>) -> Vec<(f64, f64)> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::CostLimitExceeded {
+                max_cost_usd,
+                spent_usd,
+            } => Some((*max_cost_usd, *spent_usd)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Under budget: the run spends, but never crosses the ceiling, so the loop
+/// keeps going to its natural answer and stays silent about cost.
+#[test]
+fn under_budget_run_completes_without_stopping() {
+    // One call, 10k prompt + 2k completion = $0.03 + $0.03 = $0.06.
+    let mut response = support::text_response("all done");
+    response.usage = Some(support::usage(10_000, 2_000));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![response]));
+
+    let mut orch = ceiling_orchestrator(provider);
+    orch.set_max_cost_usd(Some(0.10));
+    let events = captured_events(&orch);
+
+    let answer = orch.run("answer me").expect("run should succeed");
+    assert_eq!(answer, "all done");
+    assert!(
+        cost_limits(&events).is_empty(),
+        "an under-budget run must not emit CostLimitExceeded"
+    );
+    assert!(
+        (orch.run_cost_usd() - support::sonnet_cost(10_000, 2_000)).abs() < 1e-9,
+        "run cost should equal the reported usage's price, got {}",
+        orch.run_cost_usd()
+    );
+}
+
+/// Over budget on a tool-call turn: the crossing turn's tool call still runs
+/// (the loop must not cut a request short), and only then does the loop stop
+/// with `CostLimitExceeded` instead of asking the provider again.
+#[test]
+fn over_budget_stops_after_the_crossing_turn_completes() {
+    let dir = support::tempdir();
+    let path = dir.join("marker.txt");
+    std::fs::write(&path, "paid for\n").unwrap();
+
+    // Turn 1: 60k prompt + 10k completion = $0.18 + $0.15 = $0.33 → crosses
+    // the $0.20 ceiling. A tool call is requested in that same turn.
+    let mut crossing = support::tool_call_response(
+        "call-1",
+        "read_file",
+        &serde_json::json!({"path": path.to_string_lossy()}),
+    );
+    crossing.usage = Some(support::usage(60_000, 10_000));
+    // A second turn would exist if the loop kept going — it must not.
+    let mut second = support::text_response("never asked for");
+    second.usage = Some(support::usage(10_000, 1_000));
+
+    let recording = Arc::new(support::RecordingProvider::new(vec![crossing, second]));
+    let provider: Arc<dyn LLMProvider> = recording.clone();
+    let mut orch = ceiling_orchestrator(provider);
+    orch.set_max_cost_usd(Some(0.20));
+    let events = captured_events(&orch);
+
+    let answer = orch
+        .run("read the marker")
+        .expect("budget stop is not an error");
+    assert_eq!(answer, "", "no further model turn produced an answer");
+
+    // The crossing turn's work completed: the tool ran and its result landed
+    // in memory.
+    let history = orch.search_memory("paid for");
+    assert!(
+        history.iter().any(|(role, content)| matches!(
+            role,
+            takka_core::memory::MessageRole::Tool { .. }
+        ) && content.contains("paid for")),
+        "the crossing turn's tool result must be recorded, history = {history:?}"
+    );
+
+    let limits = cost_limits(&events);
+    assert_eq!(limits.len(), 1, "expected exactly one CostLimitExceeded");
+    let (max, spent) = limits[0];
+    assert!((max - 0.20).abs() < 1e-9, "max = {max}");
+    assert!(
+        (spent - support::sonnet_cost(60_000, 10_000)).abs() < 1e-9,
+        "spent = {spent}"
+    );
+    // Exactly one provider request: the loop stopped instead of asking again.
+    assert_eq!(
+        recording.tool_counts.lock().unwrap().len(),
+        1,
+        "the loop must not ask the provider again after crossing the ceiling"
+    );
+}
+
+/// No ceiling configured (the default): cost is still accumulated, but the
+/// loop runs every turn it otherwise would — unchanged behaviour.
+#[test]
+fn unset_ceiling_is_unlimited() {
+    let dir = support::tempdir();
+    let path = dir.join("marker.txt");
+    std::fs::write(&path, "unlimited\n").unwrap();
+
+    // Far above any plausible ceiling, twice.
+    let mut first = support::tool_call_response(
+        "call-1",
+        "read_file",
+        &serde_json::json!({"path": path.to_string_lossy()}),
+    );
+    first.usage = Some(support::usage(2_000_000, 500_000));
+    let mut second = support::text_response("finished anyway");
+    second.usage = Some(support::usage(2_000_000, 500_000));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![first, second]));
+    let orch = ceiling_orchestrator(provider);
+    assert_eq!(orch.max_cost_usd(), None);
+    let events = captured_events(&orch);
+
+    let answer = orch.run("keep going").expect("run should succeed");
+    assert_eq!(answer, "finished anyway");
+    assert!(
+        cost_limits(&events).is_empty(),
+        "an unlimited run must never emit CostLimitExceeded"
+    );
+    assert!(
+        orch.run_cost_usd() > 1.0,
+        "cost is still accumulated for display, got {}",
+        orch.run_cost_usd()
+    );
+}
+
+/// Streaming path: the ceiling is evaluated from the final chunk's usage and
+/// the stop happens at the turn boundary — the stream itself is never cut.
+#[tokio::test]
+async fn streaming_over_budget_stops_at_the_turn_boundary() {
+    let mut crossing = support::text_response("streamed answer");
+    crossing.usage = Some(support::usage(100_000, 20_000)); // $0.30 + $0.30
+    let mut second = support::text_response("must not be asked");
+    second.usage = Some(support::usage(1_000, 100));
+
+    let provider: Arc<dyn LLMProvider> =
+        Arc::new(StreamingScriptedProvider::new(vec![crossing, second]));
+    let mut orch = ceiling_orchestrator(provider);
+    orch.set_max_cost_usd(Some(0.50));
+    let events = captured_events(&orch);
+
+    let mut streamed = String::new();
+    let answer = orch
+        .run_stream("stream it", |chunk| streamed.push_str(&chunk))
+        .await
+        .expect("budget stop is not an error");
+
+    assert_eq!(streamed, "streamed answer", "the stream ran to completion");
+    assert_eq!(
+        answer, "streamed answer",
+        "the paid-for answer is delivered"
+    );
+    let limits = cost_limits(&events);
+    assert_eq!(
+        limits.len(),
+        1,
+        "expected exactly one CostLimitExceeded on the stream path"
+    );
+    let (max, spent) = limits[0];
+    assert!((max - 0.50).abs() < 1e-9, "max = {max}");
+    assert!(
+        (spent - support::sonnet_cost(100_000, 20_000)).abs() < 1e-9,
+        "spent = {spent}"
+    );
+}
+
+/// A provider that reports no usage leaves the ceiling unevaluated: nothing
+/// is charged, so a tight ceiling cannot stop a run nobody could price. This
+/// is the whole "unset/unmeasurable = keep going" contract.
+#[test]
+fn missing_usage_never_trips_the_ceiling() {
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "list_files", &serde_json::json!({"path": "."})),
+        support::text_response("answered without usage"),
+    ]));
+
+    let mut orch = ceiling_orchestrator(provider);
+    // Tiny ceiling: any priced call would cross it immediately.
+    orch.set_max_cost_usd(Some(0.0000001));
+    let events = captured_events(&orch);
+
+    let answer = orch.run("go").expect("run should succeed");
+    assert_eq!(answer, "answered without usage");
+    assert_eq!(orch.run_cost_usd(), 0.0);
+    assert!(
+        cost_limits(&events).is_empty(),
+        "an unpriced run must not emit CostLimitExceeded"
+    );
+}
+
+/// `run_cost_usd` is per run, not per session: a second run starts at zero.
+#[test]
+fn run_cost_resets_between_runs() {
+    let mut first = support::text_response("first");
+    first.usage = Some(support::usage(10_000, 1_000));
+    let mut second = support::text_response("second");
+    second.usage = Some(support::usage(20_000, 2_000));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![first, second]));
+    let mut orch = ceiling_orchestrator(provider);
+    orch.set_max_cost_usd(Some(5.0));
+
+    orch.run("one").unwrap();
+    assert!((orch.run_cost_usd() - support::sonnet_cost(10_000, 1_000)).abs() < 1e-9);
+
+    orch.run("two").unwrap();
+    assert!(
+        (orch.run_cost_usd() - support::sonnet_cost(20_000, 2_000)).abs() < 1e-9,
+        "the accumulator must restart every run, got {}",
+        orch.run_cost_usd()
+    );
+}

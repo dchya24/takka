@@ -61,6 +61,9 @@ impl Orchestrator {
             self.check_attachment_capability(&attachments)?;
         }
 
+        // The spend ceiling guards one user turn: start each run at zero.
+        self.reset_run_cost();
+
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
         } else {
@@ -181,6 +184,10 @@ impl Orchestrator {
                     cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 });
             }
+            // Spend ceiling: price this call and remember whether it pushed
+            // the run over. The stop itself happens further down, after
+            // this turn's work is finished (see `cost_limit_stop`).
+            let cost_limit_reached = Self::accumulate_usage_cost(self, response.usage.as_ref());
 
             // Forced finalization: accept whatever text the model returns
             // as the final answer and terminate. (Tools were stripped, so
@@ -251,6 +258,11 @@ impl Orchestrator {
                     })
                     .collect();
                 self.handle_tool_calls(&content, &tool_calls);
+
+                if let Some(answer) = self.cost_limit_stop(cost_limit_reached) {
+                    sync::lock(&self.memory).add_message(Message::assistant(&content));
+                    return Ok(answer);
+                }
             } else {
                 // No tool calls - model produced a final answer
                 // Clear loop detection history for the next user turn
@@ -265,6 +277,10 @@ impl Orchestrator {
                 }
 
                 sync::lock(&self.memory).add_message(Message::assistant(&content));
+
+                if self.cost_limit_stop(cost_limit_reached).is_some() {
+                    return Ok(content);
+                }
 
                 self.set_state(OrchestratorState::Completed);
                 return Ok(content);
@@ -319,6 +335,9 @@ impl Orchestrator {
         if !attachments.is_empty() {
             self.check_attachment_capability(&attachments)?;
         }
+
+        // The spend ceiling guards one user turn: start each run at zero.
+        self.reset_run_cost();
 
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
@@ -486,7 +505,7 @@ impl Orchestrator {
                 &content_buf,
                 &accumulated_tool_calls,
             );
-            if let Some(usage) = stream_usage {
+            if let Some(usage) = &stream_usage {
                 self.events.emit(crate::events::Event::Usage {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
@@ -494,6 +513,11 @@ impl Orchestrator {
                     cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 });
             }
+            // Spend ceiling: price this call and remember whether it pushed
+            // the run over. The stop itself happens further down, after
+            // this turn's work is finished (see `cost_limit_stop`) — never
+            // mid-stream.
+            let cost_limit_reached = Self::accumulate_usage_cost(self, stream_usage.as_ref());
 
             // Forced finalization: accept whatever text the model returns
             // as the final answer and terminate. (Tools were stripped, so
@@ -549,6 +573,11 @@ impl Orchestrator {
 
                 self.handle_tool_calls_parallel(&content_buf, &accumulated_tool_calls)
                     .await;
+
+                if let Some(answer) = self.cost_limit_stop(cost_limit_reached) {
+                    sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
+                    return Ok(answer);
+                }
                 continue;
             }
 
@@ -566,6 +595,10 @@ impl Orchestrator {
 
             sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
 
+            if self.cost_limit_stop(cost_limit_reached).is_some() {
+                return Ok(content_buf);
+            }
+
             self.set_state(OrchestratorState::Completed);
 
             return Ok(content_buf);
@@ -575,6 +608,58 @@ impl Orchestrator {
     /// Internal helper: returns true when cancel was requested.
     pub(super) fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Price one provider usage report against the model's list price and
+    /// add it to the run total. Returns `true` when the run has now crossed
+    /// `agent.max_cost_usd`.
+    ///
+    /// Unknown models have no list price, so nothing is added and the
+    /// ceiling stays unevaluated (fail-open — a wrong guess must never stop
+    /// a run the user did not actually overspend). Providers that report no
+    /// usage at all land here too, with the same outcome.
+    fn accumulate_usage_cost(&self, usage: Option<&crate::providers::ChatUsage>) -> bool {
+        let Some(usage) = usage else {
+            return false;
+        };
+        let Some(price) = crate::pricing::lookup(&self.model) else {
+            tracing::debug!(
+                model = %self.model,
+                "no list price for model; spend ceiling cannot be evaluated"
+            );
+            return false;
+        };
+        let cost = price.cost_usd(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cache_read_input_tokens.unwrap_or(0),
+            usage.cache_creation_input_tokens.unwrap_or(0),
+        );
+        self.record_run_cost(cost)
+    }
+
+    /// Stop the run when the ceiling was crossed.
+    ///
+    /// Called at the turn's *completion* boundaries only — after the tool
+    /// batch a tool-call turn requested has finished executing, or on a
+    /// final text answer. Never inside the provider stream, so an in-flight
+    /// call is always paid for and answered before the loop closes. The
+    /// answer produced so far is still returned (`Ok`), because stopping on
+    /// budget is a policy outcome, not a failure.
+    fn cost_limit_stop(&self, crossed: bool) -> Option<String> {
+        let max = self.max_cost_usd?;
+        if !crossed {
+            return None;
+        }
+        let spent = self.run_cost_usd();
+        tracing::warn!(max, spent, "agent run stopped at agent.max_cost_usd");
+        self.clear_loop_detection();
+        self.events.emit(crate::events::Event::CostLimitExceeded {
+            max_cost_usd: max,
+            spent_usd: spent,
+        });
+        self.set_state(OrchestratorState::Completed);
+        Some(String::new())
     }
 
     /// Steering poll (Fase 2b): called once per iteration boundary —
