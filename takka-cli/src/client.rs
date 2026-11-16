@@ -9,21 +9,19 @@ use takka_core::runtime::protocol::{
     PROTOCOL_VERSION,
 };
 use takka_core::runtime::transport::MemoryTransport;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc as tokio_mpsc;
 
-#[cfg(unix)]
-use tokio::net::UnixStream;
-
-/// Single clearinghouse message for the unsupported-platform guard of
-/// [`AgentConnection::connect_daemon`] (Windows: named pipes are a
-/// documented TODO). Kept platform-unconditional so the guard branch
-/// and its test compile — and run — on every CI host (same pattern as
-/// `takka-runtime`'s `not_supported_error`).
-#[cfg_attr(unix, allow(dead_code))]
+/// Single clearinghouse message for the platforms where daemon mode has
+/// no transport. Windows named pipes are implemented (H-07), so this is
+/// now reachable only on hosts that are neither unix nor windows; kept
+/// platform-unconditional so its contract test compiles — and runs — on
+/// every CI host (same pattern as `takka-runtime`'s
+/// `not_supported_error`).
+#[cfg_attr(any(unix, windows), allow(dead_code))]
 pub(crate) const DAEMON_NOT_SUPPORTED_MESSAGE: &str =
-    "daemon mode not supported on Windows yet — use --runtime embedded|spawn";
+    "daemon mode not supported on this platform — use --runtime embedded|spawn";
 
 /// Actionable error when discovery finds no usable daemon and spawning
 /// is not allowed (the `attach` path). Asserted verbatim by a unit test.
@@ -36,13 +34,13 @@ pub(crate) const NO_DAEMON_MESSAGE: &str =
 /// runners (observed: "daemon info file did not appear within 10s" in
 /// run 42601781829); the bound is startup plumbing, not the thing
 /// under test.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const DAEMON_SPAWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Upper bound for the shutdown retry loop against a busy broker (the
 /// previous connection's slot clears within milliseconds of its EOF;
 /// the bound only covers pathological cases).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const DAEMON_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Transport-agnostic IO surface shared by both connection modes, so the
@@ -522,28 +520,32 @@ impl ConnectionIo for InProcessClient {
     }
 }
 
-/// Async-native unix-socket connection to the daemon broker (Fase 3a).
-/// Same line framing and protocol-version check as the spawned-mode
-/// stdio client, but over the split halves of a `tokio::net::UnixStream`
+/// Async connection to the daemon broker (Fase 3a). Same line framing
+/// and protocol-version check as the spawned-mode stdio client, but over
+/// the local transport — a unix socket on unix, a named pipe on Windows
 /// (the broker's one-JSON-per-line framing, see its `write_frame` /
 /// `pump_requests`).
-#[cfg(unix)]
+///
+/// One duplex object rather than two halves: a Windows pipe handle is a
+/// single `AsyncRead + AsyncWrite` value, and the connection only ever
+/// alternates between writing a request and reading the next frame, so a
+/// split buys nothing. Incoming bytes are buffered per line.
+#[cfg(any(unix, windows))]
 pub struct DaemonConnection {
-    lines: Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    transport: Duplex,
+    pending: Vec<u8>,
     sequence: u64,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl DaemonConnection {
-    /// Wrap an already-connected socket. Handshake is done by the caller
-    /// (so [`AgentConnection::connect_daemon_at`] can reuse its
-    /// liveness-probe stream instead of reconnecting).
-    fn from_stream(stream: UnixStream) -> Self {
-        let (read_half, write_half) = stream.into_split();
+    /// Wrap an already-connected transport. Handshake is done by the
+    /// caller (so [`AgentConnection::connect_daemon_at`] can reuse its
+    /// liveness-probe connection instead of reconnecting).
+    fn new(transport: Duplex) -> Self {
         Self {
-            lines: BufReader::new(read_half).lines(),
-            writer: write_half,
+            transport,
+            pending: Vec::new(),
             sequence: 0,
         }
     }
@@ -554,14 +556,33 @@ impl DaemonConnection {
         let envelope = ProtocolRequest::new(id.clone(), request);
         let mut bytes = serde_json::to_vec(&envelope)?;
         bytes.push(b'\n');
-        self.writer.write_all(&bytes).await?;
-        self.writer.flush().await?;
+        self.transport.write_all(&bytes).await?;
+        self.transport.flush().await?;
         Ok(id)
+    }
+
+    /// Next newline-delimited frame. Bytes the transport delivered past
+    /// the frame boundary stay buffered for the following call.
+    async fn next_line(&mut self) -> Result<Option<String>> {
+        loop {
+            if let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = self.pending.drain(..=newline).collect();
+                let text = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                return Ok(Some(text));
+            }
+            let mut chunk = [0u8; 8192];
+            let read = self.transport.read(&mut chunk).await?;
+            if read == 0 {
+                // EOF with a partial frame left over is still EOF: the
+                // broker never sends a frame without its newline.
+                return Ok(None);
+            }
+            self.pending.extend_from_slice(&chunk[..read]);
+        }
     }
 
     pub async fn next_event(&mut self) -> Result<ProtocolEvent> {
         let line = self
-            .lines
             .next_line()
             .await?
             .ok_or_else(|| anyhow!("daemon closed the connection"))?;
@@ -585,12 +606,12 @@ impl DaemonConnection {
     /// the socket + info files.
     pub async fn shutdown(&mut self) -> Result<()> {
         let _ = self.send(Request::Shutdown).await?;
-        self.writer.shutdown().await?;
+        self.transport.shutdown().await?;
         Ok(())
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ConnectionIo for DaemonConnection {
     fn raw_send(&mut self, request: Request) -> impl Future<Output = Result<String>> + Send {
         self.send(request)
@@ -611,8 +632,9 @@ pub enum RuntimeMode {
     /// Spawn the `takka-runtime` daemon subprocess (JSONL over stdio).
     Spawn,
     /// Attach to an external `takka-runtime --daemon` broker over its
-    /// unix socket (discovery via `daemon.json`, auto-spawn on miss).
-    /// Unix only — other hosts get [`DAEMON_NOT_SUPPORTED_MESSAGE`].
+    /// local socket — a unix socket on unix, a named pipe on Windows
+    /// (discovery via `daemon.json`, auto-spawn on miss). Hosts with
+    /// neither transport get [`DAEMON_NOT_SUPPORTED_MESSAGE`].
     Daemon,
 }
 
@@ -622,10 +644,13 @@ pub enum RuntimeMode {
 pub enum AgentConnection {
     Spawned(Box<RuntimeClient>),
     InProcess(InProcessClient),
-    /// Attached to the external daemon broker over its unix socket
-    /// (unix only; Windows named pipes are a documented TODO —
-    /// [`AgentConnection::connect_daemon`] guards that path).
-    #[cfg(unix)]
+    /// Attached to the external daemon broker over its local socket
+    /// (unix socket / Windows named pipe, see [`connect_daemon`]'s
+    /// transport seam); other hosts get
+    /// [`DAEMON_NOT_SUPPORTED_MESSAGE`].
+    ///
+    /// [`connect_daemon`]: AgentConnection::connect_daemon
+    #[cfg(any(unix, windows))]
     Daemon(DaemonConnection),
 }
 
@@ -652,10 +677,11 @@ impl AgentConnection {
     /// the `attach` command). `spawn_if_missing` auto-launches the
     /// runtime binary as a daemon when discovery finds no live one — the
     /// attach command passes `false` (an attach that starts its own
-    /// daemon would be a run in disguise). Unix-only: on other hosts this
-    /// returns [`DAEMON_NOT_SUPPORTED_MESSAGE`], the single actionable
-    /// guard asserted verbatim by a platform-independent unit test.
-    #[cfg(unix)]
+    /// daemon would be a run in disguise). Hosts with neither a unix
+    /// socket nor named pipes return [`DAEMON_NOT_SUPPORTED_MESSAGE`],
+    /// the single actionable guard asserted verbatim by a
+    /// platform-independent unit test.
+    #[cfg(any(unix, windows))]
     pub async fn connect_daemon(
         overrides: InitOverrides,
         caps: ConnectionCapabilities,
@@ -664,9 +690,9 @@ impl AgentConnection {
         Self::connect_daemon_at(&daemon_info_path(), overrides, caps, spawn_if_missing).await
     }
 
-    /// Non-unix stub for [`Self::connect_daemon`]: daemon mode is
-    /// Unix-only; the actionable message is the contract.
-    #[cfg(not(unix))]
+    /// Stub for hosts with no daemon transport; the actionable message
+    /// is the contract.
+    #[cfg(not(any(unix, windows)))]
     pub async fn connect_daemon(
         _overrides: InitOverrides,
         _caps: ConnectionCapabilities,
@@ -679,7 +705,7 @@ impl AgentConnection {
     /// seam that keeps the daemon path hermetically testable (end-to-end
     /// smokes point it at a tempdir fixture) and lets `attach` honor a
     /// per-Commands override.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) async fn connect_daemon_at(
         info_path: &Path,
         overrides: InitOverrides,
@@ -703,15 +729,15 @@ impl AgentConnection {
         let mut info = info.ok_or_else(|| anyhow!(NO_DAEMON_MESSAGE))?;
 
         // 4) Liveness: the info file can outlive its daemon, so a failed
-        //    socket connect is the stale signal (portable, race-free;
+        //    transport connect is the stale signal (portable, race-free;
         //    stale → unlink and respawn once when allowed).
-        let stream = match UnixStream::connect(&info.socket_path).await {
-            Ok(stream) => stream,
+        let transport = match connect_transport(&info.socket_path).await {
+            Ok(transport) => transport,
             Err(_) if spawn_if_missing => {
                 let _ = std::fs::remove_file(info_path); // stale info (best-effort)
                 spawn_daemon_process(info_path)?;
                 info = wait_for_daemon_info(info_path).await?;
-                UnixStream::connect(&info.socket_path)
+                connect_transport(&info.socket_path)
                     .await
                     .with_context(|| {
                         format!(
@@ -729,7 +755,7 @@ impl AgentConnection {
         // 5) Token handshake: Init carries the info file's shared
         //    secret; the engine rejects mismatches with `unauthorized`
         //    before touching any session state.
-        let mut connection = DaemonConnection::from_stream(stream);
+        let mut connection = DaemonConnection::new(transport);
         perform_handshake(&mut connection, overrides, caps, Some(info.token)).await?;
         Ok(Self::Daemon(connection))
     }
@@ -738,7 +764,7 @@ impl AgentConnection {
         match self {
             Self::Spawned(client) => client.send(request).await,
             Self::InProcess(client) => client.send(request).await,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Daemon(client) => client.send(request).await,
         }
     }
@@ -747,7 +773,7 @@ impl AgentConnection {
         match self {
             Self::Spawned(client) => client.next_event().await,
             Self::InProcess(client) => client.next_event().await,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Daemon(client) => client.next_event().await,
         }
     }
@@ -795,7 +821,7 @@ impl AgentConnection {
         match self {
             Self::Spawned(client) => client.shutdown().await,
             Self::InProcess(client) => client.shutdown().await,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Daemon(client) => client.shutdown().await,
         }
     }
@@ -810,6 +836,175 @@ impl ConnectionIo for AgentConnection {
         self.next_event()
     }
 }
+
+// ---------------------------------------------------------------------
+// Daemon transport seam (H-07): the only platform-specific client code.
+// ---------------------------------------------------------------------
+//
+// Everything above is transport-agnostic (framing, handshake, shutdown
+// retry). The seam is one async function — connect to the broker's
+// endpoint and hand back a reader half plus a writer half — with a
+// `unix` and a `windows` implementation.
+//
+// Windows uses real named pipes, never a TCP socket: a loopback port is
+// reachable by every local user and by any process that can bind it,
+// which would widen the local attack surface the shared-secret handshake
+// exists to close.
+//
+// The handshake itself is NOT duplicated: `connect_daemon_at` and
+// `shutdown_daemon_at` build a `DaemonConnection` from whatever halves
+// the seam returns and run the same `perform_handshake` with the same
+// discovery-file token on both platforms.
+
+/// One connected duplex endpoint: a unix socket or a named-pipe handle.
+/// A supertrait keeps both halves behind a single trait object (Rust
+/// allows only one non-auto trait per `dyn`).
+#[cfg(any(unix, windows))]
+pub(crate) trait DuplexStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
+#[cfg(unix)]
+impl DuplexStream for tokio::net::UnixStream {}
+#[cfg(windows)]
+impl DuplexStream for tokio::fs::File {}
+
+#[cfg(any(unix, windows))]
+pub(crate) type Duplex = Box<dyn DuplexStream>;
+
+/// Unix end of the seam: tokio's event-driven `UnixStream`, which is
+/// already `AsyncRead + AsyncWrite`.
+#[cfg(unix)]
+pub(crate) mod transport {
+    use super::*;
+
+    pub async fn connect(endpoint: &str) -> Result<Duplex> {
+        let stream = tokio::net::UnixStream::connect(endpoint).await?;
+        Ok(Box::new(stream))
+    }
+}
+
+/// Windows end of the seam: a named pipe opened with a duplex
+/// `CreateFileW` handle and bridged into tokio by `tokio::fs::File`.
+///
+/// Why this shape:
+/// - the runtime broker already creates the pipe with
+///   `tokio::net::windows::named_pipe`, but the client crate only needs
+///   to *open* one, and `ClientOptions` gives no way to obtain the
+///   reader/writer halves the `DaemonConnection` wants while also
+///   retrying on `ERROR_PIPE_BUSY` (`WaitNamedPipeW` semantics);
+/// - `tokio::fs::File::from_std` drives any handle tokio's blocking pool
+///   can block on, so a duplex pipe is a valid `AsyncRead + AsyncWrite`
+///   with no overlapped-IOCP plumbing and no new dependency;
+/// - the handle is opened with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`
+///   so a malicious program that renames the pipe cannot impersonate the
+///   user through this connection (the caveat tokio's own
+///   `OpenOptions::security_qos_flags` documents).
+///
+/// Deliberately minimal: compile-checked by
+/// `cargo check --target x86_64-pc-windows-gnu` and never yet run on a
+/// real Windows host (H-07 report).
+#[cfg(windows)]
+mod transport {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::time::Duration;
+
+    const PIPE_PREFIX: &str = r"\\.\pipe\";
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    /// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` — the client can
+    /// identify the server but never impersonate it.
+    const SECURITY_IDENTIFICATION: u32 = 0x0010_0000 | 0x0001_0000;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    /// `ERROR_PIPE_BUSY`: a server exists but every instance is serving.
+    /// The only retryable failure — anything else (notably "file not
+    /// found") means no daemon and must surface immediately.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    /// Upper bound on waiting for a free instance. Comfortably inside the
+    /// spawn budget, so a saturated pipe fails as "busy" rather than
+    /// silently hanging the CLI.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security_attributes: *mut core::ffi::c_void,
+            creation: u32,
+            flags: u32,
+            template: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// Discovery files carry the endpoint as the broker was configured —
+    /// a bare pipe name or a full `\\.\pipe\<name>` path. A bare name is
+    /// qualified with the local pipe root; both forms then go through the
+    /// same `CreateFileW`.
+    fn pipe_path(endpoint: &str) -> Vec<u16> {
+        let name = if endpoint.starts_with(PIPE_PREFIX) {
+            endpoint.to_string()
+        } else {
+            format!("{PIPE_PREFIX}{endpoint}")
+        };
+        OsStr::new(&name).encode_wide().chain([0]).collect()
+    }
+
+    pub async fn connect(endpoint: &str) -> Result<Duplex> {
+        let name = pipe_path(endpoint);
+        let deadline = std::time::Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            // SAFETY: NUL-terminated UTF-16 name that outlives the call;
+            // no security attributes and no template, OPEN_EXISTING on a
+            // server pipe returns the client end or INVALID_HANDLE_VALUE.
+            let raw = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    SECURITY_IDENTIFICATION,
+                    std::ptr::null_mut(),
+                )
+            };
+            if raw as isize != INVALID_HANDLE_VALUE {
+                // SAFETY: `raw` is a valid, exclusively owned handle (the
+                // INVALID_HANDLE_VALUE case returned above).
+                let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+                let file = tokio::fs::File::from_std(std::fs::File::from(handle));
+                return Ok(Box::new(file));
+            }
+            // SAFETY: GetLastError reads this thread's last-error slot.
+            let code = unsafe { GetLastError() } as i32;
+            if code != ERROR_PIPE_BUSY {
+                // No server at all (or a real open failure): fail NOW, so
+                // the caller's stale-discovery-file handling still sees a
+                // dead endpoint instead of a 5s busy wait.
+                return Err(std::io::Error::from_raw_os_error(code).into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(anyhow!(
+                    "daemon pipe {endpoint} stayed busy (every instance in use)"
+                ));
+            }
+            // SAFETY: WaitNamedPipeW only touches the name buffer.
+            unsafe { WaitNamedPipeW(name.as_ptr(), 20) };
+            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+use transport::connect as connect_transport;
 
 pub fn runtime_binary() -> Result<PathBuf> {
     let (value, warned) =
@@ -863,7 +1058,7 @@ pub fn runtime_binary() -> Result<PathBuf> {
 /// guess anyway, since the broker records the real path in the info
 /// file. The child is deliberately detached: the daemon must outlive
 /// this process (tokio's orphan reaper collects it).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn spawn_daemon_process(info_path: &Path) -> Result<()> {
     let binary = runtime_binary()?;
     let socket_path = info_path
@@ -888,7 +1083,7 @@ fn spawn_daemon_process(info_path: &Path) -> Result<()> {
 /// Poll for the discovery file of a freshly spawned daemon. The broker
 /// writes it after binding the listener, so a parsed info file means the
 /// socket is ready to accept. Bounded by [`DAEMON_SPAWN_TIMEOUT`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn wait_for_daemon_info(info_path: &Path) -> Result<DaemonInfo> {
     let deadline = tokio::time::Instant::now() + DAEMON_SPAWN_TIMEOUT;
     loop {
@@ -917,7 +1112,7 @@ async fn wait_for_daemon_info(info_path: &Path) -> Result<DaemonInfo> {
 /// refused connection), so a blind write would silently lose the
 /// request. We detect that frame and retry until the previous
 /// connection's slot clears (bounded by [`DAEMON_SHUTDOWN_TIMEOUT`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
     let info = match parse_daemon_info(info_path) {
         Ok(info) => info,
@@ -935,8 +1130,8 @@ pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
     // stable regardless of which path the broker/OS takes.
     let busy = || anyhow!("daemon busy: another client is attached; detach it and retry shutdown");
     loop {
-        let stream = match UnixStream::connect(&info.socket_path).await {
-            Ok(stream) => stream,
+        let transport = match connect_transport(&info.socket_path).await {
+            Ok(transport) => transport,
             Err(_) => {
                 return Err(anyhow!(
                     "{} (stale discovery file at {} — its daemon is gone)",
@@ -945,7 +1140,7 @@ pub(crate) async fn shutdown_daemon_at(info_path: &Path) -> Result<()> {
                 ))
             }
         };
-        let mut connection = DaemonConnection::from_stream(stream);
+        let mut connection = DaemonConnection::new(transport);
         // The refusing broker writes its `daemon in use` frame and closes the
         // socket without spawning a reader. A fast writer can race that close
         // and observe EPIPE instead of the frame; the request was not

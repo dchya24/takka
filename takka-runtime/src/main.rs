@@ -77,7 +77,12 @@ fn parse_acp_flags(args: &[String]) -> Result<acp::AcpConfig, String> {
 /// `--daemon [--socket-path P] [--info-path P]` — hand-parsed (the
 /// runtime binary deliberately has no clap dependency). Diverges on
 /// every path, hence `!`.
-#[cfg(unix)]
+///
+/// Compiled on unix and Windows: both have a local transport (unix
+/// socket / named pipe, see `daemon::platform`), and `--socket-path`
+/// takes a socket path on unix and a pipe name (or `\\.\pipe\<name>`)
+/// on Windows.
+#[cfg(any(unix, windows))]
 fn run_daemon(args: &[String]) -> ! {
     let config = parse_daemon_flags(args).unwrap_or_else(|message| {
         eprintln!("{message}");
@@ -92,25 +97,32 @@ fn run_daemon(args: &[String]) -> ! {
     }
 }
 
-#[cfg(not(unix))]
+/// Platforms with neither a unix socket nor named pipes: one actionable
+/// line instead of a silently dead broker.
+#[cfg(not(any(unix, windows)))]
 fn run_daemon(args: &[String]) -> ! {
     let _ = args;
     eprintln!("{}", daemon::not_supported_error());
     std::process::exit(1);
 }
 
-/// Default socket lives next to the discovery file so both disappear
-/// together; the pid suffix keeps parallel daemons from colliding.
-#[cfg(unix)]
+/// Directory holding the default socket name and the discovery file
+/// (`takka-cli`'s `daemon_info_path` pins the same value). Windows reads
+/// `USERPROFILE` where unix reads `HOME`, so both branches are kept.
+#[cfg(any(unix, windows))]
 fn daemon_config_dir() -> std::path::PathBuf {
-    match std::env::var_os("HOME") {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    match home {
         Some(home) => std::path::PathBuf::from(home).join(".config").join("takka"),
         None => std::env::temp_dir().join("takka-daemon"),
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_daemon_flags(args: &[String]) -> Result<daemon::DaemonConfig, String> {
+    // Same stem on both transports: a socket file on unix, a named pipe
+    // (`\\.\pipe\takka-takka-daemon-<pid>`, see
+    // `daemon::platform::pipe_name`) on Windows.
     let mut socket_path =
         daemon_config_dir().join(format!("takka-daemon-{}.sock", std::process::id()));
     let mut info_path = daemon_config_dir().join("daemon.json");
@@ -137,7 +149,7 @@ fn parse_daemon_flags(args: &[String]) -> Result<daemon::DaemonConfig, String> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn flag_value(args: &[String], index: usize, flag: &str) -> Result<std::path::PathBuf, String> {
     args.get(index)
         .map(std::path::PathBuf::from)
