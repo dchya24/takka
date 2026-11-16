@@ -1,8 +1,9 @@
 # Tasks: Agentic Project Overview
 
-**Overview**: Task lists for the agentic CLI + core library
+**Overview**: Task lists for the takka runtime, CLI and core library
+(renamed from `agentic` in the 2026-11 `takka` rebrand)
 **Created**: 2026-04-20
-**Updated**: 2026-06-03
+**Updated**: 2026-11-16
 
 ---
 
@@ -10,8 +11,9 @@
 
 | Crate / surface | Status |
 |-----------------|--------|
-| `core-agentic` library | Foundation complete; ~95% architecture coverage. Module split (memory/orchestrator/safety) + web_search + URL allowlist + cost tracking + apply_patch + injection scanner + planner + skills + **prompt caching** all on `dev`. **Next:** Phase 12 (TBD). |
-| `agentic-cli` binary | Run / interactive / TUI flows complete. Shared widgets stack lands all output through ratatui primitives. `/search` slash command + cost line in status bar + diff preview in confirmation prompt + skills commands + **cache observability**. **Next:** Config wizard cache settings. |
+| `takka-core` library | Foundation complete; ~95% architecture coverage. Orchestrator/safety/memory/toolset hardened through the 2026-11-14 audit: bounded shell tools with timeout/cancel/process-group kill, poisoning-tolerant locks, single token estimator, spend ceiling (`agent.max_cost_usd`). **Open work:** see `docs/ROADMAP.md`. |
+| `takka-runtime` daemon | ACP v1 adapter (PRs #16–#19) + Windows named-pipe transport (PR #26) on `dev`. Note: the Windows path is compile-checked; real-Windows verification pending. |
+| `takka-cli` binary | Run / interactive / TUI flows complete. Shared widgets stack lands all output through ratatui primitives; budget chip + cost-line in the status bar. |
 
 ## Task Files
 
