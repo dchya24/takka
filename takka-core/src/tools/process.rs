@@ -255,7 +255,16 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(out.killed, Some(KillReason::Timeout));
         assert!(!out.success);
-        assert_eq!(out.exit_code, -1);
+        // A killed child's exit code is platform-defined, so both branches
+        // assert the real behaviour rather than skipping the check.
+        // unix: `status.code()` is `None` for a signalled process, so
+        // `run_bounded` reports its -1 sentinel.
+        #[cfg(unix)]
+        assert_eq!(out.exit_code, -1, "unix: a signalled child has no code");
+        // windows: `Child::kill` calls `TerminateProcess(_, 1)`, so the code
+        // is always 1.
+        #[cfg(windows)]
+        assert_eq!(out.exit_code, 1, "windows: TerminateProcess reports 1");
         assert!(
             out.stderr.contains("killed"),
             "stderr should explain the kill: {:?}",
