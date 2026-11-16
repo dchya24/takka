@@ -146,7 +146,7 @@ impl AcpService {
         };
         let session_id = request.session_id.to_string();
         let session = {
-            let sessions = self.sessions.lock().expect("session registry lock");
+            let sessions = lock(&self.sessions);
             sessions.get(&session_id).cloned()
         };
         let Some(session) = session else {
@@ -182,7 +182,7 @@ impl AcpService {
         // it (the busy gate above proves no turn is in flight, and a new
         // prompt cannot be dispatched while this handler runs on the framing
         // loop).
-        let receiver = match session.events.lock().expect("session events lock").take() {
+        let receiver = match lock(&session.events).take() {
             Some(receiver) => receiver,
             None => {
                 return Err(internal_error("session engine stream is not available"));
@@ -194,7 +194,7 @@ impl AcpService {
             Request::SetPermissionMode { mode },
         ));
         if sent.is_err() {
-            *session.events.lock().expect("session events lock") = Some(receiver);
+            *lock(&session.events) = Some(receiver);
             return Err(internal_error("runtime engine died before the mode switch"));
         }
 
@@ -227,10 +227,9 @@ impl AcpService {
             }
         }
         // Park the stream back so the next prompt can run.
-        *session.events.lock().expect("session events lock") = Some(receiver);
+        *lock(&session.events) = Some(receiver);
         if ack.is_ok() {
-            *session.current_mode.lock().expect("current mode lock") =
-                permission_mode_id(mode).to_string();
+            *lock(&session.current_mode) = permission_mode_id(mode).to_string();
         }
         ack
     }
@@ -250,7 +249,7 @@ impl AcpService {
         };
         let session_id = request.session_id.to_string();
         let session = {
-            let sessions = self.sessions.lock().expect("session registry lock");
+            let sessions = lock(&self.sessions);
             sessions.get(&session_id).cloned()
         };
         let Some(session) = session else {
@@ -299,7 +298,7 @@ impl AcpService {
                 if session.busy.load(Ordering::SeqCst) {
                     return RouteOutcome::Error(busy_error(&session.id));
                 }
-                let receiver = match session.events.lock().expect("session events lock").take() {
+                let receiver = match lock(&session.events).take() {
                     Some(receiver) => receiver,
                     None => {
                         return RouteOutcome::Error(internal_error(
@@ -315,7 +314,7 @@ impl AcpService {
                     },
                 ));
                 if sent.is_err() {
-                    *session.events.lock().expect("session events lock") = Some(receiver);
+                    *lock(&session.events) = Some(receiver);
                     return RouteOutcome::Error(internal_error(
                         "runtime engine died before the model switch",
                     ));
@@ -329,8 +328,7 @@ impl AcpService {
                     match receiver.recv_timeout(remaining) {
                         Ok(event) => match &event.event {
                             takka_core::Event::SessionModelChanged { provider, model } => {
-                                *session.current_model.lock().expect("current model lock") =
-                                    format!("{provider}/{model}");
+                                *lock(&session.current_model) = format!("{provider}/{model}");
                                 session.context_size.store(
                                     u64::from(model_max_tokens(&config, provider, model)),
                                     Ordering::SeqCst,
@@ -353,7 +351,7 @@ impl AcpService {
                         }
                     }
                 }
-                *session.events.lock().expect("session events lock") = Some(receiver);
+                *lock(&session.events) = Some(receiver);
                 if let Err(error) = ack {
                     return RouteOutcome::Error(error);
                 }
@@ -364,16 +362,8 @@ impl AcpService {
                 )));
             }
         }
-        let current_model = session
-            .current_model
-            .lock()
-            .expect("current model lock")
-            .clone();
-        let current_mode = session
-            .current_mode
-            .lock()
-            .expect("current mode lock")
-            .clone();
+        let current_model = lock(&session.current_model).clone();
+        let current_mode = lock(&session.current_mode).clone();
         let config = self.adapter_config();
         let options = match &config {
             Some(config) => build_config_options(config, &current_model, &current_mode),
@@ -425,7 +415,7 @@ impl AcpService {
         }
 
         {
-            let sessions = self.sessions.lock().expect("session registry lock");
+            let sessions = lock(&self.sessions);
             if sessions.contains_key(&session_id) {
                 if resume {
                     // The agent kept the session live: just re-attach.
@@ -459,7 +449,7 @@ impl AcpService {
             // its engine) died when this handler returned, and the first
             // prompt after a successful load answered `session not found`.
             // Same EOF-drain guard as `session/new`.
-            let mut registry = self.sessions.lock().expect("session registry lock");
+            let mut registry = lock(&self.sessions);
             if self.closed.load(Ordering::SeqCst) {
                 return RouteOutcome::Error(internal_error("connection is shutting down"));
             }
@@ -479,7 +469,7 @@ impl AcpService {
 
         // Take the parked stream; the replayed history flows out as session
         // updates while the `SessionLoaded` ack is awaited.
-        let receiver = match session.events.lock().expect("session events lock").take() {
+        let receiver = match lock(&session.events).take() {
             Some(receiver) => receiver,
             None => {
                 return RouteOutcome::Error(internal_error(
@@ -525,17 +515,14 @@ impl AcpService {
             }
         }
         // Park the stream back so the next prompt can run.
-        *session.events.lock().expect("session events lock") = Some(receiver);
+        *lock(&session.events) = Some(receiver);
         match ack {
             Ok(()) => RouteOutcome::Reply(load_modes_reply(resume)),
             Err(error) => {
                 // A failed load leaves a useless session: drop the registry
                 // entry so the engine exits with its dropped senders and
                 // the capacity slot is free again.
-                self.sessions
-                    .lock()
-                    .expect("session registry lock")
-                    .remove(&session_id);
+                lock(&self.sessions).remove(&session_id);
                 RouteOutcome::Error(error)
             }
         }

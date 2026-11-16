@@ -61,7 +61,7 @@ impl Writer {
 
 impl AcpSink for Writer {
     fn send_line(&self, frame: &Value) {
-        let mut out = self.out.lock().expect("writer lock");
+        let mut out = lock(&self.out);
         if let Err(error) = write_frame_line(&mut *out, frame) {
             tracing::warn!(%error, "acp: failed to write a frame to stdout");
         }
@@ -205,7 +205,7 @@ mod tests {
         let response = acp.response(42);
         assert_eq!(response["result"]["protocolVersion"], serde_json::json!(1));
 
-        let lines = acp.sink.lines.lock().expect("sink lock");
+        let lines = lock(&acp.sink.lines);
         assert!(
             !lines
                 .iter()

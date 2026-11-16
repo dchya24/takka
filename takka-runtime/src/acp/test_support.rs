@@ -32,14 +32,14 @@ pub(crate) struct VecSink {
 
 impl AcpSink for VecSink {
     fn send_line(&self, frame: &Value) {
-        self.lines.lock().expect("sink lock").push(frame.clone());
+        lock(&self.lines).push(frame.clone());
     }
 }
 
 impl VecSink {
     /// Newest-first lookup of a JSON-RPC response by request id.
     pub(crate) fn response_for(&self, id: i64) -> Option<Value> {
-        let lines = self.lines.lock().expect("sink lock");
+        let lines = lock(&self.lines);
         lines
             .iter()
             .rev()
@@ -49,7 +49,7 @@ impl VecSink {
 
     /// All `session/update` notifications seen so far.
     pub(crate) fn updates(&self) -> Vec<Value> {
-        let lines = self.lines.lock().expect("sink lock");
+        let lines = lock(&self.lines);
         lines
             .iter()
             .filter(|frame| frame.get("method").and_then(Value::as_str) == Some(SESSION_UPDATE))
@@ -61,10 +61,7 @@ impl VecSink {
     pub(crate) fn wait_until(&self, predicate: impl Fn(&Value) -> bool, what: &str) -> Value {
         let deadline = deadline();
         loop {
-            let hit = self
-                .lines
-                .lock()
-                .expect("sink lock")
+            let hit = lock(&self.lines)
                 .iter()
                 .find(|frame| predicate(frame))
                 .cloned();
@@ -567,4 +564,26 @@ pub(crate) fn wait_for_permission_request(acp: &TestAcp) -> Value {
 /// request, so the record is complete when this runs.
 pub(crate) fn seen_requests(receiver: &std::sync::mpsc::Receiver<Request>) -> Vec<Request> {
     receiver.try_iter().collect()
+}
+
+// ------------------------------------------------------------------
+// H-02: poisoned-lock recovery. A panicking holder poisons a bookkeeping
+// mutex; every later reader/writer must recover instead of cascading the
+// panic into unrelated sessions.
+// ------------------------------------------------------------------
+
+/// Take `m`'s guard and panic while holding it, leaving `m` poisoned (the
+/// poisoner's panic is caught so the test process stays clean). The guard
+/// is dropped by the unwinding panic — that is what marks the mutex
+/// poisoned.
+pub(crate) fn poison<T>(m: &Mutex<T>) {
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = m.lock().expect("guard to poison");
+        panic!("poison the mutex on purpose");
+    }));
+    assert!(
+        poisoned.is_err(),
+        "the poisoner must panic while holding the lock"
+    );
+    assert!(m.lock().is_err(), "the mutex should be poisoned");
 }

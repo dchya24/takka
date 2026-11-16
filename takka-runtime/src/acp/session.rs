@@ -169,7 +169,7 @@ impl AcpService {
         // T-04: the capacity slot is claimed at `session/new` — boot
         // failures release it again (nothing is inserted on error).
         {
-            let sessions = self.sessions.lock().expect("session registry lock");
+            let sessions = lock(&self.sessions);
             if sessions.len() >= self.config.max_sessions {
                 return Err(capacity_error(self.config.max_sessions));
             }
@@ -182,7 +182,7 @@ impl AcpService {
             // T-07: the insert must not sneak past the EOF drain — the
             // closed flag is checked under the same lock the insert runs
             // under (see `AcpService::closed`).
-            let mut registry = self.sessions.lock().expect("session registry lock");
+            let mut registry = lock(&self.sessions);
             if self.closed.load(Ordering::SeqCst) {
                 return Err(internal_error("connection is shutting down"));
             }
@@ -192,16 +192,8 @@ impl AcpService {
         let mut response = acp::NewSessionResponse::new(acp::SessionId::new(session_id))
             .modes(session_mode_state());
         if let Some(config) = self.adapter_config() {
-            let current_model = session
-                .current_model
-                .lock()
-                .expect("current model lock")
-                .clone();
-            let current_mode = session
-                .current_mode
-                .lock()
-                .expect("current mode lock")
-                .clone();
+            let current_model = lock(&session.current_model).clone();
+            let current_mode = lock(&session.current_mode).clone();
             response = response.config_options(build_config_options(
                 &config,
                 &current_model,
@@ -277,7 +269,7 @@ impl AcpService {
         // Skip the engine's `Ready` banner; `InitOk` is the first real
         // word. An `Error` event (bad config, no provider, …) is the boot
         // failure and is surfaced verbatim.
-        let evt_rx_guard = session.events.lock().expect("session events lock");
+        let evt_rx_guard = lock(&session.events);
         let deadline = Instant::now() + BOOT_TIMEOUT;
         loop {
             let Some(receiver) = evt_rx_guard.as_ref() else {
@@ -342,7 +334,7 @@ impl AcpService {
         };
         let session_id = request.session_id.to_string();
         let session = {
-            let sessions = self.sessions.lock().expect("session registry lock");
+            let sessions = lock(&self.sessions);
             sessions.get(&session_id).cloned()
         };
         let Some(session) = session else {
@@ -385,7 +377,7 @@ impl AcpService {
             Ok(handle) => {
                 // T-07: park the handle so the EOF teardown can join the
                 // turn bounded.
-                *session.turn.lock().expect("session turn lock") = Some(handle);
+                *lock(&session.turn) = Some(handle);
                 RouteOutcome::Deferred
             }
             Err(error) => {
@@ -408,7 +400,7 @@ impl AcpService {
         };
         let session_id = notification.session_id.to_string();
         let session = {
-            let sessions = self.sessions.lock().expect("session registry lock");
+            let sessions = lock(&self.sessions);
             sessions.get(&session_id).cloned()
         };
         let Some(session) = session else {
@@ -719,15 +711,74 @@ mod tests {
         // the deny is internal, not a response frame to the client.
         // (The request frame itself carries the id; a reply would be a
         // frame with that id and no method.)
-        let replied = acp
-            .sink
-            .lines
-            .lock()
-            .expect("sink lock")
+        let replied = lock(&acp.sink.lines)
             .iter()
             .any(|frame| frame.get("id") == Some(&outbound_id) && frame.get("method").is_none());
         assert!(!replied, "no reply for the abandoned permission frame");
 
         acp.close_and_join();
+    }
+
+    /// H-02: the per-session state mutexes are bookkeeping — a parked
+    /// stream, a mode/model id, a thread handle. A panic while one was
+    /// held must not poison the session for the client: the handler that
+    /// next touches it recovers the guard. Poisoned in place, then the
+    /// real handlers (`session/prompt` parks the turn handle,
+    /// `session/set_mode` reads the stream, `session/new` reads the
+    /// model/mode) must keep working.
+    #[test]
+    fn a_poisoned_session_survives_the_handlers() {
+        let sink = Arc::new(VecSink::default());
+        let service = AcpService::new(
+            AcpConfig {
+                max_sessions: DEFAULT_MAX_SESSIONS,
+                config_path: Some(hermetic_config_path()),
+            },
+            sink.clone(),
+        );
+        let cwd = std::env::current_dir().expect("process cwd");
+        let created = service
+            .session_new(&acp::NewSessionRequest::new(cwd))
+            .expect("session/new boots");
+        let session = lock(&service.sessions)[&created.session_id.to_string()].clone();
+
+        poison(&session.events);
+        poison(&session.current_model);
+        poison(&session.current_mode);
+        poison(&session.turn);
+        poison(&session.engine);
+        assert!(
+            session.events.lock().is_err(),
+            "the event stream lock is poisoned"
+        );
+
+        // `session/prompt` takes the parked stream, parks the turn handle,
+        // and the turn thread answers from the recovered state.
+        let prompt = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": SESSION_PROMPT,
+            "params": {
+                "sessionId": created.session_id.to_string(),
+                "prompt": [{ "type": "text", "text": "hi" }]
+            }
+        });
+        assert!(matches!(
+            service.route_frame(&prompt),
+            RouteOutcome::Deferred
+        ));
+        let response = sink.wait_until(
+            |frame| frame.get("id") == Some(&serde_json::json!(2)),
+            "the turn's response",
+        );
+        // The hermetic provider refuses connections, so the turn ends in a
+        // typed error — not a `PoisonError` panic.
+        assert!(
+            response.get("error").is_some() || response.get("result").is_some(),
+            "the turn must answer: {response}"
+        );
+        // The session survived: the stream is parked back and idle again.
+        assert!(lock(&session.events).is_some(), "the stream is parked back");
+        assert!(!session.busy.load(Ordering::SeqCst));
+
+        service.shutdown();
     }
 }
