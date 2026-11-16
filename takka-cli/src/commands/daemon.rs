@@ -121,7 +121,7 @@ impl Commands {
     }
 }
 
-// ── Daemon-mode e2e smoke (Fase 3a, unix only) ───────────
+// ── Daemon-mode e2e smoke (Fase 3a, unix + windows) ──────
 //
 // The daemon mode of the `--runtime` matrix gets dedicated
 // AgentConnection-level smokes instead of extending the Commands-level
@@ -131,7 +131,13 @@ impl Commands {
 // under parallel cargo test). `AgentConnection::connect_daemon_at` is
 // the same discovery + spawn + token-handshake path the mode flag and
 // `attach` use, pointed at a tempdir fixture.
-#[cfg(all(test, unix))]
+//
+// Windows runs the same tests over the named-pipe transport (H-07): the
+// fixture is endpoint-agnostic — it hands the broker a path and the
+// platform seam turns it into a socket file (unix) or a pipe name
+// (windows). The `any(unix, windows)` gate keeps the module off hosts
+// with neither transport, where `connect_daemon_at` does not exist.
+#[cfg(all(test, any(unix, windows)))]
 mod daemon_smoke_tests {
     use super::*;
     use crate::client::{AgentConnection, CLI_CAPABILITIES};
@@ -141,8 +147,9 @@ mod daemon_smoke_tests {
 
     /// Bound for every poll so a regression can never hang the suite.
     /// macOS CI runners have been observed needing >10s just to bring a
-    /// daemon up when the runner is loaded — the bound is fixture plumbing,
-    /// not the thing under test, so it only needs to be generous.
+    /// daemon up when the runner is loaded — and a cold Windows runner is
+    /// not faster. The bound is fixture plumbing, not the thing under
+    /// test, so it only needs to be generous.
     const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// Hermetic provider config (same shape as `hermetic_runtime_config`):
@@ -178,13 +185,14 @@ mod daemon_smoke_tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            // Path-length discipline: Unix socket paths must stay under
-            // SUN_LEN (104) — macOS runners' tempdir prefix is ~50 chars,
-            // so a long descriptive name + "test.sock" blew the limit
-            // ("path must be shorter than SUN_LEN", every macOS daemon
-            // smoke dead-on-arrival). Short unique dir keeps the socket
-            // path under the limit while pid + truncated nanos separate
-            // test instances; cleanup is per-dir.
+            // Path discipline, per transport: a unix socket path must stay
+            // under SUN_LEN (104) — macOS runners' tempdir prefix is ~50
+            // chars, so a long descriptive name + "test.sock" blew the limit
+            // ("path must be shorter than SUN_LEN", every macOS daemon smoke
+            // dead-on-arrival). A short unique dir keeps the socket path under
+            // the limit while pid + truncated nanos separate test instances;
+            // cleanup is per-dir. Windows turns the same path into a pipe
+            // name from its file stem, so the short dir serves both.
             let dir = std::env::temp_dir().join(format!(
                 "takka-da-{}-{}",
                 std::process::id(),
@@ -193,6 +201,12 @@ mod daemon_smoke_tests {
             std::fs::create_dir_all(&dir).unwrap();
             let config_path = dir.join("config.json");
             std::fs::write(&config_path, HERMETIC_CONFIG).unwrap();
+            // One endpoint path, two transports: a socket file on unix, a
+            // named pipe (`\\.\pipe\takka-test`, derived from the stem by
+            // the runtime's `platform::pipe_name`) on Windows. Neither side
+            // hard-codes `/tmp`: `temp_dir()` is the platform temp dir, which
+            // on Windows is also where the pipe's inherited user-only ACL
+            // comes from.
             let socket_path = dir.join("test.sock");
             let info_path = dir.join("daemon.json");
             let binary = {
@@ -214,7 +228,12 @@ mod daemon_smoke_tests {
                 .stdin(std::process::Stdio::null())
                 // Evidence pinning: a failing start on a CI runner is
                 // invisible with null streams; park both in the fixture
-                // directory so a timeout failure can quote them.
+                // directory so a timeout failure can quote them. Neither
+                // stream may inherit the harness's stdout/stderr handles:
+                // cargo captures those through pipes, and keeping the
+                // child's handles off them is the one Windows convention
+                // that differs (the pipe it uses is derived from
+                // `socket_path`, never from inherited handles).
                 .stdout(std::process::Stdio::from(
                     std::fs::File::create(dir.join("daemon-stdout.log")).unwrap(),
                 ))
