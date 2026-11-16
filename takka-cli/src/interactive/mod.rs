@@ -35,7 +35,7 @@ use ratatui::{
     text::{Line, Span as RSpan},
 };
 use std::io::{self, Stdout, Write};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -44,6 +44,7 @@ use crate::commands::{Commands, QueueMode, TimelineStyle};
 use crate::input_buffer::InputBuffer;
 use crate::input_renderer::{self, PromptMetadata};
 use crate::tui::dropdown::{Dropdown, DropdownType};
+use crate::widgets::budget::budget_chip;
 use crate::widgets::components;
 use crate::widgets::inline;
 use crate::widgets::spinner;
@@ -59,6 +60,9 @@ pub(crate) struct SessionStats {
     pub(crate) total_output_tokens: Arc<AtomicU32>,
     pub(crate) total_cache_read_tokens: Arc<AtomicU32>,
     pub(crate) total_cache_creation_tokens: Arc<AtomicU32>,
+    /// Spend of the current run, in USD (H-06). The ceiling bounds one run,
+    /// so the budget chip reads this, not a session total.
+    pub(crate) run_cost_usd: Arc<AtomicU64>,
     pub(crate) session_start: Instant,
 }
 
@@ -71,6 +75,7 @@ impl SessionStats {
             total_output_tokens: Arc::new(AtomicU32::new(0)),
             total_cache_read_tokens: Arc::new(AtomicU32::new(0)),
             total_cache_creation_tokens: Arc::new(AtomicU32::new(0)),
+            run_cost_usd: Arc::new(AtomicU64::new(0)),
             session_start: Instant::now(),
         }
     }
@@ -86,6 +91,18 @@ impl SessionStats {
         self.total_output_tokens.store(0, Ordering::Relaxed);
         self.total_cache_read_tokens.store(0, Ordering::Relaxed);
         self.total_cache_creation_tokens.store(0, Ordering::Relaxed);
+        self.run_cost_usd.store(0, Ordering::Relaxed);
+    }
+
+    /// Record this run's spend (H-06). F64 has no atomic, so the bits are
+    /// carried in a `u64` — this is display state only.
+    pub(crate) fn set_run_cost_usd(&self, cost: f64) {
+        self.run_cost_usd
+            .store(cost.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn run_cost_usd(&self) -> f64 {
+        f64::from_bits(self.run_cost_usd.load(Ordering::Relaxed))
     }
 
     pub(crate) fn add_tool_calls(&self, n: u32) {

@@ -889,6 +889,19 @@ impl Commands {
             )
         };
         let (measured, prompt_tokens, completion_tokens, cache_read, cache_creation) = usage;
+        // H-06: price this run the way the orchestrator does, so the status
+        // bar's budget chip shows the same remaining figure the ceiling
+        // enforced. Unknown models simply report $0 — no chip movement.
+        let model_id = self
+            .config
+            .active_model()
+            .map(|m| m.model.clone())
+            .unwrap_or_default();
+        let cost_usd = takka_core::pricing::lookup(&model_id)
+            .map(|price| {
+                price.cost_usd(prompt_tokens, completion_tokens, cache_read, cache_creation)
+            })
+            .unwrap_or(0.0);
         self.last_run = RunStats {
             input_chars: task.len(),
             output_chars: 0,
@@ -897,6 +910,7 @@ impl Commands {
             completion_tokens: measured.then_some(completion_tokens),
             cache_read_tokens: cache_read,
             cache_creation_tokens: cache_creation,
+            cost_usd,
         };
 
         match result {

@@ -628,6 +628,12 @@ impl Commands {
         &self.config
     }
 
+    /// Configured spend ceiling for one run (`agent.max_cost_usd`, H-06).
+    /// `None` means unlimited — the default, and the pre-ceiling behaviour.
+    pub fn max_cost_usd(&self) -> Option<f64> {
+        self.config.agent.max_cost_usd.filter(|max| *max > 0.0)
+    }
+
     /// Render the `/image <path>` slash command: load the file, validate
     /// it (size cap + MIME), and queue it for the next user turn. The
     /// next call to `run()` will attach all queued images to the

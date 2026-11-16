@@ -48,7 +48,7 @@ pub(crate) async fn repl_loop(
 
         // ── Print status bar once per prompt cycle ──
         if render.needs_status_bar {
-            print_prompt_status_bar(stats);
+            print_prompt_status_bar(model_info, stats);
 
             // Render active toasts
             if toast_manager.has_toasts() {
@@ -983,6 +983,8 @@ pub(crate) async fn process_message(
         stats.add_cache_read_tokens(run.cache_read_tokens);
         stats.add_cache_creation_tokens(run.cache_creation_tokens);
         stats.add_tool_calls(run.tool_calls);
+        // H-06: the ceiling bounds one run, so the budget chip reads this.
+        stats.set_run_cost_usd(run.cost_usd);
 
         conversation.push(ConversationEntry {
             role: "assistant".into(),

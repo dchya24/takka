@@ -59,6 +59,9 @@ pub struct RunStats {
     /// Prompt-cache reads / writes the provider reported.
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    /// This run's spend in USD (H-06). `0.0` when the model has no known
+    /// list price or the provider reported no usage.
+    pub cost_usd: f64,
 }
 
 impl RunStats {

@@ -73,6 +73,8 @@ pub enum AppMessage {
     ToolDelta { name: String, delta: String },
     /// Provider-reported token usage for one model call.
     Usage { input: u32, output: u32 },
+    /// The run stopped at `agent.max_cost_usd` (H-06).
+    CostLimit { max_cost_usd: f64, spent_usd: f64 },
     /// Plan progress update from the planner agent.
     PlanProgress {
         goal: String,
@@ -196,6 +198,9 @@ pub struct SessionStats {
     pub tool_calls: u32,
     pub tokens_input: u32,
     pub tokens_output: u32,
+    /// Spend of the most recent run, in USD (H-06). The ceiling bounds one
+    /// run, so the budget chip reads this rather than a session total.
+    pub run_cost_usd: f64,
 }
 
 impl SessionStats {
@@ -550,6 +555,33 @@ mod tests {
         );
         // The mid-run buffer cleared.
         assert!(app.mid_run_input.is_empty());
+    }
+
+    /// H-06: a budget stop reaches the log as a system notice naming the
+    /// config key, not as a red error.
+    #[test]
+    fn cost_limit_message_becomes_an_actionable_system_notice() {
+        let (mut app, _commands) = test_app();
+        app.is_loading = true;
+
+        app.tx
+            .send(AppMessage::CostLimit {
+                max_cost_usd: 0.50,
+                spent_usd: 0.62,
+            })
+            .unwrap();
+        app.process_messages();
+
+        let notice = app
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::System && m.content.contains("Spend ceiling"))
+            .unwrap_or_else(|| panic!("expected a system notice, got {:?}", app.messages));
+        assert!(
+            notice.content.contains("agent.max_cost_usd"),
+            "the notice must say how to lift the ceiling: {}",
+            notice.content
+        );
     }
 
     // ── Story 3.1: mid-run completions & idle parity ──

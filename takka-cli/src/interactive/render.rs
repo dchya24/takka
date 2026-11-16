@@ -76,6 +76,8 @@ pub(crate) struct ModelInfo {
     pub(crate) active_skill: Option<String>,
     /// Session skill list (per-instance, Fase D) for the banner.
     pub(crate) available_skills: Vec<(String, String)>,
+    /// `agent.max_cost_usd` for this session, if configured (H-06).
+    pub(crate) max_cost_usd: Option<f64>,
 }
 
 pub(crate) fn get_model_info(commands: &Commands) -> ModelInfo {
@@ -93,6 +95,7 @@ pub(crate) fn get_model_info(commands: &Commands) -> ModelInfo {
         vision_capable: commands.active_model_capabilities().vision,
         active_skill: commands.active_skill_name(),
         available_skills: commands.available_skills(),
+        max_cost_usd: commands.max_cost_usd(),
     }
 }
 
@@ -317,6 +320,7 @@ pub(crate) fn print_status_bar(model_info: &ModelInfo, stats: &SessionStats) {
             RStyle::default().fg(Color::Rgb(186, 85, 211)),
         ),
     ]));
+    print_budget_chip(model_info, stats);
 
     let has_agent_md = model_info.agent_md_name.is_some();
     let has_skill = model_info.active_skill.is_some();
@@ -361,7 +365,7 @@ pub(crate) fn print_status_bar(model_info: &ModelInfo, stats: &SessionStats) {
     inline::print_blank();
 }
 
-pub(crate) fn print_prompt_status_bar(stats: &SessionStats) {
+pub(crate) fn print_prompt_status_bar(model_info: &ModelInfo, stats: &SessionStats) {
     let in_tok = stats.format_tokens(stats.total_input_tokens());
     let out_tok = stats.format_tokens(stats.total_output_tokens());
     let total_tok = stats.total_input_tokens() + stats.total_output_tokens();
@@ -403,7 +407,30 @@ pub(crate) fn print_prompt_status_bar(stats: &SessionStats) {
         ));
     }
 
+    // H-06: remaining budget for this run. Hidden when no ceiling is set.
+    if let Some(chip) = budget_chip(model_info.max_cost_usd, stats.run_cost_usd()) {
+        spans.push(sep.clone());
+        spans.push(RSpan::styled(chip, budget_chip_style()));
+    }
+
     inline::print_line(&Line::from(spans));
+}
+
+/// One budget chip span handler for both status bars.
+fn budget_chip_style() -> RStyle {
+    RStyle::default().fg(Color::Rgb(241, 196, 15))
+}
+
+/// `agent.max_cost_usd` chip for the banner status bar: a second line under
+/// the model/token row, so the banner keeps its width when no ceiling is
+/// configured.
+fn print_budget_chip(model_info: &ModelInfo, stats: &SessionStats) {
+    if let Some(chip) = budget_chip(model_info.max_cost_usd, stats.run_cost_usd()) {
+        inline::print_line(&Line::from(vec![
+            RSpan::raw("  "),
+            RSpan::styled(chip, budget_chip_style()),
+        ]));
+    }
 }
 
 pub(crate) fn print_response_summary(stats: &SessionStats) {

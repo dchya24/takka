@@ -211,6 +211,14 @@ impl App {
         }
     }
 
+    /// H-06: remaining-budget chip for the header, or `None` when no
+    /// `agent.max_cost_usd` is configured (the default: unlimited).
+    pub fn budget_chip(&self) -> Option<String> {
+        let cmds_arc = self.commands.as_ref()?;
+        let max = cmds_arc.try_lock().ok()?.max_cost_usd()?;
+        crate::widgets::budget::budget_chip(Some(max), self.stats.run_cost_usd)
+    }
+
     /// Open session list view
     pub(crate) fn open_sessions(&mut self) {
         match session::list() {

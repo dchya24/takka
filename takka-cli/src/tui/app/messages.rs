@@ -57,6 +57,11 @@ impl App {
                             content,
                             timestamp: chrono::Local::now(),
                         });
+                        // H-06: refresh the run's spend so the header's budget
+                        // chip reflects what the ceiling just measured.
+                        if let Some(cmds) = self.commands.as_ref().and_then(|c| c.try_lock().ok()) {
+                            self.stats.run_cost_usd = cmds.last_run_stats().cost_usd;
+                        }
                     }
                     AppMessage::Error(err) => {
                         self.is_loading = false;
@@ -152,6 +157,18 @@ impl App {
                     } => {
                         self.progress
                             .set_message(format!("Plan: {} — {}", current_step, step_status,));
+                    }
+                    AppMessage::CostLimit {
+                        max_cost_usd,
+                        spent_usd,
+                    } => {
+                        // A budget stop is a policy outcome, not a failure:
+                        // say so, and say how to lift it.
+                        self.messages.push(Message {
+                            role: MessageRole::System,
+                            content: crate::widgets::budget::stop_notice(max_cost_usd, spent_usd),
+                            timestamp: chrono::Local::now(),
+                        });
                     }
                     AppMessage::Usage { input, output } => {
                         // Real provider numbers — the status bar used to sit at
