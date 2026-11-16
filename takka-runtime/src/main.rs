@@ -120,9 +120,9 @@ fn daemon_config_dir() -> std::path::PathBuf {
 
 #[cfg(any(unix, windows))]
 fn parse_daemon_flags(args: &[String]) -> Result<daemon::DaemonConfig, String> {
-    // Same stem on both transports: a socket file on unix, a named pipe
-    // (`\\.\pipe\takka-takka-daemon-<pid>`, see
-    // `daemon::platform::pipe_name`) on Windows.
+    // One endpoint path, two transports: a socket file on unix, a named
+    // pipe on Windows derived from a hash of the whole path (see
+    // `daemon::platform::pipe_name`).
     let mut socket_path =
         daemon_config_dir().join(format!("takka-daemon-{}.sock", std::process::id()));
     let mut info_path = daemon_config_dir().join("daemon.json");

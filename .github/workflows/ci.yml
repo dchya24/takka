@@ -44,7 +44,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-targets
+      # `--no-fail-fast` so one failing test binary does not hide the
+      # results of the rest (cargo stops at the first failing binary by
+      # default, which made a Windows-only investigation look like the
+      # failure lived in `takka-cli` alone).
+      - run: cargo test --workspace --all-targets --no-fail-fast
 
   # T-08 (ACP design spec §6): CI sanity for the ACP adapter — the
   # hermetic 24-check conformance run over `takka-runtime --acp` on the

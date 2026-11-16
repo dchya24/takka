@@ -21,3 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ACP (Fase 4) — typed wire schema for the Agent Client Protocol v1. Types only:
 # the framing loop lives in src/acp.rs (see the Fase 4 design spec).
 agent-client-protocol-schema = { version = "1.16.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# OS CSPRNG for the auth token. Windows has no stable import library for
+# `ProcessPrng`, so we go through getrandom instead of a hand-rolled `#[link]`.
+getrandom = "0.4"

@@ -256,6 +256,86 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// Named-pipe naming (H-07 follow-up): portable so it is unit-tested on
+// every host, Windows-only in effect.
+// ---------------------------------------------------------------------
+
+/// Derivation of a Windows pipe name from a configured endpoint.
+///
+/// The previous rule reduced the endpoint to its **file stem**
+/// (`…/takka-da-123-456/test.sock` → `\\.\pipe\takka-test`). Every
+/// concurrently running daemon smoke in one test binary therefore chose
+/// the same pipe name, and `FILE_FLAG_FIRST_PIPE_INSTANCE` turned the
+/// losers into `ERROR_ACCESS_DENIED` (os error 5) at bind time — which
+/// the client then swallowed into "no daemon running". The name is now
+/// derived from a hash of the *whole normalized* endpoint, so distinct
+/// endpoints cannot collide and the same endpoint always yields the same
+/// name on both sides.
+///
+/// The derivation is duplicated in `takka-cli`'s `pipe_id` module (the
+/// runtime deliberately has no dependency on the CLI): the two copies
+/// must stay identical — `pipe_name_matches_server_derivation` on the
+/// CLI side pins the same vectors as
+/// `pipe_name_hashing_is_unique_and_stable` here.
+///
+/// `DefaultHasher` is explicitly NOT used: it is not stable across
+/// processes (`RandomState` is randomly seeded), so server and client
+/// would disagree. FNV-1a over the normalized UTF-8 bytes is stable,
+/// dependency-free and deterministic.
+#[cfg(any(test, windows))]
+pub(crate) mod pipe_id {
+    /// Root every local named pipe lives under.
+    pub(crate) const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+    /// Positional 64-bit FNV-1a (offset basis 0xcbf29ce484222325).
+    pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Normalize an endpoint into the string the hash is taken over.
+    ///
+    /// Textual only: `std::fs::canonicalize` would fail for a socket
+    /// path that does not exist yet (the broker mints its endpoint
+    /// *before* binding) and resolves 8.3 short names differently
+    /// depending on the working directory. Both sides see the same
+    /// string (the daemon records `config.socket_path` verbatim in the
+    /// discovery file), so stripping trailing separators, folding
+    /// `/` to `\` and lowercasing (NTFS is case-insensitive; pipe names
+    /// are compared case-insensitively by the object manager) is enough
+    /// to make the mapping stable.
+    pub(crate) fn normalize(endpoint: &str) -> String {
+        let mut text = endpoint.replace('/', r"\");
+        while text.len() > 1 && text.ends_with('\\') {
+            text.pop();
+        }
+        // ASCII-only lowercasing: a non-ASCII path component must hash
+        // identically on both sides, and `to_lowercase`'s Unicode rules
+        // (e.g. Turkish dotless i) would make that posture-dependent.
+        text.make_ascii_lowercase();
+        text
+    }
+
+    /// The pipe name (without the `\\.\pipe\` root) for an endpoint:
+    /// `takka-<hex16>`, where `hex16` is the FNV-1a of the normalized
+    /// endpoint. A caller that already passes a fully qualified
+    /// `\\.\pipe\…` path keeps it verbatim (tests pin names that way).
+    pub(crate) fn pipe_name_for(endpoint: &str) -> String {
+        if endpoint.starts_with(PIPE_PREFIX) {
+            return endpoint.to_string();
+        }
+        format!(
+            "{PIPE_PREFIX}takka-{:016x}",
+            fnv1a64(normalize(endpoint).as_bytes())
+        )
+    }
+}
+
+// ---------------------------------------------------------------------
 // Transport seam (H-07): the only platform-specific code in the broker.
 // ---------------------------------------------------------------------
 
@@ -372,10 +452,14 @@ mod platform {
 /// socket file gets from its directory and the info file from mode 0600.
 /// The token handshake is the second layer and is identical to unix.
 ///
+/// Instances are created with `FILE_FLAG_OVERLAPPED` so
+/// `ConnectNamedPipe` can be polled instead of blocking the accept loop;
+/// reads and writes stay logically blocking by waiting on the same
+/// overlapped operation immediately.
+///
 /// Deliberately minimal: this module is compile-checked by
 /// `cargo check --target x86_64-pc-windows-gnu` and hosts the same
-/// transport tests as unix, but it has NOT been run on a real Windows
-/// host yet (H-07 report).
+/// transport tests as unix. It is exercised by the Windows CI leg.
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -393,6 +477,16 @@ mod platform {
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     /// Refuse to attach to an existing pipe of the same name.
     const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    /// Handle-level async flag. Only `ConnectNamedPipe` is issued
+    /// asynchronously (so `accept()` can poll); the accepted instance
+    /// then does blocking `ReadFile` / `WriteFile` through an
+    /// `OVERLAPPED` with an immediate wait, which Win32 defines as
+    /// "wait for this operation to finish".
+    const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+    /// `ConnectNamedPipe` on an overlapped handle: no client yet.
+    const ERROR_IO_PENDING: i32 = 997;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
     const INVALID_HANDLE_VALUE: isize = -1;
     /// `ConnectNamedPipe` reports a client that connected first this way.
     const ERROR_PIPE_CONNECTED: i32 = 535;
@@ -405,6 +499,68 @@ mod platform {
     /// broker's spawn budget).
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     const CONNECT_RETRY_SLEEP: Duration = Duration::from_millis(20);
+
+    /// `OVERLAPPED` as Win32 lays it out on 64-bit hosts:
+    /// `ULONG_PTR Internal; ULONG_PTR InternalHigh;` then the
+    /// offset/offset-high union, then `HANDLE hEvent`. The extra
+    /// status block in some declarations belongs to the 32-bit variant,
+    /// so there is nothing after `hEvent` here.
+    #[repr(C)]
+    struct OVERLAPPED {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: *mut core::ffi::c_void,
+    }
+
+    /// Owns the `OVERLAPPED`'s event handle: one event per operation, so
+    /// it must be closed or a long-lived daemon leaks a handle per
+    /// connection.
+    struct OverlappedOp {
+        overlapped: OVERLAPPED,
+    }
+
+    impl OverlappedOp {
+        /// A fresh overlapped op with its own manual-reset event, so a
+        /// pending connect (or a read) can be waited on.
+        fn new() -> io::Result<Self> {
+            // SAFETY: NULL attributes/name, manual reset, initially
+            // non-signaled; returns an owned handle or NULL.
+            let event = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+            if event.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                overlapped: OVERLAPPED {
+                    internal: 0,
+                    internal_high: 0,
+                    offset: 0,
+                    offset_high: 0,
+                    event,
+                },
+            })
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
+            std::ptr::from_mut(&mut self.overlapped).cast()
+        }
+
+        fn as_ptr(&self) -> *const OVERLAPPED {
+            std::ptr::from_ref(&self.overlapped)
+        }
+
+        fn event(&self) -> *mut core::ffi::c_void {
+            self.overlapped.event
+        }
+    }
+
+    impl Drop for OverlappedOp {
+        fn drop(&mut self) {
+            // SAFETY: `event` came from CreateEventW and is closed once.
+            unsafe { CloseHandle(self.overlapped.event) };
+        }
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -431,6 +587,19 @@ mod platform {
             flags: u32,
             template: *mut core::ffi::c_void,
         ) -> *mut core::ffi::c_void;
+        fn CreateEventW(
+            attributes: *mut core::ffi::c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut core::ffi::c_void;
+        fn WaitForSingleObject(handle: *mut core::ffi::c_void, milliseconds: u32) -> u32;
+        fn GetOverlappedResult(
+            file: *mut core::ffi::c_void,
+            overlapped: *const OVERLAPPED,
+            transferred: *mut u32,
+            wait: i32,
+        ) -> i32;
         fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
         fn ReadFile(
             file: *mut core::ffi::c_void,
@@ -447,23 +616,16 @@ mod platform {
             overlapped: *mut core::ffi::c_void,
         ) -> i32;
         fn GetLastError() -> u32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
     }
 
-    /// `take.sock` → `\\.\pipe\takka-take`; a value that already looks
-    /// like a pipe path is used verbatim, so a caller (or a test) can pin
-    /// a fully qualified name.
+    /// `…/x/test.sock` → `\\.\pipe\takka-<hex16>`, a hash of the whole
+    /// normalized path (see [`super::pipe_id`]); a value that already
+    /// looks like a pipe path is used verbatim, so a caller (or a test)
+    /// can pin a fully qualified name.
     pub fn pipe_name(path: &Path) -> Vec<u16> {
-        const PIPE_PREFIX: &str = r"\\.\pipe\";
         let text = path.as_os_str().to_string_lossy();
-        let name = if text.starts_with(PIPE_PREFIX) {
-            text.into_owned()
-        } else {
-            let stem = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "daemon".to_string());
-            format!("{PIPE_PREFIX}takka-{stem}")
-        };
+        let name = pipe_id::pipe_name_for(&text);
         OsStr::new(&name).encode_wide().chain([0]).collect()
     }
 
@@ -478,7 +640,12 @@ mod platform {
     }
 
     fn create_instance(name: &[u16], first: bool) -> io::Result<OwnedHandle> {
-        let mut open_mode = PIPE_ACCESS_DUPLEX;
+        // `FILE_FLAG_OVERLAPPED` is what makes `ConnectNamedPipe` not
+        // block: without it `accept()` parked inside the call and the
+        // broker's shutdown flag was never re-read, so a Windows daemon
+        // could not be stopped once it went idle (the four smoke tests
+        // that hung past 60s in run 43797687559).
+        let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
         if first {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
@@ -508,34 +675,62 @@ mod platform {
     /// `"daemon in use"` frame.
     pub struct LocalListener {
         name: Vec<u16>,
-        next: std::sync::Mutex<OwnedHandle>,
+        next: std::sync::Mutex<Armed>,
+    }
+
+    /// The instance waiting for the next client, plus its pending
+    /// overlapped connect (if one has already been issued).
+    struct Armed {
+        handle: OwnedHandle,
+        /// Kept across polls: re-issuing `ConnectNamedPipe` on an
+        /// instance whose connect is already pending is an error.
+        pending: Option<OverlappedOp>,
     }
 
     impl LocalListener {
         pub fn bind(path: &Path) -> io::Result<Self> {
             let name = pipe_name(path);
-            let next = create_instance(&name, true)?;
+            let handle = create_instance(&name, true)?;
             Ok(Self {
                 name,
-                next: std::sync::Mutex::new(next),
+                next: std::sync::Mutex::new(Armed {
+                    handle,
+                    pending: None,
+                }),
             })
         }
 
-        /// Named pipes are blocking by construction; nothing to arm.
+        /// Nothing to arm: `accept()` is already non-blocking (the
+        /// armed instance's `ConnectNamedPipe` is issued overlapped and
+        /// polled), which is what the accept loop's shutdown check needs.
         pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
             Ok(())
         }
 
-        /// Accept the next client: arm the replacement instance FIRST,
-        /// then block in `ConnectNamedPipe` on the instance already
-        /// waiting, so a connecting client always finds a server.
+        /// Accept the next client, never blocking: the armed instance's
+        /// `ConnectNamedPipe` runs overlapped, so a client that has not
+        /// connected yet yields `WouldBlock` and the accept loop keeps
+        /// polling its shutdown flag (the unix listener's contract).
+        ///
+        /// The replacement instance is armed BEFORE the accepted one is
+        /// handed out, so a connecting client always finds a server.
         pub fn accept(&self) -> io::Result<LocalStream> {
             let mut guard = sync::lock(&self.next);
+            if !connect_pending(&mut guard)? {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
             let replacement = create_instance(&self.name, false)?;
-            let current = std::mem::replace(&mut *guard, replacement);
+            let current = std::mem::replace(
+                &mut *guard,
+                Armed {
+                    handle: replacement,
+                    pending: None,
+                },
+            );
             drop(guard);
-            connect_instance(&current)?;
-            Ok(LocalStream { handle: current })
+            Ok(LocalStream {
+                handle: current.handle,
+            })
         }
 
         /// Between accept polls the replacement instance is already in
@@ -543,24 +738,64 @@ mod platform {
         pub fn rearm(&self) {}
     }
 
-    /// Block in `ConnectNamedPipe` on an already-created instance.
-    fn connect_instance(instance: &OwnedHandle) -> io::Result<()> {
-        // SAFETY: synchronous (NULL lpOverlapped) ConnectNamedPipe on a
-        // server handle this struct exclusively owns; it blocks until a
-        // client connects and returns a BOOL.
-        let connected = unsafe { ConnectNamedPipe(instance.as_raw_handle(), std::ptr::null_mut()) };
-        if connected != 0 {
-            return Ok(());
+    /// Advance the armed instance's connect without blocking.
+    ///
+    /// Returns `Ok(true)` once a client is connected, `Ok(false)` while
+    /// none has arrived (the caller reports `WouldBlock`), and `Err` for
+    /// a real failure. The pending `OVERLAPPED` is kept on the instance
+    /// between polls — issuing `ConnectNamedPipe` twice on the same
+    /// instance is an error.
+    fn connect_pending(armed: &mut Armed) -> io::Result<bool> {
+        if armed.pending.is_none() {
+            // First poll for this instance: issue the overlapped connect
+            // and keep the op, so later polls only inspect its event.
+            let mut op = OverlappedOp::new()?;
+            // SAFETY: overlapped `ConnectNamedPipe` on a handle this
+            // struct exclusively owns; the op is moved onto the instance
+            // and lives until the operation completes.
+            let connected =
+                unsafe { ConnectNamedPipe(armed.handle.as_raw_handle(), op.as_mut_ptr()) };
+            if connected != 0 {
+                return Ok(true);
+            }
+            // SAFETY: GetLastError reads this thread's last-error slot.
+            let code = unsafe { GetLastError() } as i32;
+            if code == ERROR_PIPE_CONNECTED {
+                // A client connected before the call; Windows reports
+                // that as an error even though it succeeded.
+                return Ok(true);
+            }
+            if code != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+            armed.pending = Some(op);
+            return Ok(false);
         }
-        let error = io::Error::last_os_error();
-        // SAFETY: GetLastError reads this thread's last-error slot only.
-        let code = unsafe { GetLastError() } as i32;
-        if code == ERROR_PIPE_CONNECTED {
-            // The client connected before ConnectNamedPipe was called;
-            // Windows reports that as an error even though it succeeded.
-            return Ok(());
+
+        let op = armed.pending.as_ref().expect("checked above");
+        // SAFETY: `op` is the stored, still-pending connect on this
+        // instance; a zero timeout only inspects its event.
+        match unsafe { WaitForSingleObject(op.event(), 0) } {
+            WAIT_TIMEOUT => return Ok(false),
+            WAIT_OBJECT_0 => {}
+            _ => return Err(io::Error::last_os_error()),
         }
-        Err(error)
+        let mut transferred: u32 = 0;
+        // SAFETY: the operation is signalled, so `wait = 1` returns at
+        // once with the byte count (0 for a connect).
+        let ok = unsafe {
+            GetOverlappedResult(
+                armed.handle.as_raw_handle(),
+                op.as_ptr(),
+                &mut transferred,
+                1,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        armed.pending = None;
+        Ok(true)
     }
 
     /// Accepted connection end of the local transport: a byte-mode duplex
@@ -590,26 +825,53 @@ mod platform {
         }
     }
 
+    /// Run one overlapped pipe operation to completion.
+    ///
+    /// Instances carry `FILE_FLAG_OVERLAPPED` (needed so `accept()` can
+    /// poll), and Win32 requires an `OVERLAPPED` for every `ReadFile` /
+    /// `WriteFile` on such a handle. Passing one with an immediate
+    /// `GetOverlappedResult(wait = 1)` restores exactly the blocking
+    /// semantics the synchronous handles had.
+    fn run_overlapped(
+        handle: *mut core::ffi::c_void,
+        issue: impl FnOnce(*mut core::ffi::c_void) -> i32,
+    ) -> io::Result<usize> {
+        let mut op = OverlappedOp::new()?;
+        // SAFETY: `op` lives for the whole operation.
+        let issued = issue(op.as_mut_ptr());
+        if issued == 0 {
+            // SAFETY: GetLastError reads this thread's last-error slot.
+            let code = unsafe { GetLastError() } as i32;
+            if code != ERROR_IO_PENDING {
+                return Err(io::Error::from_raw_os_error(code));
+            }
+        }
+        let mut done: u32 = 0;
+        // SAFETY: `wait = 1` blocks until the operation completes and
+        // fills in the transferred byte count.
+        let finished = unsafe { GetOverlappedResult(handle, op.as_ptr(), &mut done, 1) };
+        if finished == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(done as usize)
+    }
+
     impl Read for LocalStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let len = u32::try_from(buf.len().min(u32::MAX as usize))
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let mut done: u32 = 0;
-            // SAFETY: `buf` is valid for `len` writable bytes, and
-            // `done` is a valid out-pointer for the byte count.
-            let ok = unsafe {
+            let handle = self.handle.as_raw_handle();
+            // SAFETY: `buf` is valid for `len` writable bytes until the
+            // operation completes synchronously inside `run_overlapped`.
+            run_overlapped(handle, |overlapped| unsafe {
                 ReadFile(
-                    self.handle.as_raw_handle(),
+                    handle,
                     buf.as_mut_ptr(),
                     len,
-                    &mut done,
                     std::ptr::null_mut(),
+                    overlapped,
                 )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(done as usize)
+            })
         }
     }
 
@@ -617,22 +879,12 @@ mod platform {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let len = u32::try_from(buf.len().min(u32::MAX as usize))
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            let mut done: u32 = 0;
-            // SAFETY: `buf` is valid for `len` readable bytes, and
-            // `done` is a valid out-pointer for the byte count.
-            let ok = unsafe {
-                WriteFile(
-                    self.handle.as_raw_handle(),
-                    buf.as_ptr(),
-                    len,
-                    &mut done,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(done as usize)
+            let handle = self.handle.as_raw_handle();
+            // SAFETY: `buf` is valid for `len` readable bytes until the
+            // operation completes synchronously inside `run_overlapped`.
+            run_overlapped(handle, |overlapped| unsafe {
+                WriteFile(handle, buf.as_ptr(), len, std::ptr::null_mut(), overlapped)
+            })
         }
 
         /// Byte-mode pipes are unbuffered: every `write` reaches the
@@ -869,7 +1121,7 @@ fn write_frame(writer: &mut BufWriter<LocalStream>, event: &ProtocolEvent) -> io
 }
 
 /// 32 hex chars (16 bytes) from the OS CSPRNG (`/dev/urandom`, or
-/// `ProcessPrng` on Windows). This is the shared secret of the auth
+/// `ProcessPrng` via getrandom on Windows). This is the shared secret of the auth
 /// handshake, so it must never fall back to a userspace PRNG.
 #[cfg(any(unix, windows))]
 fn generate_token() -> io::Result<String> {
@@ -884,21 +1136,11 @@ fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
     std::fs::File::open("/dev/urandom")?.read_exact(bytes)
 }
 
-/// `ProcessPrng` (available since Windows 10 1809) is the OS CSPRNG
-/// entry point bcryptprimitives exposes; reaching it directly avoids
-/// pulling in a RNG crate for 16 bytes.
+// getrandom reaches `ProcessPrng` without a hand-rolled `#[link]`, which has no
+// import library and fails to link (`LNK1181: bcryptprimitives.lib`).
 #[cfg(windows)]
 fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
-    #[link(name = "bcryptprimitives")]
-    extern "system" {
-        fn ProcessPrng(data: *mut u8, length: usize) -> i32;
-    }
-    // SAFETY: `bytes` is a valid, writable, correctly sized buffer.
-    let ok = unsafe { ProcessPrng(bytes.as_mut_ptr(), bytes.len()) };
-    if ok == 0 {
-        return Err(io::Error::other("ProcessPrng failed"));
-    }
-    Ok(())
+    getrandom::fill(bytes).map_err(|err| io::Error::other(err.to_string()))
 }
 
 /// Version reported in the info file. `takka_core` exposes no version
@@ -1166,7 +1408,12 @@ mod tests {
                 // Closing a socket that still holds unread input (our
                 // init frame was never read by the refusing daemon)
                 // signals RST rather than FIN — both mean "closed".
+                // A Windows named pipe says the same thing with
+                // ERROR_BROKEN_PIPE ("pipe has been ended", os error
+                // 109), which std does not map to ConnectionReset.
                 Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                #[cfg(windows)]
+                Err(error) if error.raw_os_error() == Some(109) => {}
                 Err(error) => panic!("read after refusal failed: {error}"),
             }
         }
@@ -1263,7 +1510,51 @@ mod tests {
         assert_eq!(reply, b"pong\n");
     }
 
-    /// The seam's client half refuses a path nobody listens on, so the
+    /// The pipe-name derivation must be (a) collision-free across the
+    /// endpoints the smokes actually generate and (b) byte-identical to
+    /// the CLI's copy of the rule
+    /// (`takka-cli/src/client.rs` `mod transport`). These vectors are
+    /// duplicated verbatim there — change one, change both.
+    #[test]
+    fn pipe_name_hashing_is_unique_and_stable() {
+        use super::pipe_id::{fnv1a64, normalize, pipe_name_for};
+
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(normalize("/tmp/x.SOCK/"), r"\tmp\x.sock");
+
+        // Two fixtures that differ ONLY in their unique dir (the exact
+        // shape the smokes produce) must not share a pipe name.
+        let a = pipe_name_for("/tmp/takka-da-123-456/ep-456.sock");
+        let b = pipe_name_for("/tmp/takka-da-123-457/ep-457.sock");
+        assert_ne!(a, b, "distinct endpoints must not collide");
+
+        // Same endpoint, different spelling (case, separator style,
+        // trailing slash): one pipe name, so client and server always
+        // agree.
+        assert_eq!(
+            pipe_name_for(r"C:\Temp\takka-da-1-2\ep-3.sock"),
+            pipe_name_for(r"c:/temp/TAKKA-DA-1-2/ep-3.sock\"),
+        );
+
+        // Pinned vectors: the CLI copy asserts the same strings.
+        assert_eq!(
+            pipe_name_for("/tmp/takka-da-123-456/ep-456.sock"),
+            r"\\.\pipe\takka-0013c643e0315b28"
+        );
+        assert_eq!(
+            pipe_name_for(r"C:\Temp\takka-da-1-2\ep-3.sock"),
+            r"\\.\pipe\takka-2dd13866d5f634ea"
+        );
+
+        // A fully qualified name is pinned verbatim (tests and callers
+        // can choose their own pipe).
+        assert_eq!(
+            pipe_name_for(r"\\.\pipe\takka-pinned"),
+            r"\\.\pipe\takka-pinned"
+        );
+    }
+
+    /// The broker's client half refuses a path nobody listens on, so the
     /// CLI's "stale discovery file" error stays reachable on both
     /// transports.
     #[test]
@@ -1521,7 +1812,10 @@ mod tests {
     #[test]
     fn shutdown_unlinks_files() {
         let (socket_path, config_path, token, serve_handle) = spawn_daemon("shutdown");
-        assert!(socket_path.exists() && config_path.parent().unwrap().join("daemon.json").exists());
+        // Readiness is the discovery file on both transports: a unix
+        // socket is a file on disk, a Windows named pipe is not, so
+        // asserting `socket_path.exists()` would be unix-only.
+        assert!(config_path.parent().unwrap().join("daemon.json").exists());
 
         let mut client = TestConn::connect(&socket_path, deadline());
         client.send(&init_frame(

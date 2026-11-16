@@ -752,6 +752,16 @@ fn sync_run_executes_read_only_batch_concurrently() {
     );
 }
 
+/// Two newline-terminated lines, for the lifecycle tests: `run_command`
+/// passes the string to `sh -c` on unix and `cmd /C` on Windows, so this
+/// must be valid in both shells. `echo` is the one emitter both have. The
+/// Windows form deliberately has no spaces, so it is passed to `cmd` as a
+/// single unquoted argument and cannot trip `/C`'s quote-stripping rules.
+#[cfg(unix)]
+const TWO_LINE_ECHO: &str = "echo a; echo b";
+#[cfg(windows)]
+const TWO_LINE_ECHO: &str = "echo a&&echo b";
+
 /// Tool lifecycle events: run_command must emit ToolStart then an
 /// enriched ToolOutput (with a duration_ms, 0 valid for fast runs) via the
 /// sync path, and the
@@ -762,7 +772,7 @@ fn tool_lifecycle_events_emitted_in_order() {
         support::tool_call_response(
             "call-1",
             "run_command",
-            &serde_json::json!({"command": "printf 'a\nb\n'"}),
+            &serde_json::json!({ "command": TWO_LINE_ECHO }),
         ),
         support::text_response("done"),
     ]));
@@ -827,7 +837,7 @@ async fn tool_lifecycle_events_stream_path() {
         support::tool_call_response(
             "call-1",
             "run_command",
-            &serde_json::json!({"command": "printf 'x\ny\n'"}),
+            &serde_json::json!({ "command": TWO_LINE_ECHO }),
         ),
         support::text_response("stream done"),
     ]));
@@ -870,7 +880,7 @@ async fn tool_lifecycle_events_stream_path() {
     });
     assert!(output.is_some(), "expected run_command ToolOutput");
     // duration_ms is truncated to whole milliseconds — a sub-millisecond
-    // tool run (e.g. printf on a fast runner) legitimately reports 0.
+    // tool run (e.g. a shell `echo` on a fast runner) legitimately reports 0.
     let _ = output.unwrap();
     assert!(!chunks.lock().unwrap().is_empty());
 }
