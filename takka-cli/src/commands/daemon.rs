@@ -1,6 +1,7 @@
 use anyhow::Result;
 use takka_core::sync;
 
+#[cfg(any(unix, windows))]
 use crate::widgets::{components, inline};
 
 use super::*;
@@ -18,10 +19,11 @@ impl Commands {
         self.attach_daemon_inner(shutdown).await
     }
 
-    /// Unix implementation: shutdown or connect to the live daemon.
-    /// On non-unix this variant does not exist; the stub below returns
-    /// the actionable error.
-    #[cfg(unix)]
+    /// Shutdown or connect to the live daemon. Compiled on unix and
+    /// Windows — both have a local transport (unix socket / named pipe,
+    /// see `crate::client`'s transport seam); only hosts with neither get
+    /// the stub below.
+    #[cfg(any(unix, windows))]
     pub(crate) async fn attach_daemon_inner(&mut self, shutdown: bool) -> Result<()> {
         if shutdown {
             let info_path = self
@@ -67,12 +69,9 @@ impl Commands {
         Ok(())
     }
 
-    /// Non-unix stub: daemon mode is Unix-only. This is the ONLY
-    /// `attach_daemon` body compiled on Windows — the unix variant above
-    /// (with its `connect_daemon_at` / `shutdown_daemon_at` references)
-    /// does not exist there, so no unix-only symbol leaks into the
-    /// Windows build under `-D warnings`.
-    #[cfg(not(unix))]
+    /// Stub for hosts with neither a unix socket nor named pipes: the
+    /// actionable message is the whole contract.
+    #[cfg(not(any(unix, windows)))]
     pub(crate) async fn attach_daemon_inner(&mut self, _shutdown: bool) -> Result<()> {
         Err(anyhow::anyhow!(crate::client::DAEMON_NOT_SUPPORTED_MESSAGE))
     }

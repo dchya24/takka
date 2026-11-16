@@ -1,8 +1,8 @@
-//! Unix-socket daemon broker (Fase 3a).
+//! Local-socket daemon broker (Fase 3a).
 //!
 //! The daemon is a *broker*, not a new engine: one `RuntimeEngine`
 //! talks over a `MemoryTransport`; the broker pumps wire frames between
-//! the socket connection(s) and that engine's channels. Rules:
+//! the connection(s) and that engine's channels. Rules:
 //!
 //! - ONE active connection. A second attach is refused with a single
 //!   `"daemon in use"` error frame; the active connection is never
@@ -27,78 +27,95 @@
 //!   caught, reported on stderr and turned into an orderly broker
 //!   shutdown, so a dead engine always looks like a shutdown — never
 //!   like a connection that just vanished.
+//!
+//! # Transport seam (H-07)
+//!
+//! Everything above the listener is transport-agnostic; the platform
+//! surface is exactly four items, each with a `unix` and a `windows`
+//! implementation in the `platform` module:
+//!
+//! - `LocalListener` — `UnixListener` / named-pipe server instances,
+//! - `LocalStream` — `UnixStream` / an accepted named-pipe handle,
+//! - `open_connection` — client-side connect for the broker's own
+//!   transport tests,
+//! - `write_info_file` — the discovery file (0600 mode / user-only ACL).
+//!
+//! Windows uses real named pipes (`\\.\pipe\<name>`), never a TCP
+//! socket: a loopback TCP port is reachable by every local user and by
+//! any process that can bind it, which would widen the local attack
+//! surface the shared-secret handshake exists to close.
 
-/// Single clearinghouse message for unsupported platforms (Windows:
-/// named pipes are a documented TODO). Used by `main` on non-unix
-/// hosts; kept platform-unconditional so the guard test compiles and
-/// runs on every CI host.
-#[cfg_attr(unix, allow(dead_code))]
+/// Single clearinghouse message for platforms where daemon mode has no
+/// transport. Windows named pipes are implemented (H-07), so this is
+/// now reachable only on hosts that are neither unix nor windows; kept
+/// platform-unconditional so its contract test compiles and runs on
+/// every CI host.
+#[cfg_attr(any(unix, windows), allow(dead_code))]
 pub fn not_supported_error() -> &'static str {
-    "daemon mode not supported on Windows yet — use --runtime embedded|spawn"
+    "daemon mode not supported on this platform — use --runtime embedded|spawn"
 }
 
 // ---------------------------------------------------------------------
-// Broker (unix only; the message helper above stays portable so the
-// windows guard branch of `main` and its test compile everywhere).
+// Broker (unix + windows; the message helper above stays portable so
+// its guard branch in `main` and its test compile everywhere).
 // ---------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::mpsc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::{Duration, Instant};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use takka_core::events::Event;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use takka_core::runtime::engine::RuntimeEngine;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use takka_core::runtime::protocol::{ProtocolEvent, ProtocolRequest};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use takka_core::runtime::transport::MemoryTransport;
 use takka_core::sync;
 
 /// Daemon endpoints, both explicit (the CLI resolves defaults before
-/// calling [`serve`]): the unix socket to listen on and the discovery
-/// info file to publish.
-#[cfg(unix)]
+/// calling [`serve`]): the local socket to listen on — a unix socket
+/// path on unix, a pipe name or `\\.\pipe\<name>` path on Windows —
+/// and the discovery info file to publish.
+#[cfg(any(unix, windows))]
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub info_path: PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const DAEMON_IN_USE_MESSAGE: &str = "daemon in use";
 
 /// Accept poll interval for the nonblocking listener and the shutdown
 /// flag — bounds shutdown latency without burning CPU.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Bound on joining reader/drain/engine threads after shutdown.
 /// Readers blocked on an idle-but-connected socket are left detached;
 /// the process exits right after `serve` returns.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The writer half of the active connection, tagged with a generation
 /// counter: reader threads may outlive their connection's slot (EOF
 /// detection races with the next attach), so they only clear the slot
 /// when the generation still matches their own.
-#[cfg(unix)]
-type WriterSlot = Arc<Mutex<Option<(u64, BufWriter<UnixStream>)>>>;
+#[cfg(any(unix, windows))]
+type WriterSlot = Arc<Mutex<Option<(u64, BufWriter<LocalStream>)>>>;
 
 /// Serve the daemon until the engine reports shutdown.
 /// Blocking; expected to run on `main`'s thread (tests spawn it).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn serve(config: DaemonConfig) -> io::Result<()> {
     // 1) Stale guard: a live pid in the info file means another daemon
     //    owns this socket — refuse. Anything else is stale and removed.
@@ -119,7 +136,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     }
 
     // 2) Bind + shared secret.
-    let listener = UnixListener::bind(&config.socket_path)?;
+    let listener = LocalListener::bind(&config.socket_path)?;
     let token = generate_token()?;
 
     // 3) One engine behind a MemoryTransport; the broker pumps frames
@@ -208,7 +225,7 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             break;
         }
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 connection_generation += 1;
                 if let Some(handle) =
                     handle_connection(stream, connection_generation, &req_tx, &slot)
@@ -220,6 +237,10 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
             Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => tracing::warn!(%error, "daemon: accept failed"),
         }
+        // Windows: a second, unconnected server instance is armed before
+        // the accepted one is served, so the next client always finds a
+        // pipe to connect to (unix: no-op).
+        listener.rearm();
         std::thread::sleep(ACCEPT_POLL_INTERVAL);
     }
 
@@ -234,28 +255,494 @@ pub fn serve(config: DaemonConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Accepted connections are explicitly made BLOCKING.
-///
-/// `accept()` on a non-blocking listener returns a socket that INHERITS
-/// `O_NONBLOCK` on macOS/BSD, while Linux clears it. With the flag set,
-/// the reader gets `WouldBlock` instead of waiting for the client's first
-/// frame, treats a healthy client as a detach, and closes the connection
-/// while the daemon keeps running — exactly the macOS CI signature of
-/// issue #2 (client sees EOF, daemon still alive, the engine never saw
-/// `Init`). Never rely on platform `accept` semantics.
+// ---------------------------------------------------------------------
+// Transport seam (H-07): the only platform-specific code in the broker.
+// ---------------------------------------------------------------------
+
 #[cfg(unix)]
-fn make_blocking(stream: UnixStream) -> io::Result<UnixStream> {
-    stream.set_nonblocking(false)?;
-    Ok(stream)
+mod platform {
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    /// Listening end of the local transport.
+    pub struct LocalListener {
+        listener: UnixListener,
+    }
+
+    impl LocalListener {
+        pub fn bind(path: &Path) -> io::Result<Self> {
+            Ok(Self {
+                listener: UnixListener::bind(path)?,
+            })
+        }
+
+        /// Armed BEFORE the discovery file is published: a client that
+        /// sees the info file must never find a listener that is not
+        /// accepting yet.
+        pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.listener.set_nonblocking(nonblocking)
+        }
+
+        pub fn accept(&self) -> io::Result<LocalStream> {
+            let (stream, _addr) = self.listener.accept()?;
+            Ok(stream)
+        }
+
+        /// No pre-instancing on unix: every connection finds the listener.
+        pub fn rearm(&self) {}
+    }
+
+    /// Accepted connection end of the local transport.
+    pub type LocalStream = UnixStream;
+
+    /// Client-side connect, used by the broker's own transport tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_connection(path: &Path) -> io::Result<LocalStream> {
+        UnixStream::connect(path)
+    }
+
+    /// Accepted connections are explicitly made BLOCKING.
+    ///
+    /// `accept()` on a non-blocking listener returns a socket that
+    /// INHERITS `O_NONBLOCK` on macOS/BSD, while Linux clears it. With
+    /// the flag set, the reader gets `WouldBlock` instead of waiting for
+    /// the client's first frame, treats a healthy client as a detach,
+    /// and closes the connection while the daemon keeps running — the
+    /// macOS CI signature of issue #2 (client sees EOF, daemon still
+    /// alive, the engine never saw `Init`). Never rely on platform
+    /// `accept` semantics.
+    pub fn make_blocking(stream: LocalStream) -> io::Result<LocalStream> {
+        stream.set_nonblocking(false)?;
+        Ok(stream)
+    }
+
+    /// `{"pid":u32,"socket_path":String,"token":String,"version":String}`,
+    /// permissions 0600 (mode applies at create; set explicitly too so a
+    /// pre-existing file can never keep wider perms).
+    pub fn write_info_file(config: &DaemonConfig, token: &str) -> io::Result<()> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&config.info_path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(&super::info_json(config, token))?;
+        Ok(())
+    }
+
+    /// Best-effort liveness check: `/proc` on Linux (precise for reaped
+    /// pids), `kill -0` elsewhere. PID reuse can false-positive — the
+    /// token handshake, not this guard, is the real boundary.
+    pub fn pid_is_alive(pid: u32) -> bool {
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // No /proc entry on Linux ⇒ pid gone (post-reap).
+            false
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+    }
+}
+
+/// Windows end of the transport seam: real named pipes, NEVER TCP.
+///
+/// A loopback TCP listener would be reachable by every local user and by
+/// any process that can bind the port, widening the local attack surface
+/// the shared-secret handshake exists to close — hence the pipe.
+///
+/// The blocking `CreateNamedPipeW` / `ConnectNamedPipe` / `CreateFileW`
+/// API set is reached through local `extern "system"` declarations, so
+/// the runtime binary keeps its dependency set (no `windows-sys`).
+/// The pipe gets a NULL security descriptor, which makes Windows derive
+/// it from the creator's token — the same user-only protection the unix
+/// socket file gets from its directory and the info file from mode 0600.
+/// The token handshake is the second layer and is identical to unix.
+///
+/// Deliberately minimal: this module is compile-checked by
+/// `cargo check --target x86_64-pc-windows-gnu` and hosts the same
+/// transport tests as unix, but it has NOT been run on a real Windows
+/// host yet (H-07 report).
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::io::{Read, Write};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    /// Create a duplex pipe with blocking (synchronous) semantics.
+    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+    /// Byte stream, byte read mode, no overlapped flag (zero constants).
+    const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
+    const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
+    const PIPE_WAIT: u32 = 0x0000_0000;
+    const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+    /// Refuse to attach to an existing pipe of the same name.
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    /// `ConnectNamedPipe` reports a client that connected first this way.
+    const ERROR_PIPE_CONNECTED: i32 = 535;
+    /// "All pipe instances are busy" — `WaitNamedPipeW` failed to find one.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+    /// Upper bound on waiting for a free instance (well under the
+    /// broker's spawn budget).
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const CONNECT_RETRY_SLEEP: Duration = Duration::from_millis(20);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open_mode: u32,
+            pipe_mode: u32,
+            max_instances: u32,
+            out_buffer_size: u32,
+            in_buffer_size: u32,
+            default_timeout: u32,
+            security_attributes: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn ConnectNamedPipe(
+            pipe: *mut core::ffi::c_void,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security_attributes: *mut core::ffi::c_void,
+            creation: u32,
+            flags: u32,
+            template: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn WaitNamedPipeW(name: *const u16, timeout: u32) -> i32;
+        fn ReadFile(
+            file: *mut core::ffi::c_void,
+            buffer: *mut u8,
+            to_read: u32,
+            read: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+        fn WriteFile(
+            file: *mut core::ffi::c_void,
+            buffer: *const u8,
+            to_write: u32,
+            written: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// `take.sock` → `\\.\pipe\takka-take`; a value that already looks
+    /// like a pipe path is used verbatim, so a caller (or a test) can pin
+    /// a fully qualified name.
+    pub fn pipe_name(path: &Path) -> Vec<u16> {
+        const PIPE_PREFIX: &str = r"\\.\pipe\";
+        let text = path.as_os_str().to_string_lossy();
+        let name = if text.starts_with(PIPE_PREFIX) {
+            text.into_owned()
+        } else {
+            let stem = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "daemon".to_string());
+            format!("{PIPE_PREFIX}takka-{stem}")
+        };
+        OsStr::new(&name).encode_wide().chain([0]).collect()
+    }
+
+    /// Wrap a raw handle from `CreateNamedPipeW` / `CreateFileW`,
+    /// rejecting INVALID_HANDLE_VALUE (ownership stays with the OS).
+    fn adopt(raw: *mut core::ffi::c_void) -> io::Result<OwnedHandle> {
+        if raw as isize == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a valid, exclusively owned handle as checked.
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    fn create_instance(name: &[u16], first: bool) -> io::Result<OwnedHandle> {
+        let mut open_mode = PIPE_ACCESS_DUPLEX;
+        if first {
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+        }
+        // SAFETY: NULL security descriptor → the ACL is derived from the
+        // creating process's token (user-only, like mode 0600); the name
+        // is a NUL-terminated UTF-16 buffer that outlives the call.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                open_mode,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                64 * 1024,
+                64 * 1024,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        adopt(raw)
+    }
+
+    /// Listening end: the broker keeps ONE extra unconnected instance
+    /// armed at all times. A named pipe whose every instance has served a
+    /// client is *closed* to new clients ("file not found") until another
+    /// instance is created, so a refused or churning client would
+    /// otherwise see connect errors instead of the broker's
+    /// `"daemon in use"` frame.
+    pub struct LocalListener {
+        name: Vec<u16>,
+        next: std::sync::Mutex<OwnedHandle>,
+    }
+
+    impl LocalListener {
+        pub fn bind(path: &Path) -> io::Result<Self> {
+            let name = pipe_name(path);
+            let next = create_instance(&name, true)?;
+            Ok(Self {
+                name,
+                next: std::sync::Mutex::new(next),
+            })
+        }
+
+        /// Named pipes are blocking by construction; nothing to arm.
+        pub fn set_nonblocking(&self, _nonblocking: bool) -> io::Result<()> {
+            Ok(())
+        }
+
+        /// Accept the next client: arm the replacement instance FIRST,
+        /// then block in `ConnectNamedPipe` on the instance already
+        /// waiting, so a connecting client always finds a server.
+        pub fn accept(&self) -> io::Result<LocalStream> {
+            let mut guard = sync::lock(&self.next);
+            let replacement = create_instance(&self.name, false)?;
+            let current = std::mem::replace(&mut *guard, replacement);
+            drop(guard);
+            connect_instance(&current)?;
+            Ok(LocalStream { handle: current })
+        }
+
+        /// Between accept polls the replacement instance is already in
+        /// place (see [`Self::accept`]).
+        pub fn rearm(&self) {}
+    }
+
+    /// Block in `ConnectNamedPipe` on an already-created instance.
+    fn connect_instance(instance: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: synchronous (NULL lpOverlapped) ConnectNamedPipe on a
+        // server handle this struct exclusively owns; it blocks until a
+        // client connects and returns a BOOL.
+        let connected = unsafe { ConnectNamedPipe(instance.as_raw_handle(), std::ptr::null_mut()) };
+        if connected != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // SAFETY: GetLastError reads this thread's last-error slot only.
+        let code = unsafe { GetLastError() } as i32;
+        if code == ERROR_PIPE_CONNECTED {
+            // The client connected before ConnectNamedPipe was called;
+            // Windows reports that as an error even though it succeeded.
+            return Ok(());
+        }
+        Err(error)
+    }
+
+    /// Accepted connection end of the local transport: a byte-mode duplex
+    /// pipe handle, a plain `Read + Write` source.
+    pub struct LocalStream {
+        handle: OwnedHandle,
+    }
+
+    impl LocalStream {
+        /// Second handle onto the same pipe instance, so the broker can
+        /// hold a reader half and a writer half at once (mirrors
+        /// `UnixStream::try_clone`).
+        pub fn try_clone(&self) -> io::Result<Self> {
+            Ok(Self {
+                handle: self.handle.try_clone()?,
+            })
+        }
+
+        /// Accepted named pipes are blocking and have no synchronous
+        /// read timeout (`SO_RCVTIMEO` equivalent), so the broker's
+        /// bounded shutdown relies on the `SHUTDOWN_JOIN_TIMEOUT`
+        /// detach rule. Provided so the transport tests share one
+        /// client shape with unix.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for LocalStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let len = u32::try_from(buf.len().min(u32::MAX as usize))
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let mut done: u32 = 0;
+            // SAFETY: `buf` is valid for `len` writable bytes, and
+            // `done` is a valid out-pointer for the byte count.
+            let ok = unsafe {
+                ReadFile(
+                    self.handle.as_raw_handle(),
+                    buf.as_mut_ptr(),
+                    len,
+                    &mut done,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(done as usize)
+        }
+    }
+
+    impl Write for LocalStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let len = u32::try_from(buf.len().min(u32::MAX as usize))
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let mut done: u32 = 0;
+            // SAFETY: `buf` is valid for `len` readable bytes, and
+            // `done` is a valid out-pointer for the byte count.
+            let ok = unsafe {
+                WriteFile(
+                    self.handle.as_raw_handle(),
+                    buf.as_ptr(),
+                    len,
+                    &mut done,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(done as usize)
+        }
+
+        /// Byte-mode pipes are unbuffered: every `write` reaches the
+        /// pipe, so there is nothing to flush.
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Pipe handles are blocking by construction.
+    pub fn make_blocking(stream: LocalStream) -> io::Result<LocalStream> {
+        Ok(stream)
+    }
+
+    /// Client-side connect (mirrors `UnixStream::connect`): wait for a
+    /// free instance, then open it with GENERIC_READ|GENERIC_WRITE.
+    ///
+    /// A pipe that does not exist at all fails immediately (the caller's
+    /// stale-discovery-file handling depends on that); only
+    /// `ERROR_PIPE_BUSY` — every instance already serving — is retried.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn open_connection(path: &Path) -> io::Result<LocalStream> {
+        let name = pipe_name(path);
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            // SAFETY: NUL-terminated UTF-16 name, no security attributes,
+            // no template; OPEN_EXISTING on a server pipe returns the
+            // client end or INVALID_HANDLE_VALUE.
+            let raw = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            match adopt(raw) {
+                Ok(handle) => return Ok(LocalStream { handle }),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    // SAFETY: WaitNamedPipeW only touches the name buffer.
+                    unsafe { WaitNamedPipeW(name.as_ptr(), 20) };
+                    std::thread::sleep(CONNECT_RETRY_SLEEP);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Discovery file. Windows has no mode bits: the ACL is inherited
+    /// from the parent directory (`%USERPROFILE%\.config\takka` or the
+    /// user's temp dir), which is user-only by default.
+    pub fn write_info_file(config: &DaemonConfig, token: &str) -> io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&config.info_path)?;
+        file.write_all(&super::info_json(config, token))?;
+        Ok(())
+    }
+
+    /// Best-effort liveness check with the tool Windows always has.
+    /// PID reuse can false-positive — the token handshake, not this
+    /// guard, is the real boundary.
+    pub fn pid_is_alive(pid: u32) -> bool {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|text| text.contains(&format!(",\"{pid}\",")))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(any(unix, windows))]
+use platform::LocalStream;
+#[cfg(any(unix, windows))]
+use platform::{make_blocking, pid_is_alive, write_info_file, LocalListener};
+
+/// Discovery-file body shared by both platforms (the on-disk schema is a
+/// cross-crate contract pinned by `takka-cli`'s `daemon_info_tests`).
+#[cfg(any(unix, windows))]
+fn info_json(config: &DaemonConfig, token: &str) -> Vec<u8> {
+    let info = serde_json::json!({
+        "pid": std::process::id(),
+        "socket_path": config.socket_path.to_string_lossy(),
+        "token": token,
+        "version": daemon_version(),
+    });
+    let mut bytes = serde_json::to_vec_pretty(&info).expect("info json");
+    bytes.push(b'\n');
+    bytes
 }
 
 /// First rule of `handle_connection`: ONE active connection. A second
 /// attach gets a single `"daemon in use"` frame and a close — the
 /// active connection is never touched. Otherwise installs the writer
 /// slot and spawns the request pump; returns its join handle.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn handle_connection(
-    stream: UnixStream,
+    stream: LocalStream,
     generation: u64,
     req_tx: &mpsc::Sender<ProtocolRequest>,
     slot: &WriterSlot,
@@ -305,9 +792,9 @@ fn handle_connection(
 /// forwards them into the engine channel. EOF/error or engine shutdown
 /// ends the pump; the slot is released only if this connection still
 /// owns it (a newer attach may already have replaced it).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn pump_requests(
-    stream: UnixStream,
+    stream: LocalStream,
     generation: u64,
     req_tx: mpsc::Sender<ProtocolRequest>,
     slot: WriterSlot,
@@ -368,66 +855,62 @@ fn pump_requests(
 /// moment no client can have observed — replaying it only breaks the
 /// first handshake (it lands where `InitOk` is expected). Everything
 /// else is forwarded as-is (detach is handled by the absent writer).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn should_forward(event: &ProtocolEvent) -> bool {
     !matches!(event.event, Event::Ready { .. })
 }
 
 /// One JSON event frame per line (same framing as `StdioTransport`).
-#[cfg(unix)]
-fn write_frame(writer: &mut BufWriter<UnixStream>, event: &ProtocolEvent) -> io::Result<()> {
+#[cfg(any(unix, windows))]
+fn write_frame(writer: &mut BufWriter<LocalStream>, event: &ProtocolEvent) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, event)?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
 
-/// 32 hex chars (16 bytes) from `/dev/urandom`.
-#[cfg(unix)]
+/// 32 hex chars (16 bytes) from the OS CSPRNG (`/dev/urandom`, or
+/// `ProcessPrng` on Windows). This is the shared secret of the auth
+/// handshake, so it must never fall back to a userspace PRNG.
+#[cfg(any(unix, windows))]
 fn generate_token() -> io::Result<String> {
-    use std::io::Read;
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    fill_random(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// `{"pid":u32,"socket_path":String,"token":String,"version":String}`,
-/// permissions 0600 (mode applies at create; set explicitly too so a
-/// pre-existing file can never keep wider perms).
 #[cfg(unix)]
-fn write_info_file(config: &DaemonConfig, token: &str) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let info = serde_json::json!({
-        "pid": std::process::id(),
-        "socket_path": config.socket_path.to_string_lossy(),
-        "token": token,
-        "version": daemon_version(),
-    });
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&config.info_path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(
-        serde_json::to_string_pretty(&info)
-            .expect("info json")
-            .as_bytes(),
-    )?;
-    file.write_all(b"\n")?;
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")?.read_exact(bytes)
+}
+
+/// `ProcessPrng` (available since Windows 10 1809) is the OS CSPRNG
+/// entry point bcryptprimitives exposes; reaching it directly avoids
+/// pulling in a RNG crate for 16 bytes.
+#[cfg(windows)]
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    #[link(name = "bcryptprimitives")]
+    extern "system" {
+        fn ProcessPrng(data: *mut u8, length: usize) -> i32;
+    }
+    // SAFETY: `bytes` is a valid, writable, correctly sized buffer.
+    let ok = unsafe { ProcessPrng(bytes.as_mut_ptr(), bytes.len()) };
+    if ok == 0 {
+        return Err(io::Error::other("ProcessPrng failed"));
+    }
     Ok(())
 }
 
 /// Version reported in the info file. `takka_core` exposes no version
 /// constant, so the broker reports the runtime binary's own version.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn daemon_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
 /// pid from a (possibly corrupt/absent) info file; `None` = no usable
 /// pid, i.e. nothing to guard against.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn live_info_pid(info_path: &Path) -> Option<u32> {
     let content = std::fs::read_to_string(info_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -435,35 +918,9 @@ fn live_info_pid(info_path: &Path) -> Option<u32> {
     u32::try_from(pid).ok()
 }
 
-/// Best-effort liveness check: `/proc` on Linux (precise for reaped
-/// pids), `kill -0` elsewhere. PID reuse can false-positive — the token
-/// handshake, not this guard, is the real boundary.
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    if Path::new(&format!("/proc/{pid}")).exists() {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // No /proc entry on Linux ⇒ pid gone (post-reap).
-        false
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-}
-
 /// Join with a deadline; stragglers are left detached (documented at
 /// [`SHUTDOWN_JOIN_TIMEOUT`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn join_bounded(handles: Vec<std::thread::JoinHandle<()>>) {
     let deadline = Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
     for handle in handles {
@@ -478,27 +935,15 @@ fn join_bounded(handles: Vec<std::thread::JoinHandle<()>>) {
     }
 }
 
-#[cfg(test)]
-mod windows_guard_tests {
-    use super::not_supported_error;
-
-    /// Windows-level guard contract, compiled on every host: the
-    /// message is exactly one actionable line.
-    #[test]
-    fn not_supported_error_is_the_single_line_message() {
-        assert_eq!(
-            not_supported_error(),
-            "daemon mode not supported on Windows yet — use --runtime embedded|spawn"
-        );
-        assert!(!not_supported_error().contains('\n'));
-    }
-}
-
-#[cfg(all(test, unix))]
+/// Broker-level transport tests. They drive the real `serve()` over the
+/// same seam the broker uses (`platform::open_connection`), so unix and
+/// Windows run the identical assertions — the named-pipe path gets the
+/// same coverage as the unix socket, not a weaker stand-in.
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
+    use super::platform::open_connection;
     use super::*;
-    use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-    use std::os::unix::net::UnixStream;
+    use std::io::{BufRead, BufReader, BufWriter, Write};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
     use takka_core::events::Event;
@@ -616,23 +1061,26 @@ mod tests {
             .expect("serve returned Ok");
     }
 
-    /// Minimal test client: raw framed JSON over the socket (the
-    /// public `UnixSocketTransport` has no event-reading API and its
-    /// line reader lives in another crate — this is the same framing).
+    /// Minimal test client: raw framed JSON over the broker's transport
+    /// (the public client transports have no event-reading API from this
+    /// crate — this is the same one-JSON-per-line framing).
     struct TestConn {
-        reader: BufReader<UnixStream>,
-        writer: BufWriter<UnixStream>,
+        reader: BufReader<LocalStream>,
+        writer: BufWriter<LocalStream>,
     }
 
     impl TestConn {
-        fn connect(socket_path: &Path, deadline: Instant) -> Self {
+        fn connect(transport_path: &Path, deadline: Instant) -> Self {
             loop {
-                match UnixStream::connect(socket_path) {
+                match open_connection(transport_path) {
                     Ok(stream) => {
                         // Set the read bound ONCE: every wait in this
                         // helper is covered by it, and repeating
                         // SO_RCVTIMEO mid-test is a platform quirk magnet
                         // (macOS returned EINVAL for an in-test value).
+                        // Named pipes have no synchronous read timeout;
+                        // there `set_read_timeout` is a no-op and the
+                        // bounded assertions carry the guarantee.
                         stream
                             .set_read_timeout(Some(POLL_TIMEOUT))
                             .expect("set read timeout at connect");
@@ -645,7 +1093,7 @@ mod tests {
                     Err(_) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Err(error) => panic!("connect to {socket_path:?} failed: {error}"),
+                    Err(error) => panic!("connect to {transport_path:?} failed: {error}"),
                 }
             }
         }
@@ -767,6 +1215,67 @@ mod tests {
         (socket_path, PathBuf::from(config_path), token, handle)
     }
 
+    /// The transport seam under the broker, asserted for real: a client
+    /// connects, the listener accepts, and bytes flow both ways. This is
+    /// the test that replaces the old "unsupported platform" guard — on
+    /// every host it exercises the actual transport `serve` uses.
+    #[test]
+    fn transport_round_trips_bytes_both_ways() {
+        use std::io::Read;
+        let dir = tempdir("seam");
+        let path = dir.join("s.sock");
+        let listener = LocalListener::bind(&path).expect("bind");
+        listener.set_nonblocking(true).expect("arm the listener");
+
+        let mut client = open_connection(&path).expect("connect");
+        let accepted = loop {
+            match listener.accept() {
+                Ok(stream) => break stream,
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline(), "accept did not complete");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        listener.rearm();
+        let mut server = make_blocking(accepted).expect("served connection");
+
+        client.write_all(b"ping\n").expect("client write");
+        client.flush().expect("client flush");
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while !line.ends_with(b"\n") {
+            let read = server.read(&mut byte).expect("server read");
+            assert_eq!(read, 1, "server read returned 0 before the frame");
+            line.push(byte[0]);
+        }
+        assert_eq!(line, b"ping\n");
+
+        server.write_all(b"pong\n").expect("server write");
+        server.flush().expect("server flush");
+        let mut reply = Vec::new();
+        while !reply.ends_with(b"\n") {
+            let read = client.read(&mut byte).expect("client read");
+            assert_eq!(read, 1, "client read returned 0 before the frame");
+            reply.push(byte[0]);
+        }
+        assert_eq!(reply, b"pong\n");
+    }
+
+    /// The seam's client half refuses a path nobody listens on, so the
+    /// CLI's "stale discovery file" error stays reachable on both
+    /// transports.
+    #[test]
+    fn connecting_to_a_dead_endpoint_fails() {
+        let dir = tempdir("dead");
+        let path = dir.join("nobody-home.sock");
+        assert!(
+            open_connection(&path).is_err(),
+            "connect to a non-existent endpoint must fail"
+        );
+    }
+
     /// The broker's forwarding rule, unit-tested without timing: the
     /// engine's `Ready` is the only event a socket client must never
     /// see; everything else keeps flowing.
@@ -804,20 +1313,28 @@ mod tests {
     /// `O_NONBLOCK`, Linux clears it), a served connection must end up
     /// blocking — otherwise the reader mistakes a silent client for a
     /// detach and closes a healthy connection.
+    ///
+    /// Unix-only in practice: it asserts the *inherited* flag the BSD
+    /// `accept` returns. Named-pipe handles are synchronous by
+    /// construction (there is no non-blocking flag to inherit), so on
+    /// Windows the seam promise is checked by
+    /// [`served_connection_waits_for_a_silent_client`] instead.
+    #[cfg(unix)]
     #[test]
     fn accepted_connections_are_forced_blocking() {
+        use std::io::Read;
         let dir = tempdir("accept-mode");
         let path = dir.join("s.sock");
-        let listener = UnixListener::bind(&path).expect("bind");
+        let listener = LocalListener::bind(&path).expect("bind");
         listener
             .set_nonblocking(true)
             .expect("nonblocking listener");
 
-        let client = UnixStream::connect(&path).expect("connect");
+        let client = open_connection(&path).expect("connect");
         let deadline = deadline();
         let accepted = loop {
             match listener.accept() {
-                Ok((stream, _)) => break stream,
+                Ok(stream) => break stream,
                 Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(Instant::now() < deadline, "accept did not complete");
                     std::thread::sleep(Duration::from_millis(5));

@@ -89,17 +89,29 @@ fn runtime_binary_env_falls_back_to_agentic_name() {
     std::env::remove_var("AGENTIC_RUNTIME_BIN");
 }
 
-/// Windows-level guard contract, compiled on every host (same
-/// pattern as `takka-runtime`'s `not_supported_error` test): the
-/// message `connect` produces on a non-unix host is exactly one
-/// actionable line pointing at the modes that DO work.
+/// Unsupported-platform guard contract, compiled on every host (same
+/// pattern as `takka-runtime`'s `not_supported_error` test): the message
+/// is exactly one actionable line pointing at the modes that DO work.
+/// Windows is no longer in this branch — named pipes are implemented
+/// (H-07) — so the message names no platform.
 #[test]
-fn daemon_mode_windows_guard_message_is_actionable() {
+fn daemon_mode_unsupported_message_is_actionable() {
     assert_eq!(
         DAEMON_NOT_SUPPORTED_MESSAGE,
-        "daemon mode not supported on Windows yet — use --runtime embedded|spawn"
+        "daemon mode not supported on this platform — use --runtime embedded|spawn"
     );
     assert!(!DAEMON_NOT_SUPPORTED_MESSAGE.contains('\n'));
+}
+
+/// The same message has to hold in the runtime binary, so a user who
+/// sees it once sees it everywhere.
+#[test]
+fn takka_runtime_exports_the_same_unsupported_message() {
+    let runtime = include_str!("../../../takka-runtime/src/daemon.rs");
+    assert!(
+        runtime.contains(DAEMON_NOT_SUPPORTED_MESSAGE),
+        "takka-runtime's not_supported_error drifted from the CLI message"
+    );
 }
 
 /// The no-daemon attach error must tell the user how to get a
@@ -111,4 +123,49 @@ fn no_daemon_message_is_actionable() {
         "no daemon running — start it with 'takka-runtime --daemon' or use --runtime embedded"
     );
     assert!(!NO_DAEMON_MESSAGE.contains('\n'));
+}
+
+/// The transport seam under [`AgentConnection::connect_daemon_at`]:
+/// connecting to an endpoint nobody listens on must fail (that failure is
+/// exactly what turns a stale discovery file into the actionable
+/// no-daemon error), and a listening endpoint must hand back a readable,
+/// writable duplex connection.
+///
+/// Runs against the real transport of the host (`open_connection`), so
+/// the same assertion covers the unix socket and the Windows named pipe
+/// — this is the replacement for the old "daemon mode not supported"
+/// guard test.
+#[cfg(all(test, any(unix, windows)))]
+mod transport_seam_tests {
+    use super::super::transport::connect as connect_transport;
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // Unix socket paths must stay under SUN_LEN (104); macOS runners'
+        // tempdir prefix already spends ~50 chars.
+        let dir = std::env::temp_dir().join(format!(
+            "cs{}{}{}",
+            std::process::id() % 1000,
+            nanos % 1_000_000,
+            tag
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn connecting_to_a_dead_endpoint_fails() {
+        let dir = tempdir("dead");
+        let endpoint = dir.join("nobody-home.sock");
+        assert!(
+            connect_transport(&endpoint.to_string_lossy())
+                .await
+                .is_err(),
+            "connect to a non-existent daemon endpoint must fail"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
