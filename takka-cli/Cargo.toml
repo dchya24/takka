@@ -74,4 +74,3 @@ assets = [
 [dev-dependencies]
 futures = "0.3"
 tui-textarea = "0.7"
-syntect = "5.2"
