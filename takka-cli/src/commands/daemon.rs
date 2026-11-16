@@ -191,8 +191,8 @@ mod daemon_smoke_tests {
             // ("path must be shorter than SUN_LEN", every macOS daemon smoke
             // dead-on-arrival). A short unique dir keeps the socket path under
             // the limit while pid + truncated nanos separate test instances;
-            // cleanup is per-dir. Windows turns the same path into a pipe
-            // name from its file stem, so the short dir serves both.
+            // cleanup is per-dir. Windows derives the pipe name from a hash
+            // of the whole path, so the short dir serves both.
             let dir = std::env::temp_dir().join(format!(
                 "takka-da-{}-{}",
                 std::process::id(),
@@ -202,12 +202,17 @@ mod daemon_smoke_tests {
             let config_path = dir.join("config.json");
             std::fs::write(&config_path, HERMETIC_CONFIG).unwrap();
             // One endpoint path, two transports: a socket file on unix, a
-            // named pipe (`\\.\pipe\takka-test`, derived from the stem by
-            // the runtime's `platform::pipe_name`) on Windows. Neither side
-            // hard-codes `/tmp`: `temp_dir()` is the platform temp dir, which
-            // on Windows is also where the pipe's inherited user-only ACL
-            // comes from.
-            let socket_path = dir.join("test.sock");
+            // named pipe on Windows derived (`platform::pipe_name`) from a
+            // hash of this whole path. The unique dir name alone already
+            // makes the pipe name unique per fixture; carrying the token in
+            // the file name as well keeps the two independent (the old
+            // `test.sock` constant made every concurrent smoke target
+            // `\\.\pipe\takka-test`, and `FILE_FLAG_FIRST_PIPE_INSTANCE`
+            // answered the losers with `ERROR_ACCESS_DENIED`). Neither side
+            // hard-codes `/tmp`: `temp_dir()` is the platform temp dir,
+            // which on Windows is also where the pipe's inherited user-only
+            // ACL comes from.
+            let socket_path = dir.join(format!("ep-{}.sock", nanos % 91_000_000_000));
             let info_path = dir.join("daemon.json");
             let binary = {
                 // Same lock as client.rs's env-compat tests: a transient
@@ -337,9 +342,13 @@ mod daemon_smoke_tests {
                     // Quote the daemon's own logs and exit status: a
                     // handshake refusal on a CI runner otherwise dies
                     // silent (macOS failures were a guess chain until
-                    // the spawn evidence patch).
+                    // the spawn evidence patch). `{:#}` — not `{}` — so
+                    // a transport error swallowed into "no daemon"
+                    // (e.g. ERROR_ACCESS_DENIED from a colliding pipe
+                    // instance) appears in the failure instead of the
+                    // generic message alone.
                     let evidence = self.evidence().await;
-                    panic!("daemon attach failed: {error}; {evidence}");
+                    panic!("daemon attach failed: {error:#}; {evidence}");
                 }
             }
         }

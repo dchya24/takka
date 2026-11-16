@@ -28,6 +28,39 @@ pub(crate) const DAEMON_NOT_SUPPORTED_MESSAGE: &str =
 pub(crate) const NO_DAEMON_MESSAGE: &str =
     "no daemon running — start it with 'takka-runtime --daemon' or use --runtime embedded";
 
+/// The actionable "no daemon" error, with the transport failure kept as
+/// its `source`.
+///
+/// The transport error is the ONLY signal that separates "the daemon is
+/// gone" from "something else owns this endpoint". The latter is a real
+/// case: a Windows named pipe taken by another process answers
+/// `ERROR_ACCESS_DENIED`, which used to vanish into the generic message
+/// and made the H-07 smoke failures unreadable. The pinned message must
+/// stay verbatim (`to_string()` is asserted by several tests), so the
+/// cause hangs off `source` instead — visible as `{:#}`, `{:?}` and via
+/// `Error::chain`, invisible in the user-facing `to_string()`.
+#[cfg(any(unix, windows))]
+fn no_daemon_error(cause: anyhow::Error) -> anyhow::Error {
+    #[derive(Debug)]
+    struct NoDaemon(Box<dyn std::error::Error + Send + Sync>);
+
+    impl std::fmt::Display for NoDaemon {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(NO_DAEMON_MESSAGE)
+        }
+    }
+
+    impl std::error::Error for NoDaemon {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            // The cause itself, not *its* source: the transport error is
+            // the diagnostic detail being preserved.
+            Some(&*self.0)
+        }
+    }
+
+    anyhow::Error::new(NoDaemon(cause.into()))
+}
+
 /// Upper bound for waiting until a freshly spawned daemon publishes its
 /// discovery file (the broker writes it after bind, so its existence
 /// means the listener is ready). 10s was too tight on loaded macOS CI
@@ -746,9 +779,9 @@ impl AgentConnection {
                         )
                     })?
             }
-            Err(_) => {
+            Err(error) => {
                 let _ = std::fs::remove_file(info_path); // stale info (best-effort)
-                return Err(anyhow!(NO_DAEMON_MESSAGE));
+                return Err(no_daemon_error(error));
             }
         };
 
@@ -904,15 +937,67 @@ pub(crate) mod transport {
 /// Deliberately minimal: compile-checked by
 /// `cargo check --target x86_64-pc-windows-gnu` and never yet run on a
 /// real Windows host (H-07 report).
+///
+/// Pipe-name derivation, duplicated from
+/// `takka_runtime::daemon::pipe_id` (the CLI does not depend on the
+/// runtime crate): both copies MUST stay identical, and
+/// `pipe_name_matches_server_derivation` pins the shared vectors.
+/// Kept outside the `#[cfg(windows)]` module so it is unit-tested on
+/// every CI host, not only on Windows.
+#[cfg(any(test, windows))]
+mod pipe_id {
+    /// Root every local named pipe lives under.
+    pub(crate) const PIPE_PREFIX: &str = r"\\.\pipe\";
+
+    /// Positional 64-bit FNV-1a. `DefaultHasher` is deliberately not
+    /// used: its `RandomState` is seeded per process, so the broker and
+    /// the client would derive different pipe names.
+    pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Normalize an endpoint into the string the hash is taken over:
+    /// strip trailing separators, fold `/` to `\`, ASCII-lowercase
+    /// (NTFS and the pipe namespace are case-insensitive, and ASCII-only
+    /// keeps the two copies trivially equal). Textual only — never
+    /// `canonicalize`: both sides see the same string from the discovery
+    /// file, and the broker mints its endpoint before binding it.
+    pub(crate) fn normalize(endpoint: &str) -> String {
+        let mut text = endpoint.replace('/', r"\");
+        while text.len() > 1 && text.ends_with('\\') {
+            text.pop();
+        }
+        text.make_ascii_lowercase();
+        text
+    }
+
+    /// `\\.\pipe\takka-<hex16>` for a filesystem-path endpoint; a fully
+    /// qualified `\\.\pipe\…` path is kept verbatim.
+    pub(crate) fn pipe_name_for(endpoint: &str) -> String {
+        if endpoint.starts_with(PIPE_PREFIX) {
+            return endpoint.to_string();
+        }
+        format!(
+            "{PIPE_PREFIX}takka-{:016x}",
+            fnv1a64(normalize(endpoint).as_bytes())
+        )
+    }
+}
+
 #[cfg(windows)]
 mod transport {
+    use super::pipe_id;
     use super::*;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
     use std::time::Duration;
 
-    const PIPE_PREFIX: &str = r"\\.\pipe\";
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
@@ -946,15 +1031,15 @@ mod transport {
     }
 
     /// Discovery files carry the endpoint as the broker was configured —
-    /// a bare pipe name or a full `\\.\pipe\<name>` path. A bare name is
-    /// qualified with the local pipe root; both forms then go through the
-    /// same `CreateFileW`.
+    /// usually a filesystem path. Anything that is not already a fully
+    /// qualified `\\.\pipe\…` goes through the same hash derivation as
+    /// the broker's server side (`pipe_id`, mirrored from
+    /// `takka_runtime::daemon::pipe_id`). The old rule prefixed a bare
+    /// endpoint with the pipe root, which only ever matched a broker that
+    /// had kept the name verbatim — it never matched a filesystem path,
+    /// whose stem the server used to reduce it to.
     fn pipe_path(endpoint: &str) -> Vec<u16> {
-        let name = if endpoint.starts_with(PIPE_PREFIX) {
-            endpoint.to_string()
-        } else {
-            format!("{PIPE_PREFIX}{endpoint}")
-        };
+        let name = pipe_id::pipe_name_for(endpoint);
         OsStr::new(&name).encode_wide().chain([0]).collect()
     }
 
@@ -1197,3 +1282,59 @@ pub(crate) mod daemon_info_tests;
 #[cfg(test)]
 #[cfg(test)]
 mod handshake_tests;
+
+/// Pipe-name derivation (H-07 follow-up): the client copy must produce
+/// the same names as the broker's copy, or an attach would address a
+/// pipe nobody listens on. The vectors here are duplicated verbatim in
+/// `takka-runtime`'s `pipe_name_hashing_is_unique_and_stable`.
+#[cfg(test)]
+mod pipe_id_tests {
+    use super::pipe_id::{fnv1a64, normalize, pipe_name_for};
+
+    #[test]
+    fn pipe_name_matches_server_derivation() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(normalize("/tmp/x.SOCK/"), r"\tmp\x.sock");
+
+        assert_eq!(
+            pipe_name_for("/tmp/takka-da-123-456/ep-456.sock"),
+            r"\\.\pipe\takka-0013c643e0315b28"
+        );
+        assert_eq!(
+            pipe_name_for(r"C:\Temp\takka-da-1-2\ep-3.sock"),
+            r"\\.\pipe\takka-2dd13866d5f634ea"
+        );
+        assert_eq!(
+            pipe_name_for(r"\\.\pipe\takka-pinned"),
+            r"\\.\pipe\takka-pinned"
+        );
+    }
+
+    /// A failed transport connect must keep the actionable message as
+    /// `to_string()` (several tests and the CLI's user-facing output pin
+    /// it) while still carrying the underlying OS error, so a Windows
+    /// `ERROR_ACCESS_DENIED` can no longer hide inside "no daemon
+    /// running".
+    #[test]
+    fn no_daemon_error_keeps_the_cause() {
+        let cause = anyhow::anyhow!("Access is denied. (os error 5)");
+        let error = super::no_daemon_error(cause);
+        assert_eq!(error.to_string(), super::NO_DAEMON_MESSAGE);
+        let chain: Vec<String> = error.chain().map(|link| link.to_string()).collect();
+        assert!(
+            chain.iter().any(|link| link.contains("os error 5")),
+            "cause must survive in the chain, got {chain:?}"
+        );
+    }
+
+    /// The endpoint the fixture writes is what an attach asks for: same
+    /// string in, same pipe name out, and two concurrent fixtures never
+    /// share one.
+    #[test]
+    fn distinct_endpoints_never_collide() {
+        let a = pipe_name_for("/tmp/takka-da-123-456/ep-456.sock");
+        let b = pipe_name_for("/tmp/takka-da-123-457/ep-457.sock");
+        assert_ne!(a, b);
+        assert_eq!(a, pipe_name_for("/tmp/takka-da-123-456/ep-456.sock"));
+    }
+}
