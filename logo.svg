@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Container: Dark squircle with subtle border -->
+  <rect width="64" height="64" rx="16" fill="#0A0A0C" />
+  <rect x="0.5" y="0.5" width="63" height="63" rx="15.5" fill="none" stroke="#27272A" stroke-width="1" />
+
+  <!-- takka geometric glyph -->
+  <g transform="translate(3, 4) scale(0.113)">
+    <!-- Terminal Prompt Chevron + 'T' Stem -->
+    <path d="M 148 160 L 220 224 L 148 288 L 182 320 L 282 232 C 288 227 288 221 282 216 L 182 128 Z" fill="#FFFFFF" />
+
+    <!-- Sharp Top 'T' Bar -->
+    <path d="M 216 128 L 364 128 L 364 172 L 298 172 L 264 142 Z" fill="#FFFFFF" />
+
+    <!-- Terminal Command Exec Bolt / Lower Leg -->
+    <path d="M 284 196 L 368 274 C 374 280 374 288 368 294 L 332 328 L 252 254 L 266 216 Z" fill="#FFFFFF" />
+
+    <!-- Prompt Core Dot Cutout -->
+    <circle cx="238" cy="224" r="14" fill="#0A0A0C" />
+    <circle cx="238" cy="224" r="7" fill="#FFFFFF" />
+
+    <!-- Active Terminal Cursor Indicator -->
+    <rect x="330" y="318" width="46" height="12" rx="6" fill="#FFFFFF" />
+  </g>
+</svg>

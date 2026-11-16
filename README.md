@@ -1,4 +1,10 @@
+<div align="center">
+
+<img src="logo.svg" alt="takka logo" width="96" />
+
 # takka
+
+</div>
 
 takka is a Rust-based coding agent that can inspect a codebase, edit files,
 run commands, use external tools, and work through multi-step development tasks
