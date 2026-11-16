@@ -743,6 +743,9 @@ impl<T: Transport> RuntimeEngine<T> {
         if let Some(max_iterations) = config.agent.max_iterations {
             orchestrator.set_max_iterations(max_iterations);
         }
+        // Spend ceiling (`agent.max_cost_usd`): `None` leaves the loop
+        // unlimited, exactly as before the key existed.
+        orchestrator.set_max_cost_usd(config.agent.max_cost_usd);
         self.install_confirmation_handler(&mut orchestrator);
         self.install_steering_source(&mut orchestrator);
         self.orchestrator = Some(Arc::new(orchestrator));
