@@ -170,6 +170,21 @@ impl TranslatorState {
             | Event::CompactionStarted
             | Event::WaitingForUser
             | Event::SessionCompleted { .. } => None,
+            // Spend ceiling (`agent.max_cost_usd`): the work paid for so far
+            // is still delivered, so the turn surfaces as an ordinary
+            // agent message explaining why it stopped early. ACP has no
+            // stop reason for a budget cut, and reporting `error` would
+            // turn a policy outcome into a failed prompt.
+            Event::CostLimitExceeded {
+                max_cost_usd,
+                spent_usd,
+            } => Some(acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(text_block(format!(
+                    "Spend ceiling reached (spent ${spent_usd:.4} of \
+                     ${max_cost_usd:.4}); the run stopped here. Raise or remove \
+                     `agent.max_cost_usd` in the takka config to continue."
+                ))),
+            )),
             // D12/D9: consumed by the turn loop (stop reason) and the mode
             // surface, never rendered as a stream update.
             Event::TurnLimitExceeded { .. } | Event::PermissionModeChanged { .. } => None,
@@ -240,6 +255,30 @@ mod tests {
         };
         assert_eq!(usage.used, 53_000);
         assert_eq!(usage.size, 198_192);
+    }
+
+    /// H-06: a budget stop has no ACP stop reason of its own, so it surfaces
+    /// as an agent message that names the ceiling and the way out — never as
+    /// an error prompt (the work paid for was delivered).
+    #[test]
+    fn cost_limit_exceeded_maps_to_an_explanatory_agent_message() {
+        let mut state = TranslatorState::new();
+        let update = take(
+            &mut state,
+            takka_core::Event::CostLimitExceeded {
+                max_cost_usd: 0.50,
+                spent_usd: 0.62,
+            },
+        );
+        let wire = serde_json::to_value(&update).expect("update serializes");
+        assert_eq!(
+            wire["sessionUpdate"],
+            serde_json::json!("agent_message_chunk")
+        );
+        let text = wire["content"]["text"].as_str().expect("text");
+        assert!(text.contains("$0.62"), "{text}");
+        assert!(text.contains("$0.50"), "{text}");
+        assert!(text.contains("agent.max_cost_usd"), "{text}");
     }
 
     #[test]

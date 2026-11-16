@@ -104,6 +104,25 @@ pub fn text_response(s: &str) -> ChatResponse {
     }
 }
 
+/// Token usage for spend-ceiling tests: `total_tokens` is derived, matching
+/// what the real providers send.
+pub fn usage(prompt_tokens: u32, completion_tokens: u32) -> takka_core::providers::ChatUsage {
+    takka_core::providers::ChatUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+    }
+}
+
+/// Price of one token of the ceiling tests' model
+/// (`claude-3-5-sonnet`: $3.00 / Mtok in, $15.00 / Mtok out). Returned as a
+/// closure so the arithmetic stays readable in the assertions.
+pub fn sonnet_cost(prompt_tokens: u32, completion_tokens: u32) -> f64 {
+    f64::from(prompt_tokens) * 3.0 / 1_000_000.0 + f64::from(completion_tokens) * 15.0 / 1_000_000.0
+}
+
 /// Provider that returns scripted `ChatResponse`s in order, one per
 /// `chat()` call, AND records how many tools each request offered.
 /// Used by the graceful-finalization tests to assert that tools are

@@ -552,6 +552,15 @@ impl App {
                         takka_core::Event::Error { message } => {
                             let _ = event_tx.send(AppMessage::Error(message));
                         }
+                        takka_core::Event::CostLimitExceeded {
+                            max_cost_usd,
+                            spent_usd,
+                        } => {
+                            let _ = event_tx.send(AppMessage::CostLimit {
+                                max_cost_usd,
+                                spent_usd,
+                            });
+                        }
                         takka_core::Event::Usage {
                             prompt_tokens,
                             completion_tokens,

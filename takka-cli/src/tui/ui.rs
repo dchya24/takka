@@ -98,6 +98,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
 
+    // H-06: remaining budget for this run, when a ceiling is configured.
+    if let Some(chip) = app.budget_chip() {
+        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!(" {chip} "),
+            Style::default().fg(Color::Rgb(241, 196, 15)),
+        ));
+    }
+
     // Context indicator (G-11): AGENT.md / memory.md
     if !context.is_empty() {
         spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
@@ -677,6 +686,40 @@ mod tests {
         assert!(
             shown.contains("idle text"),
             "idle pane must show the idle buffer: {shown:?}"
+        );
+    }
+
+    /// H-06: the header carries the run's remaining budget when
+    /// `agent.max_cost_usd` is configured, and stays unchanged when it is not.
+    #[test]
+    fn header_shows_remaining_budget_only_when_a_ceiling_is_set() {
+        let render_header = |config: Config, run_cost_usd: f64| {
+            let commands = Arc::new(Mutex::new(Commands::new(config)));
+            let mut app = App::new(commands);
+            app.stats.run_cost_usd = run_cost_usd;
+            let area = Rect::new(0, 0, 100, 3);
+            let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            term.draw(|f| draw_header(f, &app, area)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let unlimited = render_header(Config::fallback(), 0.40);
+        assert!(
+            !unlimited.contains("left"),
+            "no ceiling means no budget chip: {unlimited:?}"
+        );
+
+        let mut capped = Config::fallback();
+        capped.agent.max_cost_usd = Some(1.50);
+        let shown = render_header(capped, 0.40);
+        assert!(
+            shown.contains("$1.10 of $1.50 left"),
+            "header must show the remaining budget: {shown:?}"
         );
     }
 }

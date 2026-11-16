@@ -103,6 +103,12 @@ pub struct AgentLoopConfig {
     /// Default is 30 (the orchestrator's compiled-in default).
     #[serde(default)]
     pub max_iterations: Option<u32>,
+    /// Spend ceiling for one run, in US dollars. When the accumulated cost
+    /// of the run's provider calls crosses it, the loop stops after the
+    /// crossing turn (see `Event::CostLimitExceeded`). `None` (the default)
+    /// means unlimited — the pre-ceiling behaviour.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
     /// Planner agent configuration.
     #[serde(default)]
     pub planner: PlannerLoopConfig,
@@ -724,6 +730,8 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).expect("parse");
         assert!(!cfg.agent.auto_compact_with_llm);
         assert!(cfg.agent.summarizer_model.is_none());
+        // Unset spend ceiling = unlimited (pre-ceiling behaviour).
+        assert!(cfg.agent.max_cost_usd.is_none());
 
         // Planner config should have defaults when omitted.
         assert_eq!(cfg.agent.planner.max_steps, 20);
@@ -757,6 +765,26 @@ mod tests {
         let cfg2: Config = serde_json::from_str(&out).expect("reparse");
         assert!(cfg2.agent.auto_compact_with_llm);
         assert_eq!(cfg2.agent.summarizer_model.as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn max_cost_usd_round_trips() {
+        let json = r#"{
+            "providers": [{
+                "name": "p",
+                "type": "openai-compatible",
+                "api_base": "https://x",
+                "api_key": "k",
+                "models": [{"model": "m"}]
+            }],
+            "agent": { "max_cost_usd": 2.5 }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.agent.max_cost_usd, Some(2.5));
+
+        let out = serde_json::to_string(&cfg).expect("serialize");
+        let cfg2: Config = serde_json::from_str(&out).expect("reparse");
+        assert_eq!(cfg2.agent.max_cost_usd, Some(2.5));
     }
 
     #[test]

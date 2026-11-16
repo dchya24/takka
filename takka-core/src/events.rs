@@ -285,6 +285,15 @@ pub enum Event {
     #[serde(rename = "turn_limit_exceeded")]
     TurnLimitExceeded { kind: TurnLimitKind },
 
+    /// Emitted when a turn ends because the run's accumulated spend reached
+    /// `agent.max_cost_usd`. Same contract as `TurnLimitExceeded`: the loop
+    /// stops *after* the crossing turn completes (never mid-stream), so the
+    /// work already paid for still lands. Carries what the run spent and the
+    /// ceiling it crossed, so frontends can show both.
+    #[serde(rename = "cost_limit_exceeded")]
+    #[serde(rename_all = "camelCase")]
+    CostLimitExceeded { max_cost_usd: f64, spent_usd: f64 },
+
     /// Ack of `Request::SetPermissionMode` (ACP `session/set_mode`, D9):
     /// the session now runs in `mode`. Takes effect at the next turn
     /// boundary (safety is checked per boundary).
@@ -389,6 +398,7 @@ pub enum EventType {
     Steered,
     SessionAdopted,
     TurnLimitExceeded,
+    CostLimitExceeded,
     PermissionModeChanged,
     HistoryReplay,
     SessionLoaded,
@@ -439,6 +449,7 @@ impl Event {
             Event::Steered { .. } => EventType::Steered,
             Event::SessionAdopted { .. } => EventType::SessionAdopted,
             Event::TurnLimitExceeded { .. } => EventType::TurnLimitExceeded,
+            Event::CostLimitExceeded { .. } => EventType::CostLimitExceeded,
             Event::PermissionModeChanged { .. } => EventType::PermissionModeChanged,
             Event::HistoryReplay { .. } => EventType::HistoryReplay,
             Event::SessionLoaded { .. } => EventType::SessionLoaded,
@@ -670,6 +681,23 @@ mod tests {
             let parsed: Event = serde_json::from_value(json).unwrap();
             assert_eq!(parsed.event_type(), EventType::TurnLimitExceeded);
         }
+    }
+
+    #[test]
+    fn cost_limit_exceeded_serializes_with_wire_tag() {
+        // The spend ceiling's stop event must round-trip with the stable
+        // snake_case tag `cost_limit_exceeded` and camelCase payload fields
+        // so non-Rust frontends can render the ceiling and what was spent.
+        let event = Event::CostLimitExceeded {
+            max_cost_usd: 1.5,
+            spent_usd: 1.62,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "cost_limit_exceeded");
+        assert_eq!(json["maxCostUsd"], 1.5);
+        assert_eq!(json["spentUsd"], 1.62);
+        let parsed: Event = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.event_type(), EventType::CostLimitExceeded);
     }
 
     #[test]

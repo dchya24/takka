@@ -34,6 +34,10 @@ This file defines available AI providers, their models, and enabled tools.
     "show_thoughts": true,
     "show_tool_calls": true
   },
+  "agent": {
+    "max_iterations": 30,
+    "max_cost_usd": null
+  },
   "mcp_servers": {
     "<server_name>": {
       "command": "string",
@@ -107,6 +111,44 @@ CLI output preferences:
 * `/timeline` (REPL) → `detailed` (default) or `compact` tool-timeline detail;
   `compact` prints one row per tool with no nested output, errors or diffs
 * `show_tool_calls` → Show tool call details (default: `true`)
+
+---
+
+#### `agent`
+
+Agent-loop knobs. Every key is optional; omitting the block keeps the
+built-in defaults.
+
+* `max_iterations` → Hard cap on agent-loop iterations for one user turn
+  (default: `30`). The last allowed turn is a forced finalization: tools are
+  stripped and the model must answer in text, so hitting the cap still yields
+  a result.
+* `max_cost_usd` → Spend ceiling for **one user turn**, in US dollars
+  (default: `null` = unlimited, i.e. the behaviour before this key existed).
+
+  The cost of every provider call is priced against a built-in list-price
+  table (USD per million tokens, including prompt-cache reads/writes) and
+  accumulated for the run. When the running total reaches the ceiling, the
+  loop stops with `cost_limit_exceeded` **after the crossing turn completes** —
+  a tool batch that turn requested still runs, and an in-flight/provider
+  stream is never cut mid-response. The work already paid for is returned as
+  the answer; the stop is a policy outcome, not a failure.
+
+  The counter restarts at every turn, so `max_cost_usd: 0.50` allows up to
+  about $0.50 per prompt, not per session. Models with no entry in the price
+  table cannot be priced, so the ceiling stays unevaluated for them
+  (fail-open) rather than stopping a run on a guess.
+
+  The REPL and TUI show the remaining budget in their status lines while a
+  ceiling is set, and the stop notice tells you to raise or remove the key.
+
+**Example — cap each turn at 25 cents:**
+
+```json
+"agent": {
+  "max_cost_usd": 0.25
+}
+```
 
 ---
 

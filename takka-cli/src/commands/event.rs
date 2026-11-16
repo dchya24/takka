@@ -210,6 +210,17 @@ pub(crate) fn render_event(event: &takka_core::Event, timeline: &mut ToolTimelin
         takka_core::Event::Error { message } => {
             inline::print_line(&components::error_badge(message));
         }
+        // H-06: the run stopped on budget, not on failure. Name the cause and
+        // the way out instead of letting the turn end silently.
+        takka_core::Event::CostLimitExceeded {
+            max_cost_usd,
+            spent_usd,
+        } => {
+            inline::print_line(&components::warning_badge(&crate::widgets::budget::stop_notice(
+                *max_cost_usd,
+                *spent_usd,
+            )));
+        }
         takka_core::Event::System { message } => {
             inline::print_line(&components::info_badge(message));
         }

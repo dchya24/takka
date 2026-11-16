@@ -250,6 +250,18 @@ pub struct Orchestrator {
     /// a user message and announced via `Event::Steered`. `None` (the
     /// default) means no poll — the loop behaves exactly as before.
     steering_source: Option<Box<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Spend ceiling for one run, in USD. `None` (the default) means
+    /// unlimited: cost is still accumulated but never stops the loop.
+    ///
+    /// Immutable after construction on purpose — runs take `&self` (the
+    /// runtime clones the orchestrator's `Arc` into its run thread), so the
+    /// ceiling is set once by the host while the accumulator below moves
+    /// under a mutex.
+    max_cost_usd: Option<f64>,
+    /// Cost accumulated by the current run, in USD. Reset at the start of
+    /// every run (see `run.rs`) and updated after each provider usage
+    /// report.
+    run_cost_usd: Mutex<f64>,
 }
 
 impl Orchestrator {
@@ -277,6 +289,8 @@ impl Orchestrator {
             auto_compact_with_llm: false,
             summarizer_model: None,
             steering_source: None,
+            max_cost_usd: None,
+            run_cost_usd: Mutex::new(0.0),
         }
     }
 
@@ -412,6 +426,48 @@ impl Orchestrator {
     /// Clear the loop detection history (e.g. after a successful non-tool response).
     fn clear_loop_detection(&self) {
         sync::lock(&self.recent_tool_calls).clear();
+    }
+
+    /// Set the run's spend ceiling in USD. `None` (or a non-positive /
+    /// negative value) means unlimited. When the accumulated cost of a run
+    /// crosses the ceiling, the loop emits `Event::CostLimitExceeded` and
+    /// stops after the crossing turn completes. Needs `&mut` — hosts call it
+    /// between runs (the runtime engine wires it from
+    /// `agent.max_cost_usd`).
+    pub fn set_max_cost_usd(&mut self, max_cost_usd: Option<f64>) {
+        self.max_cost_usd = max_cost_usd.filter(|max| *max > 0.0);
+    }
+
+    /// Configured spend ceiling for one run, if any.
+    pub fn max_cost_usd(&self) -> Option<f64> {
+        self.max_cost_usd
+    }
+
+    /// Cost accumulated by the current run so far, in USD.
+    pub fn run_cost_usd(&self) -> f64 {
+        *sync::lock(&self.run_cost_usd)
+    }
+
+    /// Reset the per-run cost accumulator (called at the start of every
+    /// run, so the ceiling guards one user turn, not the whole session).
+    pub(super) fn reset_run_cost(&self) {
+        *sync::lock(&self.run_cost_usd) = 0.0;
+    }
+
+    /// Accumulate one usage report's cost and report whether the run has
+    /// now crossed the ceiling. Returning `false` means "keep going" — the
+    /// unlimited case and every under-budget report land here.
+    ///
+    /// The comparison is `>=` on purpose: a ceiling of exactly the reported
+    /// spend is treated as reached, so `max_cost_usd: 0.01` stops a run that
+    /// has just spent its last cent.
+    pub(super) fn record_run_cost(&self, cost_usd: f64) -> bool {
+        let mut spent = sync::lock(&self.run_cost_usd);
+        *spent += cost_usd.max(0.0);
+        match self.max_cost_usd {
+            Some(max) => *spent >= max,
+            None => false,
+        }
     }
 
     /// Check if we're approaching the iteration limit (>= 80%).
@@ -667,5 +723,79 @@ mod cancel_handle_tests {
         .unwrap();
 
         assert!(cancel.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod spend_ceiling_tests {
+    use super::*;
+    use crate::providers::{
+        ChatChunk, ChatRequest, ChatResponse, ProviderError, ProviderResult, StreamResult,
+    };
+
+    /// Never called: these tests exercise the accumulator, not the loop.
+    struct UnusedProvider;
+
+    impl LLMProvider for UnusedProvider {
+        fn provider_type(&self) -> &str {
+            "unused"
+        }
+        fn provider_id(&self) -> &str {
+            "unused"
+        }
+        fn chat(&self, _request: ChatRequest) -> ProviderResult<ChatResponse> {
+            Err(ProviderError::new("unused"))
+        }
+        fn chat_stream(&self, _request: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
+            Err(ProviderError::new("unused"))
+        }
+    }
+
+    fn orchestrator() -> Orchestrator {
+        Orchestrator::new(std::sync::Arc::new(UnusedProvider), ToolRegistry::new())
+    }
+
+    #[test]
+    fn default_is_unlimited_and_accumulates_without_stopping() {
+        let orch = orchestrator();
+        assert_eq!(orch.max_cost_usd(), None);
+        assert_eq!(orch.run_cost_usd(), 0.0);
+        assert!(!orch.record_run_cost(1_000.0), "unset ceiling never stops");
+        assert_eq!(orch.run_cost_usd(), 1_000.0);
+    }
+
+    #[test]
+    fn non_positive_ceiling_is_treated_as_unlimited() {
+        let mut orch = orchestrator();
+        orch.set_max_cost_usd(Some(0.0));
+        assert_eq!(orch.max_cost_usd(), None);
+        orch.set_max_cost_usd(Some(-1.0));
+        assert_eq!(orch.max_cost_usd(), None);
+    }
+
+    #[test]
+    fn crossing_the_ceiling_is_reported_once_per_record() {
+        let mut orch = orchestrator();
+        orch.set_max_cost_usd(Some(0.05));
+        orch.reset_run_cost();
+        assert!(!orch.record_run_cost(0.04), "under budget keeps going");
+        assert!(orch.record_run_cost(0.02), "crossing is reported");
+        assert!((orch.run_cost_usd() - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exact_ceiling_counts_as_crossed() {
+        let mut orch = orchestrator();
+        orch.set_max_cost_usd(Some(0.01));
+        orch.reset_run_cost();
+        assert!(orch.record_run_cost(0.01), "spending the last cent stops");
+    }
+
+    #[test]
+    fn run_cost_resets_to_zero() {
+        let orch = orchestrator();
+        orch.record_run_cost(0.5);
+        orch.reset_run_cost();
+        assert_eq!(orch.run_cost_usd(), 0.0);
     }
 }

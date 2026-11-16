@@ -29,6 +29,7 @@ pub mod memory;
 pub mod memory_file;
 pub mod orchestrator;
 pub mod planner;
+pub mod pricing;
 pub mod prompts;
 pub mod providers;
 pub mod runtime;
@@ -68,6 +69,7 @@ pub use memory_file::{
 };
 pub use orchestrator::{Orchestrator, OrchestratorState};
 pub use planner::{Plan, PlanResult, PlanStatus, PlannerAgent, PlannerConfig, Step, StepStatus};
+pub use pricing::ModelPrice;
 pub use prompts::{
     assemble_system_prompt, find_project_instructions, load_project_instructions,
     skills_system_section, DEFAULT_SYSTEM_PROMPT, PROJECT_INSTRUCTION_FILES,

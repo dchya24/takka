@@ -51,6 +51,7 @@
   },
   "agent": {
     "max_iterations": 30,
+    "max_cost_usd": null,
     "auto_compact_with_llm": false,
     "summarizer_model": null,
     "planner": {
