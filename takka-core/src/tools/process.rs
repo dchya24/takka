@@ -54,11 +54,21 @@ pub fn run_bounded(
     on_progress: Option<&dyn Fn(&str)>,
 ) -> std::io::Result<ProcessOutput> {
     let started = Instant::now();
-    let mut child = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // Put the child in its own process group so a kill can reach its
+        // descendants too: `sh /tmp/x.sh` does not exec the script body, so
+        // killing the interpreter alone leaves grandchildren (e.g. a
+        // backgrounded `sleep`) running.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    let pgid = child.id(); // == pgid: the child leads its new group
 
     let (tx, rx) = mpsc::sync_channel(READ_CHANNEL_DEPTH);
     if let Some(stdout) = child.stdout.take() {
@@ -94,6 +104,10 @@ pub fn run_bounded(
     }
 
     if killed.is_some() {
+        #[cfg(unix)]
+        kill_process_group(pgid);
+        // Windows is out of scope for group kills (no Job Objects here), so
+        // only the direct child is killed and any grandchildren survive.
         let _ = child.kill();
     }
     let status: ExitStatus = child.wait()?;
@@ -125,6 +139,17 @@ pub fn run_bounded(
         stderr: stderr_text,
         killed,
     })
+}
+
+/// SIGKILL the whole process group led by `pgid`. Best effort: a group that
+/// is already gone reports `ESRCH` and is ignored.
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    // SAFETY: `kill` has no memory-safety preconditions; a negative pid
+    // addresses the process group `pgid`.
+    unsafe {
+        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+    }
 }
 
 fn spawn_reader(
