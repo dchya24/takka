@@ -1408,7 +1408,12 @@ mod tests {
                 // Closing a socket that still holds unread input (our
                 // init frame was never read by the refusing daemon)
                 // signals RST rather than FIN — both mean "closed".
+                // A Windows named pipe says the same thing with
+                // ERROR_BROKEN_PIPE ("pipe has been ended", os error
+                // 109), which std does not map to ConnectionReset.
                 Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                #[cfg(windows)]
+                Err(error) if error.raw_os_error() == Some(109) => {}
                 Err(error) => panic!("read after refusal failed: {error}"),
             }
         }
@@ -1807,7 +1812,10 @@ mod tests {
     #[test]
     fn shutdown_unlinks_files() {
         let (socket_path, config_path, token, serve_handle) = spawn_daemon("shutdown");
-        assert!(socket_path.exists() && config_path.parent().unwrap().join("daemon.json").exists());
+        // Readiness is the discovery file on both transports: a unix
+        // socket is a file on disk, a Windows named pipe is not, so
+        // asserting `socket_path.exists()` would be unix-only.
+        assert!(config_path.parent().unwrap().join("daemon.json").exists());
 
         let mut client = TestConn::connect(&socket_path, deadline());
         client.send(&init_frame(
