@@ -1799,3 +1799,61 @@ fn read_after_edit_does_not_trigger_nudge() {
         *captured
     );
 }
+
+/// O-02: the tool budget shrinks in stages as the iteration cap nears —
+/// read-only tools dropped at 80%, edit tools only at 90%, nothing on the
+/// forced-finalization turn. A run that stays below 80% keeps the full set.
+#[test]
+fn wind_down_shrinks_tool_defs_in_stages() {
+    let mut script = Vec::new();
+    for i in 0..9 {
+        // Distinct args per turn: identical calls would trip loop
+        // detection long before the wind-down stages are reached.
+        script.push(support::tool_call_response(
+            &format!("call-{}", i),
+            "list_files",
+            &serde_json::json!({"path": format!("dir{}", i)}),
+        ));
+    }
+    script.push(support::text_response("wrapped up"));
+
+    let provider = Arc::new(support::RecordingProvider::new(script));
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider.clone(), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(10); // 80% = 8, 90% = 9, final = 10
+
+    let answer = orch.run("walk many directories").expect("run should succeed");
+    assert_eq!(answer, "wrapped up");
+
+    let counts = provider.tool_counts.lock().unwrap().clone();
+    assert_eq!(counts.len(), 10, "one request per iteration, got {:?}", counts);
+
+    let full = counts[0];
+    assert!(full > 0, "expected tools to be offered, got {:?}", counts);
+    assert!(
+        counts[..7].iter().all(|&c| c == full),
+        "below 80% the full tool set must stay, got {:?}",
+        counts
+    );
+    assert!(
+        counts[7] < full,
+        "at 80% read-only tools must be trimmed, got {:?}",
+        counts
+    );
+    assert!(
+        counts[8] < counts[7],
+        "at 90% only edit tools may remain, got {:?}",
+        counts
+    );
+    assert_eq!(
+        counts[9], 0,
+        "the finalization turn must strip every tool, got {:?}",
+        counts
+    );
+}

@@ -15,9 +15,40 @@ use crate::providers::ChatRequest;
 use crate::sync;
 use crate::AgenticError;
 
-use super::{Orchestrator, OrchestratorState};
+use super::{Orchestrator, OrchestratorState, WindDownStage};
 
 impl Orchestrator {
+    /// Narrow `defs` to what the wind-down `stage` still allows.
+    ///
+    /// Classification comes from the registry's own metadata, so a newly
+    /// registered tool narrows itself without a hardcoded name list:
+    /// `TrimReadOnly` drops everything read-only, `EditsOnly` keeps only
+    /// filesystem-mutating tools.
+    fn tool_defs_for_stage(
+        &self,
+        defs: &[crate::providers::ToolDefinition],
+        stage: WindDownStage,
+    ) -> Vec<crate::providers::ToolDefinition> {
+        use crate::tool::{Mutability, SideEffects};
+        match stage {
+            WindDownStage::Full => defs.to_vec(),
+            WindDownStage::TrimReadOnly => defs
+                .iter()
+                .filter(|d| {
+                    self.tools.metadata(&d.function.name).mutability == Mutability::Mutating
+                })
+                .cloned()
+                .collect(),
+            WindDownStage::EditsOnly => defs
+                .iter()
+                .filter(|d| {
+                    self.tools.metadata(&d.function.name).side_effects == SideEffects::FsWrite
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
     pub fn run(&self, input: &str) -> Result<String, AgenticError> {
         self.run_with_attachments(input, Vec::new())
     }
@@ -103,21 +134,30 @@ impl Orchestrator {
             // done.
             let finalizing = iteration == self.max_iterations;
 
-            // Warn when approaching the limit (80% threshold): surface a
-            // UI notice and inject a transient "start wrapping up" nudge
-            // so the model converges naturally before forced finalization.
-            let approaching = self.approaching_limit(iteration) && !finalizing;
+            // Graduated wind-down: the offered tool set shrinks in
+            // stages as the cap nears (read-only tools first, then edits
+            // only) so the model converges while it still has the tools
+            // to act. A transient "start wrapping up" nudge rides along.
+            let stage = if finalizing {
+                WindDownStage::Full
+            } else {
+                self.wind_down_stage(iteration)
+            };
+            let approaching = stage != WindDownStage::Full;
             if approaching {
                 tracing::info!(
                     iteration,
                     max = self.max_iterations,
+                    stage = stage.label(),
                     "Approaching max_iterations limit"
                 );
                 // Emit a warning event so the UI can display it
                 self.events.emit(crate::events::Event::System {
                     message: format!(
-                        "⚠️ Approaching iteration limit ({}/{})",
-                        iteration, self.max_iterations
+                        "⚠️ Approaching iteration limit ({}/{}): {}",
+                        iteration,
+                        self.max_iterations,
+                        stage.label()
                     ),
                 });
             }
@@ -156,7 +196,7 @@ impl Orchestrator {
             // return tool calls — the model is forced to answer in text.
             let mut request = ChatRequest::new(&self.model, messages);
             if !finalizing {
-                request = request.with_tools(tool_defs.clone());
+                request = request.with_tools(self.tool_defs_for_stage(&tool_defs, stage));
             }
             if let Some(ref prompt) = self.system_prompt {
                 request = request.with_system_prompt(prompt.clone());
@@ -398,20 +438,28 @@ impl Orchestrator {
             // the full rationale.
             let finalizing = iteration == self.max_iterations;
 
-            // Warn when approaching the limit (80% threshold): UI notice
-            // + transient "start wrapping up" nudge so the model can
-            // converge naturally before forced finalization.
-            let approaching = self.approaching_limit(iteration) && !finalizing;
+            // Warn when approaching the limit: UI notice + transient
+            // "start wrapping up" nudge, with the same staged tool-budget
+            // narrowing as the sync loop.
+            let stage = if finalizing {
+                WindDownStage::Full
+            } else {
+                self.wind_down_stage(iteration)
+            };
+            let approaching = stage != WindDownStage::Full;
             if approaching {
                 tracing::info!(
                     iteration,
                     max = self.max_iterations,
+                    stage = stage.label(),
                     "Approaching max_iterations limit"
                 );
                 self.events.emit(crate::events::Event::System {
                     message: format!(
-                        "⚠️ Approaching iteration limit ({}/{})",
-                        iteration, self.max_iterations
+                        "⚠️ Approaching iteration limit ({}/{}): {}",
+                        iteration,
+                        self.max_iterations,
+                        stage.label()
                     ),
                 });
             }
@@ -448,7 +496,7 @@ impl Orchestrator {
             // return tool calls — the model is forced to answer in text.
             let mut request = ChatRequest::new(&self.model, messages);
             if !finalizing {
-                request = request.with_tools(tool_defs.clone());
+                request = request.with_tools(self.tool_defs_for_stage(&tool_defs, stage));
             }
             request = request.stream();
             if let Some(ref prompt) = self.system_prompt {

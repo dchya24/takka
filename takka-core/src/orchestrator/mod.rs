@@ -54,6 +54,35 @@ const LOOP_DETECTION_WINDOW: usize = 8;
 /// pattern reaches this count without any mutation in between.
 const SEMANTIC_LOOP_THRESHOLD: usize = 4;
 
+/// Graduated narrowing of the tool budget as the iteration cap nears.
+///
+/// The cap used to be a cliff: a single nudge at 80% that the model
+/// routinely ignored, then every tool stripped at 100%. Staging the
+/// reduction gives the model a chance to converge while it still has
+/// the tools it needs to act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindDownStage {
+    /// Below the wind-down threshold: every tool stays available.
+    Full,
+    /// From 80% of the cap: inspection tools are dropped so the model
+    /// stops exploring and starts acting on what it already found.
+    TrimReadOnly,
+    /// From 90% of the cap: only filesystem-mutating (write/edit) tools
+    /// remain.
+    EditsOnly,
+}
+
+impl WindDownStage {
+    /// Human-readable stage name for `Event::System` notices.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full tool set",
+            Self::TrimReadOnly => "read-only tools trimmed — act on what you found",
+            Self::EditsOnly => "edit tools only — finish the change now",
+        }
+    }
+}
+
 /// Default tool-result truncation limit (chars). Layer 1 of context compression.
 pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 25_000;
 
@@ -575,9 +604,26 @@ impl Orchestrator {
         }
     }
 
+    /// Iteration number at which `percent` of the cap is reached (>= 1).
+    fn iteration_threshold(&self, percent: u32) -> u32 {
+        (self.max_iterations * percent / 100).max(1)
+    }
+
     /// Check if we're approaching the iteration limit (>= 80%).
     fn approaching_limit(&self, iteration: u32) -> bool {
-        iteration >= (self.max_iterations * 4 / 5).max(1)
+        iteration >= self.iteration_threshold(80)
+    }
+
+    /// Wind-down stage for `iteration`: how much of the tool budget the
+    /// loop may still offer the model.
+    pub(super) fn wind_down_stage(&self, iteration: u32) -> WindDownStage {
+        if iteration >= self.iteration_threshold(90) {
+            WindDownStage::EditsOnly
+        } else if self.approaching_limit(iteration) {
+            WindDownStage::TrimReadOnly
+        } else {
+            WindDownStage::Full
+        }
     }
 
     /// Override the per-tool-result character cap.
