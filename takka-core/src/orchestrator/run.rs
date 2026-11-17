@@ -15,9 +15,40 @@ use crate::providers::ChatRequest;
 use crate::sync;
 use crate::AgenticError;
 
-use super::{Orchestrator, OrchestratorState};
+use super::{Orchestrator, OrchestratorState, WindDownStage};
 
 impl Orchestrator {
+    /// Narrow `defs` to what the wind-down `stage` still allows.
+    ///
+    /// Classification comes from the registry's own metadata, so a newly
+    /// registered tool narrows itself without a hardcoded name list:
+    /// `TrimReadOnly` drops everything read-only, `EditsOnly` keeps only
+    /// filesystem-mutating tools.
+    fn tool_defs_for_stage(
+        &self,
+        defs: &[crate::providers::ToolDefinition],
+        stage: WindDownStage,
+    ) -> Vec<crate::providers::ToolDefinition> {
+        use crate::tool::{Mutability, SideEffects};
+        match stage {
+            WindDownStage::Full => defs.to_vec(),
+            WindDownStage::TrimReadOnly => defs
+                .iter()
+                .filter(|d| {
+                    self.tools.metadata(&d.function.name).mutability == Mutability::Mutating
+                })
+                .cloned()
+                .collect(),
+            WindDownStage::EditsOnly => defs
+                .iter()
+                .filter(|d| {
+                    self.tools.metadata(&d.function.name).side_effects == SideEffects::FsWrite
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
     pub fn run(&self, input: &str) -> Result<String, AgenticError> {
         self.run_with_attachments(input, Vec::new())
     }
@@ -64,6 +95,17 @@ impl Orchestrator {
         // The spend ceiling guards one user turn: start each run at zero.
         self.reset_run_cost();
 
+        // O-05a plan-then-execute: a FRESH turn (no adopted session id —
+        // i.e. not a resumed checkpoint) gets a new plan when plan mode
+        // is on; a resumed session keeps its checkpointed plan and skips
+        // the extra call.
+        if self.session_id().is_none() {
+            *sync::lock(&self.plan) = None;
+        }
+        if self.plan_mode && sync::lock(&self.plan).is_none() {
+            self.create_session_plan(input);
+        }
+
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
         } else {
@@ -103,21 +145,30 @@ impl Orchestrator {
             // done.
             let finalizing = iteration == self.max_iterations;
 
-            // Warn when approaching the limit (80% threshold): surface a
-            // UI notice and inject a transient "start wrapping up" nudge
-            // so the model converges naturally before forced finalization.
-            let approaching = self.approaching_limit(iteration) && !finalizing;
+            // Graduated wind-down: the offered tool set shrinks in
+            // stages as the cap nears (read-only tools first, then edits
+            // only) so the model converges while it still has the tools
+            // to act. A transient "start wrapping up" nudge rides along.
+            let stage = if finalizing {
+                WindDownStage::Full
+            } else {
+                self.wind_down_stage(iteration)
+            };
+            let approaching = stage != WindDownStage::Full;
             if approaching {
                 tracing::info!(
                     iteration,
                     max = self.max_iterations,
+                    stage = stage.label(),
                     "Approaching max_iterations limit"
                 );
                 // Emit a warning event so the UI can display it
                 self.events.emit(crate::events::Event::System {
                     message: format!(
-                        "⚠️ Approaching iteration limit ({}/{})",
-                        iteration, self.max_iterations
+                        "⚠️ Approaching iteration limit ({}/{}): {}",
+                        iteration,
+                        self.max_iterations,
+                        stage.label()
                     ),
                 });
             }
@@ -131,9 +182,15 @@ impl Orchestrator {
             // the next provider call.
             self.drain_steering();
 
-            self.maybe_autocompact();
+            self.maybe_autocompact(iteration);
+            self.maybe_cadence_compact(iteration);
 
             let mut messages = self.build_messages();
+            if self.plan_mode {
+                if let Some(plan_msg) = self.plan_progress_message() {
+                    messages.push(plan_msg);
+                }
+            }
             if finalizing {
                 messages.push(Self::finalization_message());
                 self.events.emit(crate::events::Event::System {
@@ -156,7 +213,7 @@ impl Orchestrator {
             // return tool calls — the model is forced to answer in text.
             let mut request = ChatRequest::new(&self.model, messages);
             if !finalizing {
-                request = request.with_tools(tool_defs.clone());
+                request = request.with_tools(self.tool_defs_for_stage(&tool_defs, stage));
             }
             if let Some(ref prompt) = self.system_prompt {
                 request = request.with_system_prompt(prompt.clone());
@@ -165,7 +222,7 @@ impl Orchestrator {
             let response = self
                 .provider
                 .chat(request)
-                .map_err(|e| AgenticError::Provider(e.to_string()))?;
+                .map_err(|e| AgenticError::Provider(e.0.clone()))?;
 
             let content = response.message.content.clone().unwrap_or_default();
             Self::log_response(
@@ -243,6 +300,28 @@ impl Orchestrator {
                          Aborting to prevent an infinite loop.",
                         sig.tool, run, sig.args_preview,
                     )));
+                }
+
+                // Semantic loop detection — *similar* calls (same tool,
+                // same primary target) piling up inside the window: a
+                // steering nudge, never an abort, because scattered
+                // similar calls can be legitimate progress.
+                if let Some((fp, count)) =
+                    self.record_fingerprints_for_loop_detection(&loop_sigs)
+                {
+                    tracing::warn!(
+                        fingerprint = %fp.preview,
+                        count = count,
+                        threshold = super::SEMANTIC_LOOP_THRESHOLD,
+                        "Semantic loop: similar tool call piling up in the window"
+                    );
+                    self.events.emit(crate::events::Event::System {
+                        message: format!(
+                            "🔁 You keep repeating {} ({} similar calls recently). \
+                             Decide or ask rather than reading again.",
+                            fp.preview, count
+                        ),
+                    });
                 }
 
                 let tool_calls: Vec<(String, String, String)> = response
@@ -339,6 +418,17 @@ impl Orchestrator {
         // The spend ceiling guards one user turn: start each run at zero.
         self.reset_run_cost();
 
+        // O-05a plan-then-execute: a FRESH turn (no adopted session id —
+        // i.e. not a resumed checkpoint) gets a new plan when plan mode
+        // is on; a resumed session keeps its checkpointed plan and skips
+        // the extra call.
+        if self.session_id().is_none() {
+            *sync::lock(&self.plan) = None;
+        }
+        if self.plan_mode && sync::lock(&self.plan).is_none() {
+            self.create_session_plan(input);
+        }
+
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
         } else {
@@ -376,20 +466,28 @@ impl Orchestrator {
             // the full rationale.
             let finalizing = iteration == self.max_iterations;
 
-            // Warn when approaching the limit (80% threshold): UI notice
-            // + transient "start wrapping up" nudge so the model can
-            // converge naturally before forced finalization.
-            let approaching = self.approaching_limit(iteration) && !finalizing;
+            // Warn when approaching the limit: UI notice + transient
+            // "start wrapping up" nudge, with the same staged tool-budget
+            // narrowing as the sync loop.
+            let stage = if finalizing {
+                WindDownStage::Full
+            } else {
+                self.wind_down_stage(iteration)
+            };
+            let approaching = stage != WindDownStage::Full;
             if approaching {
                 tracing::info!(
                     iteration,
                     max = self.max_iterations,
+                    stage = stage.label(),
                     "Approaching max_iterations limit"
                 );
                 self.events.emit(crate::events::Event::System {
                     message: format!(
-                        "⚠️ Approaching iteration limit ({}/{})",
-                        iteration, self.max_iterations
+                        "⚠️ Approaching iteration limit ({}/{}): {}",
+                        iteration,
+                        self.max_iterations,
+                        stage.label()
                     ),
                 });
             }
@@ -403,9 +501,15 @@ impl Orchestrator {
             // the next provider call.
             self.drain_steering();
 
-            self.maybe_autocompact();
+            self.maybe_autocompact(iteration);
+            self.maybe_cadence_compact(iteration);
 
             let mut messages = self.build_messages();
+            if self.plan_mode {
+                if let Some(plan_msg) = self.plan_progress_message() {
+                    messages.push(plan_msg);
+                }
+            }
             if finalizing {
                 messages.push(Self::finalization_message());
                 self.events.emit(crate::events::Event::System {
@@ -426,7 +530,7 @@ impl Orchestrator {
             // return tool calls — the model is forced to answer in text.
             let mut request = ChatRequest::new(&self.model, messages);
             if !finalizing {
-                request = request.with_tools(tool_defs.clone());
+                request = request.with_tools(self.tool_defs_for_stage(&tool_defs, stage));
             }
             request = request.stream();
             if let Some(ref prompt) = self.system_prompt {
@@ -477,13 +581,13 @@ impl Orchestrator {
                                 }
                             }
                             Err(e) => {
-                                return Err(AgenticError::Provider(e.to_string()));
+                                return Err(AgenticError::Provider(e.0.clone()));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    return Err(AgenticError::Provider(e.to_string()));
+                    return Err(AgenticError::Provider(e.0.clone()));
                 }
             }
 
@@ -569,6 +673,28 @@ impl Orchestrator {
                          Aborting to prevent an infinite loop.",
                         sig.tool, run, sig.args_preview,
                     )));
+                }
+
+                // Semantic loop detection — *similar* calls (same tool,
+                // same primary target) piling up inside the window: a
+                // steering nudge, never an abort, because scattered
+                // similar calls can be legitimate progress.
+                if let Some((fp, count)) =
+                    self.record_fingerprints_for_loop_detection(&loop_sigs)
+                {
+                    tracing::warn!(
+                        fingerprint = %fp.preview,
+                        count = count,
+                        threshold = super::SEMANTIC_LOOP_THRESHOLD,
+                        "Semantic loop: similar tool call piling up in the window"
+                    );
+                    self.events.emit(crate::events::Event::System {
+                        message: format!(
+                            "🔁 You keep repeating {} ({} similar calls recently). \
+                             Decide or ask rather than reading again.",
+                            fp.preview, count
+                        ),
+                    });
                 }
 
                 self.handle_tool_calls_parallel(&content_buf, &accumulated_tool_calls)

@@ -574,7 +574,9 @@ impl AnthropicProvider {
             .header("Content-Type", "application/json")
             .json(request)
             .send()
-            .map_err(|e| ProviderError::new(format!("Request failed: {}", e)))?;
+            .map_err(|e| {
+                ProviderError::new(format!("Request failed: {}", super::reqwest_chain(&e)))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -740,7 +742,12 @@ impl LLMProvider for AnthropicProvider {
                         .json(&anthropic_request)
                         .send()
                         .await
-                        .map_err(|e| ProviderError::new(format!("Stream request failed: {}", e)))?
+                        .map_err(|e| {
+                            ProviderError::new(format!(
+                                "Stream request failed: {}",
+                                super::reqwest_chain(&e)
+                            ))
+                        })?
                         .error_for_status()
                         .map_err(|e| ProviderError::new(format!("Stream API error: {}", e)))
                 })
@@ -830,7 +837,10 @@ impl LLMProvider for AnthropicProvider {
                                     }
                                 }
                                 Err(e) => {
-                                    yield Err(ProviderError::new(format!("Stream read error: {}", e)));
+                                    yield Err(ProviderError::new(format!(
+                                        "Stream read error: {}",
+                                        super::reqwest_chain(&e)
+                                    )));
                                     return;
                                 }
                             }

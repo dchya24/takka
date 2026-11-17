@@ -24,6 +24,7 @@ use crate::tool_registry::ToolRegistry;
 
 mod checkpoint;
 mod compaction;
+mod planning;
 mod progress;
 mod run;
 mod tool_exec;
@@ -47,6 +48,42 @@ const LOOP_DETECTION_THRESHOLD: usize = 3;
 /// the window and is never fragmented by the trim.
 const LOOP_DETECTION_WINDOW: usize = 8;
 
+/// How many *similar* calls (same tool, same primary target) inside the
+/// window trip the semantic loop nudge. Above [`LOOP_DETECTION_THRESHOLD`]
+/// because scattered repeats of similar-but-not-identical calls can be
+/// legitimate (read → edit → re-read); only the alternation-heavy thrash
+/// pattern reaches this count without any mutation in between.
+const SEMANTIC_LOOP_THRESHOLD: usize = 4;
+
+/// Graduated narrowing of the tool budget as the iteration cap nears.
+///
+/// The cap used to be a cliff: a single nudge at 80% that the model
+/// routinely ignored, then every tool stripped at 100%. Staging the
+/// reduction gives the model a chance to converge while it still has
+/// the tools it needs to act.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindDownStage {
+    /// Below the wind-down threshold: every tool stays available.
+    Full,
+    /// From 80% of the cap: inspection tools are dropped so the model
+    /// stops exploring and starts acting on what it already found.
+    TrimReadOnly,
+    /// From 90% of the cap: only filesystem-mutating (write/edit) tools
+    /// remain.
+    EditsOnly,
+}
+
+impl WindDownStage {
+    /// Human-readable stage name for `Event::System` notices.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full tool set",
+            Self::TrimReadOnly => "read-only tools trimmed — act on what you found",
+            Self::EditsOnly => "edit tools only — finish the change now",
+        }
+    }
+}
+
 /// Default tool-result truncation limit (chars). Layer 1 of context compression.
 pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 25_000;
 
@@ -54,6 +91,10 @@ pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 25_000;
 /// results are replaced with a `[Cleared]` placeholder. Layer 2 of context
 /// compression.
 pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 6;
+
+/// Run the cadenced tool-result collapsing pass every N iterations
+/// (iteration-cadenced compaction). `0` disables the pass.
+pub const DEFAULT_COMPACTION_CADENCE: usize = 10;
 
 /// A tool call reduced to the fields that identify duplicate work.
 ///
@@ -101,6 +142,62 @@ fn truncate_args_preview(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// A tool call reduced to the tool plus its **primary target** — the file
+/// path, command, or pattern it acts on, ignoring line offsets and other
+/// secondary parameters.
+///
+/// Two calls with equal fingerprints do *similar* work: reading the same
+/// file at shifting offsets, re-listing the same directory. That shape is
+/// the soft loop the exact-match guard ([`ToolCallSignature`]) cannot
+/// see — the model thrashes without progress while every individual call
+/// looks fresh.
+#[derive(Clone, PartialEq, Eq)]
+struct ToolCallFingerprint {
+    tool: String,
+    /// Stable hash of the primary target (or of the full args string
+    /// when the tool has no recognizable target field).
+    target_hash: u64,
+    /// Human-readable preview for the nudge message.
+    preview: String,
+}
+
+impl ToolCallFingerprint {
+    fn new(tool: &str, args: &str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let parsed: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        // The first field that names what the call acts on. `pattern`
+        // beats `path` for search tools: the same directory grepped for
+        // different patterns is different work.
+        let target = ["command", "pattern", "path", "file_path", "query"]
+            .iter()
+            .find_map(|key| parsed.get(*key).and_then(|v| v.as_str()));
+        let mut hasher = DefaultHasher::new();
+        match target {
+            Some(t) => {
+                t.hash(&mut hasher);
+                Self {
+                    tool: tool.to_string(),
+                    target_hash: hasher.finish(),
+                    preview: format!("{}({})", tool, truncate_args_preview(t, 80)),
+                }
+            }
+            // No recognizable target: fall back to the full args string,
+            // which makes this fingerprint as strict as the exact
+            // signature — safe for tools we don't know yet.
+            None => {
+                args.hash(&mut hasher);
+                Self {
+                    tool: tool.to_string(),
+                    target_hash: hasher.finish(),
+                    preview: format!("{}({})", tool, truncate_args_preview(args, 80)),
+                }
+            }
+        }
+    }
 }
 
 /// Coarse lifecycle state of the orchestrator (P1-2).
@@ -215,6 +312,9 @@ pub struct Orchestrator {
     max_iterations: u32,
     /// Recent tool-call signatures for loop detection (sliding window).
     recent_tool_calls: Mutex<Vec<ToolCallSignature>>,
+    /// Recent tool-call fingerprints (same tool + same target) for the
+    /// semantic loop nudge (sliding window, same trim rule as above).
+    recent_tool_fingerprints: Mutex<Vec<ToolCallFingerprint>>,
     /// Cap individual tool result strings (Layer 1 of context compression).
     tool_result_max_chars: usize,
     /// Auto-compact memory when token usage exceeds the configured threshold.
@@ -223,6 +323,11 @@ pub struct Orchestrator {
     /// results are replaced with `CLEARED_TOOL_RESULT_PLACEHOLDER` when
     /// building the request. Layer 2 of context compression.
     keep_recent_tool_results: usize,
+    /// Collapse old tool results every N iterations (0 = disabled).
+    compaction_cadence: usize,
+    /// Iteration of the last full (token-budget) autocompact, so the
+    /// cadenced pass can no-op right after one.
+    last_full_compact: Mutex<Option<u32>>,
     /// Cooperative cancel flag. When set, the next loop iteration / tool
     /// batch boundary returns `AgenticError::Cancelled`. Shared via Arc so
     /// callers (CLI signal handlers) can flip it asynchronously.
@@ -235,6 +340,13 @@ pub struct Orchestrator {
     /// Optional session checkpoint store (P1-3). `None` = no
     /// persistence; runs behave exactly as before.
     session_store: Option<Mutex<crate::session::SessionStore>>,
+    /// Opt-in plan-then-execute (O-05a): when set, a run's first
+    /// iteration is preceded by one planner call that turns the goal
+    /// into a step list; progress rides along on every request.
+    plan_mode: bool,
+    /// Serialized `Plan` of the current session, kept for checkpoint
+    /// persistence. `None` on fresh turns and when plan mode is off.
+    plan: Mutex<Option<serde_json::Value>>,
     /// Tracked session id. Minted per run when a store is attached,
     /// adopted by [`Orchestrator::resume`].
     session_id: Mutex<Option<String>>,
@@ -278,13 +390,18 @@ impl Orchestrator {
             model: "glm-4.7".to_string(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             recent_tool_calls: Mutex::new(Vec::new()),
+            recent_tool_fingerprints: Mutex::new(Vec::new()),
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             auto_compact: true,
             keep_recent_tool_results: DEFAULT_KEEP_RECENT_TOOL_RESULTS,
+            compaction_cadence: DEFAULT_COMPACTION_CADENCE,
+            last_full_compact: Mutex::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
             pause_gate: Mutex::new(false),
             pause_cv: std::sync::Condvar::new(),
             session_store: None,
+            plan_mode: false,
+            plan: Mutex::new(None),
             session_id: Mutex::new(None),
             auto_compact_with_llm: false,
             summarizer_model: None,
@@ -426,6 +543,44 @@ impl Orchestrator {
     /// Clear the loop detection history (e.g. after a successful non-tool response).
     fn clear_loop_detection(&self) {
         sync::lock(&self.recent_tool_calls).clear();
+        sync::lock(&self.recent_tool_fingerprints).clear();
+    }
+
+    /// Record this turn's tool calls as fingerprints (tool + primary
+    /// target) and return the offending fingerprint + window count when
+    /// the *semantic* detector trips.
+    ///
+    /// Unlike the exact-match guard this never aborts: scattered similar
+    /// calls can be legitimate progress, so the caller only steers (a
+    /// nudge event). Same per-turn de-dup semantics as
+    /// [`Self::record_tool_calls_for_loop_detection`] — a turn that
+    /// batch-requests the same call four times is one model decision.
+    fn record_fingerprints_for_loop_detection(
+        &self,
+        calls: &[(&str, &str)],
+    ) -> Option<(ToolCallFingerprint, usize)> {
+        let mut new_fps: Vec<ToolCallFingerprint> = Vec::with_capacity(calls.len());
+        for (name, args) in calls {
+            let fp = ToolCallFingerprint::new(name, args);
+            if !new_fps.contains(&fp) {
+                new_fps.push(fp);
+            }
+        }
+
+        let mut recent = sync::lock(&self.recent_tool_fingerprints);
+        recent.extend(new_fps.iter().cloned());
+        if recent.len() > LOOP_DETECTION_WINDOW {
+            let split = recent.len() - LOOP_DETECTION_WINDOW;
+            recent.drain(0..split);
+        }
+
+        for fp in &new_fps {
+            let count = recent.iter().filter(|f| **f == *fp).count();
+            if count >= SEMANTIC_LOOP_THRESHOLD {
+                return Some((fp.clone(), count));
+            }
+        }
+        None
     }
 
     /// Set the run's spend ceiling in USD. `None` (or a non-positive /
@@ -470,9 +625,26 @@ impl Orchestrator {
         }
     }
 
+    /// Iteration number at which `percent` of the cap is reached (>= 1).
+    fn iteration_threshold(&self, percent: u32) -> u32 {
+        (self.max_iterations * percent / 100).max(1)
+    }
+
     /// Check if we're approaching the iteration limit (>= 80%).
     fn approaching_limit(&self, iteration: u32) -> bool {
-        iteration >= (self.max_iterations * 4 / 5).max(1)
+        iteration >= self.iteration_threshold(80)
+    }
+
+    /// Wind-down stage for `iteration`: how much of the tool budget the
+    /// loop may still offer the model.
+    pub(super) fn wind_down_stage(&self, iteration: u32) -> WindDownStage {
+        if iteration >= self.iteration_threshold(90) {
+            WindDownStage::EditsOnly
+        } else if self.approaching_limit(iteration) {
+            WindDownStage::TrimReadOnly
+        } else {
+            WindDownStage::Full
+        }
     }
 
     /// Override the per-tool-result character cap.
@@ -490,6 +662,20 @@ impl Orchestrator {
     /// `0` disables clearing (everything kept until autocompact runs).
     pub fn set_keep_recent_tool_results(&mut self, n: usize) {
         self.keep_recent_tool_results = n;
+    }
+
+    /// Override the cadence of the iteration-cadenced tool-result
+    /// collapsing pass: run every N iterations, `0` disables it.
+    pub fn set_compaction_cadence(&mut self, n: usize) {
+        self.compaction_cadence = n;
+    }
+
+    /// Enable or disable opt-in plan-then-execute (O-05a). When on, a
+    /// fresh run spends one extra provider call to turn the goal into a
+    /// step list before the loop starts. Off by default — single-shot
+    /// questions must not pay the extra call.
+    pub fn set_plan_mode(&mut self, enabled: bool) {
+        self.plan_mode = enabled;
     }
 
     /// Get a clone of the cancel flag. Wire this to your signal handler

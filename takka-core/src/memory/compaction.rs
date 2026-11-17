@@ -111,6 +111,57 @@ impl Memory {
         self.compact();
     }
 
+    /// Collapse all but the newest `keep_recent` tool results in place
+    /// to one-line summaries (`[Collapsed] <tool>: <outcome>`).
+    ///
+    /// This is the cadenced pass of iteration-cadenced compaction: it
+    /// frees tokens without dropping the pairing between an assistant
+    /// tool call and its (now summarized) result, and without touching
+    /// non-tool messages. Pinned results are never collapsed.
+    ///
+    /// Returns the number of results collapsed.
+    pub fn collapse_old_tool_results(&mut self, keep_recent: usize) -> usize {
+        let tool_positions: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, super::types::MessageRole::Tool { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if tool_positions.len() <= keep_recent {
+            return 0;
+        }
+
+        let mut saved_tokens: u32 = 0;
+        let mut collapsed = 0;
+        for &i in &tool_positions[..tool_positions.len() - keep_recent] {
+            let msg = &mut self.messages[i];
+            if self.pinned_ids.contains(&msg.id) {
+                continue;
+            }
+            let tool_name = match &msg.role {
+                super::types::MessageRole::Tool { tool_name, .. } => tool_name.clone(),
+                _ => continue,
+            };
+            let outcome = if msg.content.starts_with("Tool error")
+                || msg.content.starts_with("Blocked")
+                || msg.content.starts_with("Skipped")
+            {
+                "failed"
+            } else {
+                "succeeded"
+            };
+            let old_tokens = estimate_tokens(&msg.content);
+            msg.content = format!("[Collapsed] {}: {}", tool_name, outcome);
+            let new_tokens = estimate_tokens(&msg.content);
+            msg.metadata.token_count = new_tokens;
+            saved_tokens += old_tokens.saturating_sub(new_tokens);
+            collapsed += 1;
+        }
+        self.total_tokens = self.total_tokens.saturating_sub(saved_tokens);
+        collapsed
+    }
+
     /// Get the current compaction summary, if any.
     pub fn summary(&self) -> Option<&str> {
         self.summary.as_deref()

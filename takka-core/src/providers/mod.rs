@@ -28,6 +28,21 @@ impl ProviderError {
     }
 }
 
+/// Full display chain of a `reqwest` error: its `Display` only shows the top
+/// message (e.g. "error decoding response body") and drops the root cause
+/// (idle timeout, connection reset, incomplete message), which retry logic
+/// and users both need.
+pub(crate) fn reqwest_chain(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    msg
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatMessageRequest {
     pub role: String,

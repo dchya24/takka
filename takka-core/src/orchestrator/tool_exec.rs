@@ -36,6 +36,54 @@ struct SlotOutcome {
 /// Budget live output per tool (chars).
 const DELTA_BUDGET_CHARS: usize = 8_000;
 
+/// Annotation inserted between the two attempts of an auto-retried call.
+const AUTO_RETRY_NOTE: &str =
+    "[auto-retry] attempt 1 failed transiently; retried once automatically. \
+     Do not repeat this call.";
+
+/// How a failed tool call should be treated by the retry layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    /// Worth one automatic re-execution: the same call often succeeds.
+    Transient,
+    /// Retrying cannot help (missing file, bad arguments); never retry.
+    Persistent,
+}
+
+/// Classify a tool failure message.
+fn classify_failure(tool: &str, message: &str) -> FailureClass {
+    let m = message.to_ascii_lowercase();
+    // Persistent shapes win over transient markers: a missing file stays
+    // missing however often it is retried.
+    const PERSISTENT: [&str; 5] = [
+        "no such file",
+        "not found",
+        "invalid arguments",
+        "missing required parameter",
+        "permission denied",
+    ];
+    if PERSISTENT.iter().any(|p| m.contains(p)) {
+        return FailureClass::Persistent;
+    }
+    const TRANSIENT: [&str; 5] = [
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "resource busy",
+    ];
+    if TRANSIENT.iter().any(|t| m.contains(t)) {
+        return FailureClass::Transient;
+    }
+    // Shell tools fail non-deterministically in the wild (flaky exits).
+    if matches!(tool, "run_command" | "run_script" | "run_tests")
+        && m.contains("failed to execute")
+    {
+        return FailureClass::Transient;
+    }
+    FailureClass::Persistent
+}
+
 impl Orchestrator {
     /// Extract the most relevant target string from tool args (for safety scoring).
     pub(super) fn extract_target(args: &serde_json::Value) -> Option<&str> {
@@ -45,10 +93,11 @@ impl Orchestrator {
             .and_then(|v| v.as_str())
     }
 
-    /// Execute a tool, streaming progress deltas through `on_progress`.
-    /// Returns the truncated result plus duration/success/truncated flags
-    /// so callers can emit an enriched `Event::ToolOutput`.
-    fn execute_tool_streaming(
+    /// Execute a tool once, streaming progress deltas through
+    /// `on_progress`. Returns the truncated result plus
+    /// duration/success/truncated flags so callers can emit an enriched
+    /// `Event::ToolOutput`.
+    fn run_tool_once(
         &self,
         name: &str,
         args: &serde_json::Value,
@@ -75,6 +124,57 @@ impl Orchestrator {
             success,
             truncated,
         }
+    }
+
+    /// Merge two attempts of the same call into ONE history entry: the
+    /// model sees the failure, the automatic retry, and its outcome.
+    fn annotate_retry(first: SlotOutcome, second: SlotOutcome) -> SlotOutcome {
+        SlotOutcome {
+            name: second.name,
+            id: second.id,
+            result: format!("{}\n\n{}\n\n{}", first.result, AUTO_RETRY_NOTE, second.result),
+            duration_ms: second.duration_ms,
+            success: second.success,
+            truncated: second.truncated || first.truncated,
+        }
+    }
+
+    /// Execute a tool, re-executing once when the failure is transient.
+    ///
+    /// Retrying lives here — not in the model — because the model's own
+    /// retry of an identical call trips the exact-match loop detector and
+    /// aborts the run.
+    fn execute_tool_streaming(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        on_progress: &dyn Fn(&str),
+    ) -> SlotOutcome {
+        let first = self.run_tool_once(name, args, on_progress);
+        if first.success || classify_failure(name, &first.result) == FailureClass::Persistent {
+            return first;
+        }
+        let second = self.run_tool_once(name, args, on_progress);
+        Self::annotate_retry(first, second)
+    }
+
+    /// Calls executed by hand (batched or spawned singleton) bypass
+    /// [`Self::execute_tool_streaming`], so a transient failure gets its
+    /// one retry here — without replaying the live-delta events of the
+    /// first attempt.
+    fn retry_transient_failure(
+        &self,
+        first: SlotOutcome,
+        name: &str,
+        args: &serde_json::Value,
+        id: &str,
+    ) -> SlotOutcome {
+        if first.success || classify_failure(name, &first.result) == FailureClass::Persistent {
+            return first;
+        }
+        let mut second = self.run_tool_once(name, args, &|_| {});
+        second.id = id.to_string();
+        Self::annotate_retry(first, second)
     }
 
     /// Execute a tool with live `ToolDelta` emission (sync path).
@@ -266,13 +366,19 @@ impl Orchestrator {
                     .collect();
                 let outcomes = self.tools.execute_batch(&calls, self.tool_result_max_chars);
                 for (&i, outcome) in members.iter().zip(outcomes) {
-                    results[i] = Some(SlotOutcome {
+                    let slot = SlotOutcome {
                         name: outcome.name,
                         id: outcome.id,
                         result: outcome.output,
                         duration_ms: outcome.duration_ms,
                         success: outcome.success,
                         truncated: outcome.truncated,
+                    };
+                    results[i] = Some(match &slots[i] {
+                        Slot::Pending { name, id, args } => {
+                            self.retry_transient_failure(slot, name, args, id)
+                        }
+                        _ => slot,
                     });
                 }
             } else {
@@ -518,13 +624,19 @@ impl Orchestrator {
                 match joined {
                     Ok(outcomes) => {
                         for (&i, outcome) in members.iter().zip(outcomes) {
-                            results[i] = Some(SlotOutcome {
+                            let slot = SlotOutcome {
                                 name: outcome.name,
                                 id: outcome.id,
                                 result: outcome.output,
                                 duration_ms: outcome.duration_ms,
                                 success: outcome.success,
                                 truncated: outcome.truncated,
+                            };
+                            results[i] = Some(match &slots[i] {
+                                Slot::Pending { name, id, args } => {
+                                    self.retry_transient_failure(slot, name, args, id)
+                                }
+                                _ => slot,
                             });
                         }
                     }
@@ -613,13 +725,20 @@ impl Orchestrator {
                 match handle.await {
                     Ok((name, id, output, duration_ms, truncated)) => {
                         let success = !output.starts_with("Tool error");
-                        results[i] = Some(SlotOutcome {
+                        let slot = SlotOutcome {
                             name,
                             id,
                             result: output,
                             duration_ms,
                             success,
                             truncated,
+                        };
+                        results[i] = Some(if slot.success {
+                            slot
+                        } else if let Slot::Pending { name, id, args } = &slots[i] {
+                            self.retry_transient_failure(slot, name, args, id)
+                        } else {
+                            slot
                         });
                     }
                     Err(join_err) => {

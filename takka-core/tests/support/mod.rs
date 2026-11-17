@@ -361,6 +361,26 @@ impl LLMProvider for StreamingScriptedProvider {
     }
 }
 
+/// Serialize tests that touch the process-global todo list — Cargo
+/// runs a binary's tests in one process, in parallel.
+static TODO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold this guard while a plan-mode test runs: it owns the global
+/// todo list for its duration.
+pub fn todo_guard() -> std::sync::MutexGuard<'static, ()> {
+    // Ignore a poisoned lock: a panicking earlier test must not wedge
+    // the rest of the suite.
+    match TODO_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Clear the global session todo list (plan-mode tests pollute it).
+pub fn clear_todos() {
+    takka_core::tools::clear_todos();
+}
+
 /// Per-test temp dir under the system tmp. Avoids collisions with
 /// parallel tests via timestamp + pid.
 pub fn tempdir() -> std::path::PathBuf {
@@ -455,5 +475,67 @@ impl takka_core::tool::Tool for ConcurrentReadTool {
     }
     fn metadata(&self) -> takka_core::tool::ToolMetadata {
         takka_core::tool::ToolMetadata::read_only()
+    }
+}
+
+/// Test tool whose `execute` walks a scripted list of results, so a test
+/// can prove the retry layer re-executes a transient failure exactly once.
+/// The last scripted result repeats when the list runs out. Counters live
+/// behind `Arc` so the test keeps observing them after registration.
+pub struct ScriptedResultTool {
+    name: String,
+    results: std::sync::Arc<Mutex<Vec<Result<serde_json::Value, String>>>>,
+    pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    read_only: bool,
+}
+
+impl ScriptedResultTool {
+    pub fn new(
+        name: &str,
+        results: std::sync::Arc<Mutex<Vec<Result<serde_json::Value, String>>>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            results,
+            calls,
+            read_only: false,
+        }
+    }
+
+    /// Mark the tool read-only so the orchestrator schedules it through
+    /// the parallel batch path.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+}
+
+impl takka_core::tool::Tool for ScriptedResultTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "scripted-result test tool"
+    }
+    fn schema(&self) -> takka_core::tool::ToolSchema {
+        takka_core::tool::ToolSchema::new(self.name.clone(), "scripted-result test tool")
+    }
+    fn metadata(&self) -> takka_core::tool::ToolMetadata {
+        if self.read_only {
+            takka_core::tool::ToolMetadata::read_only()
+        } else {
+            takka_core::tool::ToolMetadata::default()
+        }
+    }
+    fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let q = self.results.lock().unwrap();
+        let idx = n.min(q.len().saturating_sub(1));
+        match q.get(idx) {
+            Some(Ok(v)) => Ok(v.clone()),
+            Some(Err(e)) => Err(takka_core::tool::ToolError::new(e.clone())),
+            None => Ok(serde_json::json!({ "ok": true })),
+        }
     }
 }

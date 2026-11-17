@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Core: opt-in plan-then-execute. `Orchestrator::set_plan_mode(true)` spends
+  exactly one extra provider call (via `PlannerAgent`) at the start of a
+  fresh run to turn the goal into a step list, dumps the steps into the
+  session todo store — the checklist reaches the UI through the existing
+  `todo_changed` event and the model updates progress itself via
+  `todowrite` — and prepends a transient `[plan]` progress line (done/total,
+  current step) to every request so the loop stops re-deriving the plan each
+  turn. Checkpoints persist the plan + task state (the previously reserved
+  `session.plan` / `session.task_state` slots are now written) and resume
+  restores both: a resumed session continues with its plan intact and never
+  pays a second plan call. Off by default — single-shot questions make zero
+  extra calls.
 - Runtime: **ACP adapter (Fase 4)** — `takka-runtime --acp` speaks the Agent
   Client Protocol v1 (JSON-RPC over stdio, the Zed editor integration
   surface): v1 protocol negotiation with capability advertisement (image
@@ -41,6 +53,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path note).
 
 ### Changed
+- Core: the agent loop now nudges instead of silently thrashing on *semantic*
+  tool loops. Alongside the exact-match abort guard, calls are reduced to
+  (tool, primary target) fingerprints — the file path, command, or pattern,
+  ignoring line offsets — and when 4 land in the same window the loop emits a
+  steering `Event::System` nudge ("You keep repeating X — decide or ask")
+  instead of running to `max_iterations`. This covers the thrash patterns the
+  exact-match guard never saw: re-reading a file at shifting offsets,
+  re-listing the same directory. The hard abort stays reserved for
+  byte-identical calls, and legitimate read-after-edit sequences do not
+  trigger the nudge.
+- Core: the iteration cap narrows the tool budget in stages instead of
+  cliff-dropping it. Above 80% of `max_iterations` the offered tool set
+  drops read-only tools (stop exploring, start acting on what was found);
+  above 90% only write/edit tools remain; the forced-finalization turn is
+  unchanged. Each stage is announced via `Event::System`, and the 80%
+  wind-down nudge now names the stage, so the model converges while it
+  still has the tools to act.
+- Core: iteration-cadenced compaction. Every 10 iterations
+  (`Orchestrator::set_compaction_cadence`, 0 disables) tool results older
+  than the newest 6 are collapsed in place to one-line
+  `[Collapsed] <tool>: <outcome>` summaries — the assistant-call/result
+  pairing stays intact — so long runs of small tool results stop keeping
+  stale context alive and the token-budget autocompact triggers less
+  often. The pass no-ops right after a full autocompact so the two never
+  fight over the same messages.
+- Core: one automatic retry for transient tool failures. Timeouts,
+  connection resets, and flaky command exits are re-executed once inside
+  the loop before reaching memory, with both attempts recorded as a single
+  `[auto-retry]`-annotated history entry so the model sees the failure
+  instead of repeating the call (which used to trip the exact-match loop
+  detector and abort the run). Persistent failures — missing files, bad
+  arguments — are never retried. Covered on the sequential, parallel
+  batch, and streaming execution paths.
 - Core: `estimate_tokens` is the single token estimator again (the byte-based
   copies on the provider trait are gone) and no longer divides raw UTF-8 bytes
   by 4: ASCII counts at ~4 bytes/token, non-ASCII at ~1 token per char, so CJK

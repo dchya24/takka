@@ -1663,3 +1663,697 @@ fn run_cost_resets_between_runs() {
         orch.run_cost_usd()
     );
 }
+
+/// O-01: the same *tool* re-reading the *same target* through shifting
+/// offsets (thrash without progress) must fire a semantic nudge event —
+/// a steering hint, not a hard abort.
+#[test]
+fn semantic_loop_nudge_on_alternating_similar_reads() {
+    let dir = support::tempdir();
+    let path = dir.join("thrash.txt");
+    std::fs::write(&path, "line one\nline two\n").unwrap();
+
+    // Four read_file calls of the same file at shifting offsets,
+    // interleaved with an unrelated call so no exact signature repeats
+    // consecutively.
+    let read_at = |offset: i64| {
+        support::tool_call_response(
+            "r",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": offset}),
+        )
+    };
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        read_at(1),
+        support::tool_call_response("d1", "list_files", &serde_json::json!({"path": "."})),
+        read_at(2),
+        support::tool_call_response("d2", "glob", &serde_json::json!({"pattern": "*.rs"})),
+        read_at(3),
+        support::tool_call_response("d3", "list_files", &serde_json::json!({"path": "."})),
+        read_at(4),
+        support::tool_call_response("d4", "glob", &serde_json::json!({"pattern": "*.rs"})),
+        support::text_response("finally decided"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(30);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let ev2 = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            ev2.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch.run("look around").expect("nudge must not abort the run");
+    assert_eq!(answer, "finally decided");
+
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|m| m.contains("You keep repeating")),
+        "expected a semantic loop nudge event, got {:?}",
+        *captured
+    );
+}
+
+/// O-01: legitimate re-reading after a mutation is progress, not a
+/// loop — no nudge may fire.
+#[test]
+fn read_after_edit_does_not_trigger_nudge() {
+    let dir = support::tempdir();
+    let path = dir.join("work.txt");
+    std::fs::write(&path, "alpha\nbeta\n").unwrap();
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response(
+            "r1",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy()}),
+        ),
+        support::tool_call_response(
+            "e1",
+            "edit_file",
+            &serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+            }),
+        ),
+        support::tool_call_response(
+            "r2",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": 1}),
+        ),
+        support::tool_call_response(
+            "e2",
+            "edit_file",
+            &serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": "beta",
+                "new_string": "BETA",
+            }),
+        ),
+        support::tool_call_response(
+            "r3",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": 2}),
+        ),
+        support::text_response("all done"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(30);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let ev2 = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            ev2.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch
+        .run("edit the file")
+        .expect("read-after-edit sequence must succeed");
+    assert_eq!(answer, "all done");
+
+    let captured = events.lock().unwrap();
+    assert!(
+        !captured.iter().any(|m| m.contains("You keep repeating")),
+        "legitimate read-after-edit must not be nudged, got {:?}",
+        *captured
+    );
+}
+
+/// O-02: the tool budget shrinks in stages as the iteration cap nears —
+/// read-only tools dropped at 80%, edit tools only at 90%, nothing on the
+/// forced-finalization turn. A run that stays below 80% keeps the full set.
+#[test]
+fn wind_down_shrinks_tool_defs_in_stages() {
+    let mut script = Vec::new();
+    for i in 0..9 {
+        // Distinct args per turn: identical calls would trip loop
+        // detection long before the wind-down stages are reached.
+        script.push(support::tool_call_response(
+            &format!("call-{}", i),
+            "list_files",
+            &serde_json::json!({"path": format!("dir{}", i)}),
+        ));
+    }
+    script.push(support::text_response("wrapped up"));
+
+    let provider = Arc::new(support::RecordingProvider::new(script));
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider.clone(), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(10); // 80% = 8, 90% = 9, final = 10
+
+    let answer = orch.run("walk many directories").expect("run should succeed");
+    assert_eq!(answer, "wrapped up");
+
+    let counts = provider.tool_counts.lock().unwrap().clone();
+    assert_eq!(counts.len(), 10, "one request per iteration, got {:?}", counts);
+
+    let full = counts[0];
+    assert!(full > 0, "expected tools to be offered, got {:?}", counts);
+    assert!(
+        counts[..7].iter().all(|&c| c == full),
+        "below 80% the full tool set must stay, got {:?}",
+        counts
+    );
+    assert!(
+        counts[7] < full,
+        "at 80% read-only tools must be trimmed, got {:?}",
+        counts
+    );
+    assert!(
+        counts[8] < counts[7],
+        "at 90% only edit tools may remain, got {:?}",
+        counts
+    );
+    assert_eq!(
+        counts[9], 0,
+        "the finalization turn must strip every tool, got {:?}",
+        counts
+    );
+}
+
+/// O-03: every N iterations the loop collapses old tool results in
+/// memory to one-line summaries, keeping the newest K verbatim.
+#[test]
+fn cadence_collapses_old_tool_results_keeping_recent_verbatim() {
+    let dir = support::tempdir();
+    let path = dir.join("content.txt");
+    let body: String = (1..=40).map(|i| format!("line-{}\n", i)).collect();
+    std::fs::write(&path, body).unwrap();
+
+    // 30 read turns with a shifting offset (distinct args, so the
+    // exact-match loop detector never trips), then a final answer.
+    let mut script = Vec::new();
+    for i in 1..=30 {
+        script.push(support::tool_call_response(
+            &format!("c{}", i),
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": i}),
+        ));
+    }
+    script.push(support::text_response("all read"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(31);
+
+    let answer = orch.run("read it many times").expect("run should succeed");
+    assert_eq!(answer, "all read");
+
+    // 30 tool results total; the newest K (6) stay verbatim, the rest
+    // collapse to one-line summaries naming the tool.
+    let collapsed = orch.search_memory("[Collapsed] read_file");
+    assert!(
+        (20..=26).contains(&collapsed.len()),
+        "expected most tool results collapsed, got {}",
+        collapsed.len()
+    );
+    // Every verbatim read result carries the JSON field "total_lines";
+    // collapsed one-liners do not.
+    let verbatim = orch.search_memory("total_lines");
+    assert!(
+        (6..=9).contains(&verbatim.len()),
+        "expected the newest tool results verbatim, got {}",
+        verbatim.len()
+    );
+}
+
+/// O-03: a cadence of 0 disables the pass entirely.
+#[test]
+fn cadence_zero_disables_collapsing() {
+    let dir = support::tempdir();
+    let path = dir.join("content.txt");
+    std::fs::write(&path, "unique-42\n").unwrap();
+
+    let mut script = Vec::new();
+    for i in 1..=12 {
+        script.push(support::tool_call_response(
+            &format!("c{}", i),
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": i}),
+        ));
+    }
+    script.push(support::text_response("all read"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(13);
+    orch.set_compaction_cadence(0);
+
+    let answer = orch.run("read it many times").expect("run should succeed");
+    assert_eq!(answer, "all read");
+    assert!(
+        orch.search_memory("[Collapsed]").is_empty(),
+        "cadence 0 must disable the collapsing pass"
+    );
+}
+
+/// O-04: a tool failure classified transient is retried once inside the
+/// loop, and both attempts land in ONE history entry annotated so the
+/// model sees a failure rather than an invitation to call again.
+#[test]
+fn transient_tool_failure_retries_once_with_one_history_entry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(vec![
+        Err::<serde_json::Value, String>("read timed out after 30s".to_string()),
+        Ok(serde_json::json!({"data": "42"})),
+    ]));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "flaky_read", &serde_json::json!({})),
+        support::text_response("the answer is 42"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(support::ScriptedResultTool::new(
+        "flaky_read",
+        results,
+        calls.clone(),
+    )));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("read it").expect("run should succeed");
+    assert_eq!(answer, "the answer is 42");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a transient failure must be retried exactly once"
+    );
+
+    let entries = orch.search_memory("[auto-retry]");
+    assert_eq!(
+        entries.len(),
+        1,
+        "both attempts must collapse into one history entry, got {:?}",
+        entries
+    );
+    let entry = &entries[0].1;
+    assert!(
+        entry.contains("timed out") && entry.contains("42"),
+        "the entry must carry both attempts, got: {}",
+        entry
+    );
+}
+
+/// O-04: a persistent failure (missing file) is never retried — the model
+/// must see the real error once.
+#[test]
+fn persistent_tool_error_is_not_retried() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(vec![Err::<serde_json::Value, String>(
+        "No such file or directory: missing.txt".to_string(),
+    )]));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "missing_read", &serde_json::json!({})),
+        support::text_response("file is gone"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(support::ScriptedResultTool::new(
+        "missing_read",
+        results,
+        calls.clone(),
+    )));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("read it").expect("run should succeed");
+    assert_eq!(answer, "file is gone");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a persistent failure must not be retried"
+    );
+    assert!(
+        orch.search_memory("[auto-retry]").is_empty(),
+        "a persistent failure must record no retry annotation"
+    );
+}
+
+
+/// O-04: the streaming loop's batched (parallel) path also retries a
+/// transient read-only failure exactly once.
+#[tokio::test]
+async fn streaming_transient_tool_failure_retries_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(vec![
+        Err::<serde_json::Value, String>("connection reset by peer".to_string()),
+        Ok(serde_json::json!({"data": "streamed"})),
+    ]));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(StreamingScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "flaky_scan", &serde_json::json!({})),
+        support::text_response("stream done"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(
+        support::ScriptedResultTool::new("flaky_scan", results, calls.clone()).read_only(),
+    ));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let out = orch
+        .run_stream("scan it", |_| {})
+        .await
+        .expect("stream run should succeed");
+    assert_eq!(out, "stream done");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a transient failure must be retried exactly once in the stream path"
+    );
+    assert_eq!(
+        orch.search_memory("[auto-retry]").len(),
+        1,
+        "both attempts must collapse into one history entry"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// O-05a: opt-in plan-then-execute (plan call at iteration one, checklist
+// via the todo store, plan state prepended to requests, persisted through
+// checkpoints).
+// ---------------------------------------------------------------------------
+
+/// Scripted 3-step plan JSON for plan-mode tests.
+fn plan_json(tag: &str, paths: &[std::path::PathBuf]) -> String {
+    let steps: Vec<String> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            format!(
+                "{{\"description\": \"[{tag}] read file {i}\", \"tool\": \"read_file\", \
+                 \"args\": {{\"path\": {}}}}}",
+                serde_json::json!(p.to_string_lossy())
+            )
+        })
+        .collect();
+    format!("[{}]", steps.join(","))
+}
+
+/// Provider response carrying a plan as plain text content.
+fn plan_response(plan_json: &str) -> ChatResponse {
+    ChatResponse {
+        id: "resp-plan".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        message: takka_core::providers::ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: Some(plan_json.to_string()),
+            tool_calls: vec![],
+        },
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+    }
+}
+
+#[test]
+fn plan_mode_makes_one_plan_call_and_dumps_checklist() {
+    use takka_core::{Event, TodoItem};
+
+    let _todo_guard = support::todo_guard();
+    support::clear_todos();
+    let tag = "pa";
+    let dir = support::tempdir();
+    let files: Vec<_> = (0..3)
+        .map(|i| {
+            let p = dir.join(format!("p{i}.txt"));
+            std::fs::write(&p, format!("body {i}")).unwrap();
+            p
+        })
+        .collect();
+
+    let plan = plan_json(tag, &files);
+    let mut script = vec![plan_response(&plan)];
+    for (i, p) in files.iter().enumerate() {
+        script.push(support::tool_call_response(
+            &format!("c{i}"),
+            "read_file",
+            &serde_json::json!({"path": p.to_string_lossy()}),
+        ));
+    }
+    script.push(support::text_response("all planned work done"));
+    let provider = Arc::new(support::RecordingProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider.clone(), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_plan_mode(true);
+
+    let todos_seen: Arc<Mutex<Vec<Vec<TodoItem>>>> = Arc::new(Mutex::new(Vec::new()));
+    let t2 = todos_seen.clone();
+    orch.on_event(move |event| {
+        if let Event::TodoChanged { todos } = event {
+            t2.lock().unwrap().push(todos);
+        }
+    });
+
+    let answer = orch.run("do the three reads").expect("run should succeed");
+    assert_eq!(answer, "all planned work done");
+
+    // Exactly one extra plan call: 1 plan + 3 tool turns + 1 final.
+    assert_eq!(
+        provider.tool_counts.lock().unwrap().len(),
+        5,
+        "plan mode must add exactly one provider call"
+    );
+
+    // The plan surfaced as a checklist event with all three steps.
+    let seen = todos_seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|list| list.len() == 3
+                && list.iter().all(|t| t.content.contains(&format!("[{tag}]")))),
+        "expected a checklist event with the 3 planned steps, got {:?}",
+        *seen
+    );
+
+    support::clear_todos();
+}
+
+#[test]
+fn plan_mode_off_makes_no_extra_calls() {
+    let _todo_guard = support::todo_guard();
+    support::clear_todos();
+    let dir = support::tempdir();
+    let path = dir.join("one.txt");
+    std::fs::write(&path, "body").unwrap();
+
+    let provider = Arc::new(support::RecordingProvider::new(vec![
+        support::tool_call_response(
+            "c0",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy()}),
+        ),
+        support::text_response("done"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider.clone(), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("one quick read").expect("run should succeed");
+    assert_eq!(answer, "done");
+    assert_eq!(
+        provider.tool_counts.lock().unwrap().len(),
+        2,
+        "without plan mode there must be zero extra provider calls"
+    );
+    support::clear_todos();
+}
+
+#[test]
+fn plan_persists_through_checkpoint_resume() {
+    use takka_core::{Event, SessionStore, TodoItem};
+
+    let _todo_guard = support::todo_guard();
+    support::clear_todos();
+    let tag = "pc";
+    let dir = support::tempdir();
+    let files: Vec<_> = (0..3)
+        .map(|i| {
+            let p = dir.join(format!("r{i}.txt"));
+            std::fs::write(&p, format!("body {i}")).unwrap();
+            p
+        })
+        .collect();
+
+    let store_root = support::tempdir();
+    let store = SessionStore::new(store_root.clone());
+
+    let plan = plan_json(tag, &files);
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        plan_response(&plan),
+        support::tool_call_response(
+            "c0",
+            "read_file",
+            &serde_json::json!({"path": files[0].to_string_lossy()}),
+        ),
+        support::text_response("stopping after one step"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_plan_mode(true);
+    orch.set_session_store(store.clone());
+
+    let answer = orch.run("do the reads").expect("first run should succeed");
+    assert_eq!(answer, "stopping after one step");
+
+    let session_id = orch.session_id().expect("session id after a stored run");
+    let session = store.load(&session_id).expect("session document exists");
+    assert!(
+        session.plan.is_some(),
+        "the plan must be persisted in the checkpoint"
+    );
+    let task_state = session.task_state.clone().expect("task state persisted");
+    let state_text = task_state.to_string();
+    assert!(
+        state_text.contains(&format!("[{tag}]")),
+        "the todo checklist must be persisted as task_state, got: {}",
+        state_text
+    );
+
+    // Resume on a fresh orchestrator: the plan survives, the loop
+    // prepends its state, and no new plan call is made.
+    let resumed_provider = Arc::new(support::CapturingScriptedProvider::new(vec![
+        support::tool_call_response(
+            "c1",
+            "read_file",
+            &serde_json::json!({"path": files[1].to_string_lossy()}),
+        ),
+        support::text_response("resumed and finished"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut resumed = Orchestrator::new(resumed_provider.clone(), tools);
+    resumed.set_permission_mode(PermissionMode::Yolo);
+    resumed.set_model("gpt-4o-mini");
+    resumed.set_plan_mode(true);
+
+    // Subscribe BEFORE resume: the restored checklist fires during
+    // resume_session itself.
+    let todos_seen: Arc<Mutex<Vec<Vec<TodoItem>>>> = Arc::new(Mutex::new(Vec::new()));
+    let t2 = todos_seen.clone();
+    resumed.on_event(move |event| {
+        if let Event::TodoChanged { todos } = event {
+            t2.lock().unwrap().push(todos);
+        }
+    });
+
+    resumed
+        .resume_session(store.clone(), &session_id)
+        .expect("resume should succeed");
+
+    let answer = resumed
+        .run("continue")
+        .expect("resumed run should succeed");
+    assert_eq!(answer, "resumed and finished");
+
+    // No new plan call: 2 loop calls only.
+    assert_eq!(
+        resumed_provider.requests.lock().unwrap().len(),
+        2,
+        "a resumed session must not spend another plan call"
+    );
+
+    // The plan state rides along on the request.
+    let first_req = &resumed_provider.requests.lock().unwrap()[0];
+    let all_text: String = first_req
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_text.contains("[plan]") && all_text.contains(&format!("[{tag}]")),
+        "the request must carry plan progress, got: {}",
+        all_text
+    );
+    // The restored checklist fired as an event after resume.
+    assert!(
+        todos_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|list| list.iter().all(|t| t.content.contains(&format!("[{tag}]")))),
+        "resume must restore the checklist"
+    );
+
+    support::clear_todos();
+}
