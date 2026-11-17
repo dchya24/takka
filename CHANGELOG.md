@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. Each stage is announced via `Event::System`, and the 80%
   wind-down nudge now names the stage, so the model converges while it
   still has the tools to act.
+- Core: iteration-cadenced compaction. Every 10 iterations
+  (`Orchestrator::set_compaction_cadence`, 0 disables) tool results older
+  than the newest 6 are collapsed in place to one-line
+  `[Collapsed] <tool>: <outcome>` summaries — the assistant-call/result
+  pairing stays intact — so long runs of small tool results stop keeping
+  stale context alive and the token-budget autocompact triggers less
+  often. The pass no-ops right after a full autocompact so the two never
+  fight over the same messages.
 - Core: `estimate_tokens` is the single token estimator again (the byte-based
   copies on the provider trait are gone) and no longer divides raw UTF-8 bytes
   by 4: ASCII counts at ~4 bytes/token, non-ASCII at ~1 token per char, so CJK
