@@ -2039,3 +2039,46 @@ fn persistent_tool_error_is_not_retried() {
         "a persistent failure must record no retry annotation"
     );
 }
+
+/// O-04: the streaming loop's batched (parallel) path also retries a
+/// transient read-only failure exactly once.
+#[tokio::test]
+async fn streaming_transient_tool_failure_retries_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(vec![
+        Err::<serde_json::Value, String>("connection reset by peer".to_string()),
+        Ok(serde_json::json!({"data": "streamed"})),
+    ]));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(StreamingScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "flaky_scan", &serde_json::json!({})),
+        support::text_response("stream done"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(
+        support::ScriptedResultTool::new("flaky_scan", results, calls.clone()).read_only(),
+    ));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let out = orch
+        .run_stream("scan it", |_| {})
+        .await
+        .expect("stream run should succeed");
+    assert_eq!(out, "stream done");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a transient failure must be retried exactly once in the stream path"
+    );
+    assert_eq!(
+        orch.search_memory("[auto-retry]").len(),
+        1,
+        "both attempts must collapse into one history entry"
+    );
+}

@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stale context alive and the token-budget autocompact triggers less
   often. The pass no-ops right after a full autocompact so the two never
   fight over the same messages.
+- Core: one automatic retry for transient tool failures. Timeouts,
+  connection resets, and flaky command exits are re-executed once inside
+  the loop before reaching memory, with both attempts recorded as a single
+  `[auto-retry]`-annotated history entry so the model sees the failure
+  instead of repeating the call (which used to trip the exact-match loop
+  detector and abort the run). Persistent failures — missing files, bad
+  arguments — are never retried. Covered on the sequential, parallel
+  batch, and streaming execution paths.
 - Core: `estimate_tokens` is the single token estimator again (the byte-based
   copies on the provider trait are gone) and no longer divides raw UTF-8 bytes
   by 4: ASCII counts at ~4 bytes/token, non-ASCII at ~1 token per char, so CJK
