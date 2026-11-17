@@ -245,6 +245,28 @@ impl Orchestrator {
                     )));
                 }
 
+                // Semantic loop detection — *similar* calls (same tool,
+                // same primary target) piling up inside the window: a
+                // steering nudge, never an abort, because scattered
+                // similar calls can be legitimate progress.
+                if let Some((fp, count)) =
+                    self.record_fingerprints_for_loop_detection(&loop_sigs)
+                {
+                    tracing::warn!(
+                        fingerprint = %fp.preview,
+                        count = count,
+                        threshold = super::SEMANTIC_LOOP_THRESHOLD,
+                        "Semantic loop: similar tool call piling up in the window"
+                    );
+                    self.events.emit(crate::events::Event::System {
+                        message: format!(
+                            "🔁 You keep repeating {} ({} similar calls recently). \
+                             Decide or ask rather than reading again.",
+                            fp.preview, count
+                        ),
+                    });
+                }
+
                 let tool_calls: Vec<(String, String, String)> = response
                     .message
                     .tool_calls
@@ -569,6 +591,28 @@ impl Orchestrator {
                          Aborting to prevent an infinite loop.",
                         sig.tool, run, sig.args_preview,
                     )));
+                }
+
+                // Semantic loop detection — *similar* calls (same tool,
+                // same primary target) piling up inside the window: a
+                // steering nudge, never an abort, because scattered
+                // similar calls can be legitimate progress.
+                if let Some((fp, count)) =
+                    self.record_fingerprints_for_loop_detection(&loop_sigs)
+                {
+                    tracing::warn!(
+                        fingerprint = %fp.preview,
+                        count = count,
+                        threshold = super::SEMANTIC_LOOP_THRESHOLD,
+                        "Semantic loop: similar tool call piling up in the window"
+                    );
+                    self.events.emit(crate::events::Event::System {
+                        message: format!(
+                            "🔁 You keep repeating {} ({} similar calls recently). \
+                             Decide or ask rather than reading again.",
+                            fp.preview, count
+                        ),
+                    });
                 }
 
                 self.handle_tool_calls_parallel(&content_buf, &accumulated_tool_calls)

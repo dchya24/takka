@@ -47,6 +47,13 @@ const LOOP_DETECTION_THRESHOLD: usize = 3;
 /// the window and is never fragmented by the trim.
 const LOOP_DETECTION_WINDOW: usize = 8;
 
+/// How many *similar* calls (same tool, same primary target) inside the
+/// window trip the semantic loop nudge. Above [`LOOP_DETECTION_THRESHOLD`]
+/// because scattered repeats of similar-but-not-identical calls can be
+/// legitimate (read → edit → re-read); only the alternation-heavy thrash
+/// pattern reaches this count without any mutation in between.
+const SEMANTIC_LOOP_THRESHOLD: usize = 4;
+
 /// Default tool-result truncation limit (chars). Layer 1 of context compression.
 pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 25_000;
 
@@ -101,6 +108,62 @@ fn truncate_args_preview(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// A tool call reduced to the tool plus its **primary target** — the file
+/// path, command, or pattern it acts on, ignoring line offsets and other
+/// secondary parameters.
+///
+/// Two calls with equal fingerprints do *similar* work: reading the same
+/// file at shifting offsets, re-listing the same directory. That shape is
+/// the soft loop the exact-match guard ([`ToolCallSignature`]) cannot
+/// see — the model thrashes without progress while every individual call
+/// looks fresh.
+#[derive(Clone, PartialEq, Eq)]
+struct ToolCallFingerprint {
+    tool: String,
+    /// Stable hash of the primary target (or of the full args string
+    /// when the tool has no recognizable target field).
+    target_hash: u64,
+    /// Human-readable preview for the nudge message.
+    preview: String,
+}
+
+impl ToolCallFingerprint {
+    fn new(tool: &str, args: &str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let parsed: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        // The first field that names what the call acts on. `pattern`
+        // beats `path` for search tools: the same directory grepped for
+        // different patterns is different work.
+        let target = ["command", "pattern", "path", "file_path", "query"]
+            .iter()
+            .find_map(|key| parsed.get(*key).and_then(|v| v.as_str()));
+        let mut hasher = DefaultHasher::new();
+        match target {
+            Some(t) => {
+                t.hash(&mut hasher);
+                Self {
+                    tool: tool.to_string(),
+                    target_hash: hasher.finish(),
+                    preview: format!("{}({})", tool, truncate_args_preview(t, 80)),
+                }
+            }
+            // No recognizable target: fall back to the full args string,
+            // which makes this fingerprint as strict as the exact
+            // signature — safe for tools we don't know yet.
+            None => {
+                args.hash(&mut hasher);
+                Self {
+                    tool: tool.to_string(),
+                    target_hash: hasher.finish(),
+                    preview: format!("{}({})", tool, truncate_args_preview(args, 80)),
+                }
+            }
+        }
+    }
 }
 
 /// Coarse lifecycle state of the orchestrator (P1-2).
@@ -215,6 +278,9 @@ pub struct Orchestrator {
     max_iterations: u32,
     /// Recent tool-call signatures for loop detection (sliding window).
     recent_tool_calls: Mutex<Vec<ToolCallSignature>>,
+    /// Recent tool-call fingerprints (same tool + same target) for the
+    /// semantic loop nudge (sliding window, same trim rule as above).
+    recent_tool_fingerprints: Mutex<Vec<ToolCallFingerprint>>,
     /// Cap individual tool result strings (Layer 1 of context compression).
     tool_result_max_chars: usize,
     /// Auto-compact memory when token usage exceeds the configured threshold.
@@ -278,6 +344,7 @@ impl Orchestrator {
             model: "glm-4.7".to_string(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             recent_tool_calls: Mutex::new(Vec::new()),
+            recent_tool_fingerprints: Mutex::new(Vec::new()),
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             auto_compact: true,
             keep_recent_tool_results: DEFAULT_KEEP_RECENT_TOOL_RESULTS,
@@ -426,6 +493,44 @@ impl Orchestrator {
     /// Clear the loop detection history (e.g. after a successful non-tool response).
     fn clear_loop_detection(&self) {
         sync::lock(&self.recent_tool_calls).clear();
+        sync::lock(&self.recent_tool_fingerprints).clear();
+    }
+
+    /// Record this turn's tool calls as fingerprints (tool + primary
+    /// target) and return the offending fingerprint + window count when
+    /// the *semantic* detector trips.
+    ///
+    /// Unlike the exact-match guard this never aborts: scattered similar
+    /// calls can be legitimate progress, so the caller only steers (a
+    /// nudge event). Same per-turn de-dup semantics as
+    /// [`Self::record_tool_calls_for_loop_detection`] — a turn that
+    /// batch-requests the same call four times is one model decision.
+    fn record_fingerprints_for_loop_detection(
+        &self,
+        calls: &[(&str, &str)],
+    ) -> Option<(ToolCallFingerprint, usize)> {
+        let mut new_fps: Vec<ToolCallFingerprint> = Vec::with_capacity(calls.len());
+        for (name, args) in calls {
+            let fp = ToolCallFingerprint::new(name, args);
+            if !new_fps.contains(&fp) {
+                new_fps.push(fp);
+            }
+        }
+
+        let mut recent = sync::lock(&self.recent_tool_fingerprints);
+        recent.extend(new_fps.iter().cloned());
+        if recent.len() > LOOP_DETECTION_WINDOW {
+            let split = recent.len() - LOOP_DETECTION_WINDOW;
+            recent.drain(0..split);
+        }
+
+        for fp in &new_fps {
+            let count = recent.iter().filter(|f| **f == *fp).count();
+            if count >= SEMANTIC_LOOP_THRESHOLD {
+                return Some((fp.clone(), count));
+            }
+        }
+        None
     }
 
     /// Set the run's spend ceiling in USD. `None` (or a non-positive /

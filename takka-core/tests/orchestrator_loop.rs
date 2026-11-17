@@ -1663,3 +1663,139 @@ fn run_cost_resets_between_runs() {
         orch.run_cost_usd()
     );
 }
+
+/// O-01: the same *tool* re-reading the *same target* through shifting
+/// offsets (thrash without progress) must fire a semantic nudge event —
+/// a steering hint, not a hard abort.
+#[test]
+fn semantic_loop_nudge_on_alternating_similar_reads() {
+    let dir = support::tempdir();
+    let path = dir.join("thrash.txt");
+    std::fs::write(&path, "line one\nline two\n").unwrap();
+
+    // Four read_file calls of the same file at shifting offsets,
+    // interleaved with an unrelated call so no exact signature repeats
+    // consecutively.
+    let read_at = |offset: i64| {
+        support::tool_call_response(
+            "r",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": offset}),
+        )
+    };
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        read_at(1),
+        support::tool_call_response("d1", "list_files", &serde_json::json!({"path": "."})),
+        read_at(2),
+        support::tool_call_response("d2", "glob", &serde_json::json!({"pattern": "*.rs"})),
+        read_at(3),
+        support::tool_call_response("d3", "list_files", &serde_json::json!({"path": "."})),
+        read_at(4),
+        support::tool_call_response("d4", "glob", &serde_json::json!({"pattern": "*.rs"})),
+        support::text_response("finally decided"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(30);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let ev2 = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            ev2.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch.run("look around").expect("nudge must not abort the run");
+    assert_eq!(answer, "finally decided");
+
+    let captured = events.lock().unwrap();
+    assert!(
+        captured.iter().any(|m| m.contains("You keep repeating")),
+        "expected a semantic loop nudge event, got {:?}",
+        *captured
+    );
+}
+
+/// O-01: legitimate re-reading after a mutation is progress, not a
+/// loop — no nudge may fire.
+#[test]
+fn read_after_edit_does_not_trigger_nudge() {
+    let dir = support::tempdir();
+    let path = dir.join("work.txt");
+    std::fs::write(&path, "alpha\nbeta\n").unwrap();
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response(
+            "r1",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy()}),
+        ),
+        support::tool_call_response(
+            "e1",
+            "edit_file",
+            &serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": "alpha",
+                "new_string": "ALPHA",
+            }),
+        ),
+        support::tool_call_response(
+            "r2",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": 1}),
+        ),
+        support::tool_call_response(
+            "e2",
+            "edit_file",
+            &serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": "beta",
+                "new_string": "BETA",
+            }),
+        ),
+        support::tool_call_response(
+            "r3",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": 2}),
+        ),
+        support::text_response("all done"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(30);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let ev2 = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            ev2.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch
+        .run("edit the file")
+        .expect("read-after-edit sequence must succeed");
+    assert_eq!(answer, "all done");
+
+    let captured = events.lock().unwrap();
+    assert!(
+        !captured.iter().any(|m| m.contains("You keep repeating")),
+        "legitimate read-after-edit must not be nudged, got {:?}",
+        *captured
+    );
+}
