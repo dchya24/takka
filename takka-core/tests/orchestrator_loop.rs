@@ -1948,3 +1948,94 @@ fn cadence_zero_disables_collapsing() {
     );
 }
 
+/// O-04: a tool failure classified transient is retried once inside the
+/// loop, and both attempts land in ONE history entry annotated so the
+/// model sees a failure rather than an invitation to call again.
+#[test]
+fn transient_tool_failure_retries_once_with_one_history_entry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(vec![
+        Err::<serde_json::Value, String>("read timed out after 30s".to_string()),
+        Ok(serde_json::json!({"data": "42"})),
+    ]));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "flaky_read", &serde_json::json!({})),
+        support::text_response("the answer is 42"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(support::ScriptedResultTool::new(
+        "flaky_read",
+        results,
+        calls.clone(),
+    )));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("read it").expect("run should succeed");
+    assert_eq!(answer, "the answer is 42");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a transient failure must be retried exactly once"
+    );
+
+    let entries = orch.search_memory("[auto-retry]");
+    assert_eq!(
+        entries.len(),
+        1,
+        "both attempts must collapse into one history entry, got {:?}",
+        entries
+    );
+    let entry = &entries[0].1;
+    assert!(
+        entry.contains("timed out") && entry.contains("42"),
+        "the entry must carry both attempts, got: {}",
+        entry
+    );
+}
+
+/// O-04: a persistent failure (missing file) is never retried — the model
+/// must see the real error once.
+#[test]
+fn persistent_tool_error_is_not_retried() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(vec![Err::<serde_json::Value, String>(
+        "No such file or directory: missing.txt".to_string(),
+    )]));
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("call-1", "missing_read", &serde_json::json!({})),
+        support::text_response("file is gone"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(support::ScriptedResultTool::new(
+        "missing_read",
+        results,
+        calls.clone(),
+    )));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("read it").expect("run should succeed");
+    assert_eq!(answer, "file is gone");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a persistent failure must not be retried"
+    );
+    assert!(
+        orch.search_memory("[auto-retry]").is_empty(),
+        "a persistent failure must record no retry annotation"
+    );
+}
