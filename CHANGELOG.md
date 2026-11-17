@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path note).
 
 ### Changed
+- Core: the agent loop now nudges instead of silently thrashing on *semantic*
+  tool loops. Alongside the exact-match abort guard, calls are reduced to
+  (tool, primary target) fingerprints — the file path, command, or pattern,
+  ignoring line offsets — and when 4 land in the same window the loop emits a
+  steering `Event::System` nudge ("You keep repeating X — decide or ask")
+  instead of running to `max_iterations`. This covers the thrash patterns the
+  exact-match guard never saw: re-reading a file at shifting offsets,
+  re-listing the same directory. The hard abort stays reserved for
+  byte-identical calls, and legitimate read-after-edit sequences do not
+  trigger the nudge.
 - Core: `estimate_tokens` is the single token estimator again (the byte-based
   copies on the provider trait are gone) and no longer divides raw UTF-8 bytes
   by 4: ASCII counts at ~4 bytes/token, non-ASCII at ~1 token per char, so CJK
