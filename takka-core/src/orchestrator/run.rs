@@ -165,7 +165,7 @@ impl Orchestrator {
             let response = self
                 .provider
                 .chat(request)
-                .map_err(|e| AgenticError::Provider(e.to_string()))?;
+                .map_err(|e| AgenticError::Provider(e.0.clone()))?;
 
             let content = response.message.content.clone().unwrap_or_default();
             Self::log_response(
@@ -477,13 +477,13 @@ impl Orchestrator {
                                 }
                             }
                             Err(e) => {
-                                return Err(AgenticError::Provider(e.to_string()));
+                                return Err(AgenticError::Provider(e.0.clone()));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    return Err(AgenticError::Provider(e.to_string()));
+                    return Err(AgenticError::Provider(e.0.clone()));
                 }
             }
 

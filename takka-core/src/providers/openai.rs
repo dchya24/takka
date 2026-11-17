@@ -145,7 +145,7 @@ impl OpenAIProvider {
     pub fn new(config: OpenAIProviderConfig) -> Self {
         let async_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(120))
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("Failed to build async HTTP client");
 
@@ -328,7 +328,7 @@ impl OpenAIProvider {
                 .send()
                 .await
         })
-        .map_err(|e| ProviderError::new(format!("Request failed: {}", e)))?;
+        .map_err(|e| ProviderError::new(format!("Request failed: {}", super::reqwest_chain(&e))))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -483,7 +483,10 @@ impl LLMProvider for OpenAIProvider {
                     resp
                 },
                 Err(e) => {
-                    yield Err(ProviderError::new(format!("Stream request failed: {}", e)));
+                    yield Err(ProviderError::new(format!(
+                        "Stream request failed: {}",
+                        super::reqwest_chain(&e)
+                    )));
                     return;
                 }
             };
@@ -505,7 +508,10 @@ impl LLMProvider for OpenAIProvider {
                         }
                     }
                     Err(e) => {
-                        yield Err(ProviderError::new(format!("Stream read error: {}", e)));
+                        yield Err(ProviderError::new(format!(
+                            "Stream read error: {}",
+                            super::reqwest_chain(&e)
+                        )));
                         return;
                     }
                 }

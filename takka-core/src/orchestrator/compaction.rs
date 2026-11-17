@@ -96,7 +96,7 @@ impl Orchestrator {
         let response = self
             .provider
             .chat(request)
-            .map_err(|e| AgenticError::Provider(e.to_string()))?;
+            .map_err(|e| AgenticError::Provider(e.0.clone()))?;
         Ok(response.message.content.unwrap_or_default())
     }
 
