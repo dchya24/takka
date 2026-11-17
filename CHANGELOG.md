@@ -51,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-listing the same directory. The hard abort stays reserved for
   byte-identical calls, and legitimate read-after-edit sequences do not
   trigger the nudge.
+- Core: the iteration cap narrows the tool budget in stages instead of
+  cliff-dropping it. Above 80% of `max_iterations` the offered tool set
+  drops read-only tools (stop exploring, start acting on what was found);
+  above 90% only write/edit tools remain; the forced-finalization turn is
+  unchanged. Each stage is announced via `Event::System`, and the 80%
+  wind-down nudge now names the stage, so the model converges while it
+  still has the tools to act.
 - Core: `estimate_tokens` is the single token estimator again (the byte-based
   copies on the provider trait are gone) and no longer divides raw UTF-8 bytes
   by 4: ASCII counts at ~4 bytes/token, non-ASCII at ~1 token per char, so CJK
