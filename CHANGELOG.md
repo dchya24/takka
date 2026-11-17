@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Core: opt-in plan-then-execute. `Orchestrator::set_plan_mode(true)` spends
+  exactly one extra provider call (via `PlannerAgent`) at the start of a
+  fresh run to turn the goal into a step list, dumps the steps into the
+  session todo store — the checklist reaches the UI through the existing
+  `todo_changed` event and the model updates progress itself via
+  `todowrite` — and prepends a transient `[plan]` progress line (done/total,
+  current step) to every request so the loop stops re-deriving the plan each
+  turn. Checkpoints persist the plan + task state (the previously reserved
+  `session.plan` / `session.task_state` slots are now written) and resume
+  restores both: a resumed session continues with its plan intact and never
+  pays a second plan call. Off by default — single-shot questions make zero
+  extra calls.
 - Runtime: **ACP adapter (Fase 4)** — `takka-runtime --acp` speaks the Agent
   Client Protocol v1 (JSON-RPC over stdio, the Zed editor integration
   surface): v1 protocol negotiation with capability advertisement (image
