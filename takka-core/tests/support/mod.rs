@@ -361,6 +361,26 @@ impl LLMProvider for StreamingScriptedProvider {
     }
 }
 
+/// Serialize tests that touch the process-global todo list — Cargo
+/// runs a binary's tests in one process, in parallel.
+static TODO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold this guard while a plan-mode test runs: it owns the global
+/// todo list for its duration.
+pub fn todo_guard() -> std::sync::MutexGuard<'static, ()> {
+    // Ignore a poisoned lock: a panicking earlier test must not wedge
+    // the rest of the suite.
+    match TODO_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Clear the global session todo list (plan-mode tests pollute it).
+pub fn clear_todos() {
+    takka_core::tools::clear_todos();
+}
+
 /// Per-test temp dir under the system tmp. Avoids collisions with
 /// parallel tests via timestamp + pid.
 pub fn tempdir() -> std::path::PathBuf {

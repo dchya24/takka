@@ -2040,6 +2040,7 @@ fn persistent_tool_error_is_not_retried() {
     );
 }
 
+
 /// O-04: the streaming loop's batched (parallel) path also retries a
 /// transient read-only failure exactly once.
 #[tokio::test]
@@ -2081,4 +2082,278 @@ async fn streaming_transient_tool_failure_retries_once() {
         1,
         "both attempts must collapse into one history entry"
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// O-05a: opt-in plan-then-execute (plan call at iteration one, checklist
+// via the todo store, plan state prepended to requests, persisted through
+// checkpoints).
+// ---------------------------------------------------------------------------
+
+/// Scripted 3-step plan JSON for plan-mode tests.
+fn plan_json(tag: &str, paths: &[std::path::PathBuf]) -> String {
+    let steps: Vec<String> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            format!(
+                "{{\"description\": \"[{tag}] read file {i}\", \"tool\": \"read_file\", \
+                 \"args\": {{\"path\": {}}}}}",
+                serde_json::json!(p.to_string_lossy())
+            )
+        })
+        .collect();
+    format!("[{}]", steps.join(","))
+}
+
+/// Provider response carrying a plan as plain text content.
+fn plan_response(plan_json: &str) -> ChatResponse {
+    ChatResponse {
+        id: "resp-plan".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        message: takka_core::providers::ChatMessageResponse {
+            role: "assistant".to_string(),
+            content: Some(plan_json.to_string()),
+            tool_calls: vec![],
+        },
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+    }
+}
+
+#[test]
+fn plan_mode_makes_one_plan_call_and_dumps_checklist() {
+    use takka_core::{Event, TodoItem};
+
+    let _todo_guard = support::todo_guard();
+    support::clear_todos();
+    let tag = "pa";
+    let dir = support::tempdir();
+    let files: Vec<_> = (0..3)
+        .map(|i| {
+            let p = dir.join(format!("p{i}.txt"));
+            std::fs::write(&p, format!("body {i}")).unwrap();
+            p
+        })
+        .collect();
+
+    let plan = plan_json(tag, &files);
+    let mut script = vec![plan_response(&plan)];
+    for (i, p) in files.iter().enumerate() {
+        script.push(support::tool_call_response(
+            &format!("c{i}"),
+            "read_file",
+            &serde_json::json!({"path": p.to_string_lossy()}),
+        ));
+    }
+    script.push(support::text_response("all planned work done"));
+    let provider = Arc::new(support::RecordingProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider.clone(), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_plan_mode(true);
+
+    let todos_seen: Arc<Mutex<Vec<Vec<TodoItem>>>> = Arc::new(Mutex::new(Vec::new()));
+    let t2 = todos_seen.clone();
+    orch.on_event(move |event| {
+        if let Event::TodoChanged { todos } = event {
+            t2.lock().unwrap().push(todos);
+        }
+    });
+
+    let answer = orch.run("do the three reads").expect("run should succeed");
+    assert_eq!(answer, "all planned work done");
+
+    // Exactly one extra plan call: 1 plan + 3 tool turns + 1 final.
+    assert_eq!(
+        provider.tool_counts.lock().unwrap().len(),
+        5,
+        "plan mode must add exactly one provider call"
+    );
+
+    // The plan surfaced as a checklist event with all three steps.
+    let seen = todos_seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|list| list.len() == 3
+                && list.iter().all(|t| t.content.contains(&format!("[{tag}]")))),
+        "expected a checklist event with the 3 planned steps, got {:?}",
+        *seen
+    );
+
+    support::clear_todos();
+}
+
+#[test]
+fn plan_mode_off_makes_no_extra_calls() {
+    let _todo_guard = support::todo_guard();
+    support::clear_todos();
+    let dir = support::tempdir();
+    let path = dir.join("one.txt");
+    std::fs::write(&path, "body").unwrap();
+
+    let provider = Arc::new(support::RecordingProvider::new(vec![
+        support::tool_call_response(
+            "c0",
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy()}),
+        ),
+        support::text_response("done"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider.clone(), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("one quick read").expect("run should succeed");
+    assert_eq!(answer, "done");
+    assert_eq!(
+        provider.tool_counts.lock().unwrap().len(),
+        2,
+        "without plan mode there must be zero extra provider calls"
+    );
+    support::clear_todos();
+}
+
+#[test]
+fn plan_persists_through_checkpoint_resume() {
+    use takka_core::{Event, SessionStore, TodoItem};
+
+    let _todo_guard = support::todo_guard();
+    support::clear_todos();
+    let tag = "pc";
+    let dir = support::tempdir();
+    let files: Vec<_> = (0..3)
+        .map(|i| {
+            let p = dir.join(format!("r{i}.txt"));
+            std::fs::write(&p, format!("body {i}")).unwrap();
+            p
+        })
+        .collect();
+
+    let store_root = support::tempdir();
+    let store = SessionStore::new(store_root.clone());
+
+    let plan = plan_json(tag, &files);
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        plan_response(&plan),
+        support::tool_call_response(
+            "c0",
+            "read_file",
+            &serde_json::json!({"path": files[0].to_string_lossy()}),
+        ),
+        support::text_response("stopping after one step"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_plan_mode(true);
+    orch.set_session_store(store.clone());
+
+    let answer = orch.run("do the reads").expect("first run should succeed");
+    assert_eq!(answer, "stopping after one step");
+
+    let session_id = orch.session_id().expect("session id after a stored run");
+    let session = store.load(&session_id).expect("session document exists");
+    assert!(
+        session.plan.is_some(),
+        "the plan must be persisted in the checkpoint"
+    );
+    let task_state = session.task_state.clone().expect("task state persisted");
+    let state_text = task_state.to_string();
+    assert!(
+        state_text.contains(&format!("[{tag}]")),
+        "the todo checklist must be persisted as task_state, got: {}",
+        state_text
+    );
+
+    // Resume on a fresh orchestrator: the plan survives, the loop
+    // prepends its state, and no new plan call is made.
+    let resumed_provider = Arc::new(support::CapturingScriptedProvider::new(vec![
+        support::tool_call_response(
+            "c1",
+            "read_file",
+            &serde_json::json!({"path": files[1].to_string_lossy()}),
+        ),
+        support::text_response("resumed and finished"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut resumed = Orchestrator::new(resumed_provider.clone(), tools);
+    resumed.set_permission_mode(PermissionMode::Yolo);
+    resumed.set_model("gpt-4o-mini");
+    resumed.set_plan_mode(true);
+
+    // Subscribe BEFORE resume: the restored checklist fires during
+    // resume_session itself.
+    let todos_seen: Arc<Mutex<Vec<Vec<TodoItem>>>> = Arc::new(Mutex::new(Vec::new()));
+    let t2 = todos_seen.clone();
+    resumed.on_event(move |event| {
+        if let Event::TodoChanged { todos } = event {
+            t2.lock().unwrap().push(todos);
+        }
+    });
+
+    resumed
+        .resume_session(store.clone(), &session_id)
+        .expect("resume should succeed");
+
+    let answer = resumed
+        .run("continue")
+        .expect("resumed run should succeed");
+    assert_eq!(answer, "resumed and finished");
+
+    // No new plan call: 2 loop calls only.
+    assert_eq!(
+        resumed_provider.requests.lock().unwrap().len(),
+        2,
+        "a resumed session must not spend another plan call"
+    );
+
+    // The plan state rides along on the request.
+    let first_req = &resumed_provider.requests.lock().unwrap()[0];
+    let all_text: String = first_req
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        all_text.contains("[plan]") && all_text.contains(&format!("[{tag}]")),
+        "the request must carry plan progress, got: {}",
+        all_text
+    );
+    // The restored checklist fired as an event after resume.
+    assert!(
+        todos_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|list| list.iter().all(|t| t.content.contains(&format!("[{tag}]")))),
+        "resume must restore the checklist"
+    );
+
+    support::clear_todos();
 }

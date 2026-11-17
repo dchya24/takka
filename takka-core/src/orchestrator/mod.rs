@@ -24,6 +24,7 @@ use crate::tool_registry::ToolRegistry;
 
 mod checkpoint;
 mod compaction;
+mod planning;
 mod progress;
 mod run;
 mod tool_exec;
@@ -339,6 +340,13 @@ pub struct Orchestrator {
     /// Optional session checkpoint store (P1-3). `None` = no
     /// persistence; runs behave exactly as before.
     session_store: Option<Mutex<crate::session::SessionStore>>,
+    /// Opt-in plan-then-execute (O-05a): when set, a run's first
+    /// iteration is preceded by one planner call that turns the goal
+    /// into a step list; progress rides along on every request.
+    plan_mode: bool,
+    /// Serialized `Plan` of the current session, kept for checkpoint
+    /// persistence. `None` on fresh turns and when plan mode is off.
+    plan: Mutex<Option<serde_json::Value>>,
     /// Tracked session id. Minted per run when a store is attached,
     /// adopted by [`Orchestrator::resume`].
     session_id: Mutex<Option<String>>,
@@ -392,6 +400,8 @@ impl Orchestrator {
             pause_gate: Mutex::new(false),
             pause_cv: std::sync::Condvar::new(),
             session_store: None,
+            plan_mode: false,
+            plan: Mutex::new(None),
             session_id: Mutex::new(None),
             auto_compact_with_llm: false,
             summarizer_model: None,
@@ -658,6 +668,14 @@ impl Orchestrator {
     /// collapsing pass: run every N iterations, `0` disables it.
     pub fn set_compaction_cadence(&mut self, n: usize) {
         self.compaction_cadence = n;
+    }
+
+    /// Enable or disable opt-in plan-then-execute (O-05a). When on, a
+    /// fresh run spends one extra provider call to turn the goal into a
+    /// step list before the loop starts. Off by default — single-shot
+    /// questions must not pay the extra call.
+    pub fn set_plan_mode(&mut self, enabled: bool) {
+        self.plan_mode = enabled;
     }
 
     /// Get a clone of the cancel flag. Wire this to your signal handler

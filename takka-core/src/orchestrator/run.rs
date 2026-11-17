@@ -95,6 +95,17 @@ impl Orchestrator {
         // The spend ceiling guards one user turn: start each run at zero.
         self.reset_run_cost();
 
+        // O-05a plan-then-execute: a FRESH turn (no adopted session id —
+        // i.e. not a resumed checkpoint) gets a new plan when plan mode
+        // is on; a resumed session keeps its checkpointed plan and skips
+        // the extra call.
+        if self.session_id().is_none() {
+            *sync::lock(&self.plan) = None;
+        }
+        if self.plan_mode && sync::lock(&self.plan).is_none() {
+            self.create_session_plan(input);
+        }
+
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
         } else {
@@ -175,6 +186,11 @@ impl Orchestrator {
             self.maybe_cadence_compact(iteration);
 
             let mut messages = self.build_messages();
+            if self.plan_mode {
+                if let Some(plan_msg) = self.plan_progress_message() {
+                    messages.push(plan_msg);
+                }
+            }
             if finalizing {
                 messages.push(Self::finalization_message());
                 self.events.emit(crate::events::Event::System {
@@ -402,6 +418,17 @@ impl Orchestrator {
         // The spend ceiling guards one user turn: start each run at zero.
         self.reset_run_cost();
 
+        // O-05a plan-then-execute: a FRESH turn (no adopted session id —
+        // i.e. not a resumed checkpoint) gets a new plan when plan mode
+        // is on; a resumed session keeps its checkpointed plan and skips
+        // the extra call.
+        if self.session_id().is_none() {
+            *sync::lock(&self.plan) = None;
+        }
+        if self.plan_mode && sync::lock(&self.plan).is_none() {
+            self.create_session_plan(input);
+        }
+
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
         } else {
@@ -478,6 +505,11 @@ impl Orchestrator {
             self.maybe_cadence_compact(iteration);
 
             let mut messages = self.build_messages();
+            if self.plan_mode {
+                if let Some(plan_msg) = self.plan_progress_message() {
+                    messages.push(plan_msg);
+                }
+            }
             if finalizing {
                 messages.push(Self::finalization_message());
                 self.events.emit(crate::events::Event::System {

@@ -148,6 +148,15 @@ impl Orchestrator {
             }
         }
         session.checkpoint(state, messages);
+        // O-05a: persist the plan + todo checklist so a resumed session
+        // continues with the plan intact (and skips the extra plan call).
+        session.plan = sync::lock(&self.plan).clone();
+        let todos = crate::tools::todowrite::current_todos();
+        session.task_state = if todos.is_empty() {
+            None
+        } else {
+            serde_json::to_value(todos).ok()
+        };
         if let Err(e) = store_guard.save(&session) {
             tracing::warn!(error = %e, "session checkpoint failed");
         }
@@ -191,6 +200,21 @@ impl Orchestrator {
             }
         }
         self.model = session.model;
+        // O-05a: restore plan + checklist from the checkpoint so the
+        // resumed loop keeps prepending plan state and never spends a
+        // second plan call.
+        *sync::lock(&self.plan) = session.plan.clone();
+        if let Some(todos_val) = session.task_state.clone() {
+            if let Ok(todos) = serde_json::from_value::<Vec<crate::tools::TodoItem>>(todos_val) {
+                if !todos.is_empty() {
+                    {
+                        let mut list = sync::lock(&crate::tools::todowrite::TODO_LIST);
+                        *list = todos.clone();
+                    }
+                    self.events.emit(Event::TodoChanged { todos });
+                }
+            }
+        }
         self.session_store = Some(Mutex::new(store));
         *sync::lock(&self.session_id) = Some(session.session_id.clone());
         tracing::info!(
