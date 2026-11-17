@@ -1857,3 +1857,94 @@ fn wind_down_shrinks_tool_defs_in_stages() {
         counts
     );
 }
+
+/// O-03: every N iterations the loop collapses old tool results in
+/// memory to one-line summaries, keeping the newest K verbatim.
+#[test]
+fn cadence_collapses_old_tool_results_keeping_recent_verbatim() {
+    let dir = support::tempdir();
+    let path = dir.join("content.txt");
+    let body: String = (1..=40).map(|i| format!("line-{}\n", i)).collect();
+    std::fs::write(&path, body).unwrap();
+
+    // 30 read turns with a shifting offset (distinct args, so the
+    // exact-match loop detector never trips), then a final answer.
+    let mut script = Vec::new();
+    for i in 1..=30 {
+        script.push(support::tool_call_response(
+            &format!("c{}", i),
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": i}),
+        ));
+    }
+    script.push(support::text_response("all read"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(31);
+
+    let answer = orch.run("read it many times").expect("run should succeed");
+    assert_eq!(answer, "all read");
+
+    // 30 tool results total; the newest K (6) stay verbatim, the rest
+    // collapse to one-line summaries naming the tool.
+    let collapsed = orch.search_memory("[Collapsed] read_file");
+    assert!(
+        (20..=26).contains(&collapsed.len()),
+        "expected most tool results collapsed, got {}",
+        collapsed.len()
+    );
+    // Every verbatim read result carries the JSON field "total_lines";
+    // collapsed one-liners do not.
+    let verbatim = orch.search_memory("total_lines");
+    assert!(
+        (6..=9).contains(&verbatim.len()),
+        "expected the newest tool results verbatim, got {}",
+        verbatim.len()
+    );
+}
+
+/// O-03: a cadence of 0 disables the pass entirely.
+#[test]
+fn cadence_zero_disables_collapsing() {
+    let dir = support::tempdir();
+    let path = dir.join("content.txt");
+    std::fs::write(&path, "unique-42\n").unwrap();
+
+    let mut script = Vec::new();
+    for i in 1..=12 {
+        script.push(support::tool_call_response(
+            &format!("c{}", i),
+            "read_file",
+            &serde_json::json!({"path": path.to_string_lossy(), "offset": i}),
+        ));
+    }
+    script.push(support::text_response("all read"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+    orch.set_max_iterations(13);
+    orch.set_compaction_cadence(0);
+
+    let answer = orch.run("read it many times").expect("run should succeed");
+    assert_eq!(answer, "all read");
+    assert!(
+        orch.search_memory("[Collapsed]").is_empty(),
+        "cadence 0 must disable the collapsing pass"
+    );
+}
+

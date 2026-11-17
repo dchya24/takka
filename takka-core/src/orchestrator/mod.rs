@@ -91,6 +91,10 @@ pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 25_000;
 /// compression.
 pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 6;
 
+/// Run the cadenced tool-result collapsing pass every N iterations
+/// (iteration-cadenced compaction). `0` disables the pass.
+pub const DEFAULT_COMPACTION_CADENCE: usize = 10;
+
 /// A tool call reduced to the fields that identify duplicate work.
 ///
 /// Two calls with equal [`ToolCallSignature`]s are doing the *exact same
@@ -318,6 +322,11 @@ pub struct Orchestrator {
     /// results are replaced with `CLEARED_TOOL_RESULT_PLACEHOLDER` when
     /// building the request. Layer 2 of context compression.
     keep_recent_tool_results: usize,
+    /// Collapse old tool results every N iterations (0 = disabled).
+    compaction_cadence: usize,
+    /// Iteration of the last full (token-budget) autocompact, so the
+    /// cadenced pass can no-op right after one.
+    last_full_compact: Mutex<Option<u32>>,
     /// Cooperative cancel flag. When set, the next loop iteration / tool
     /// batch boundary returns `AgenticError::Cancelled`. Shared via Arc so
     /// callers (CLI signal handlers) can flip it asynchronously.
@@ -377,6 +386,8 @@ impl Orchestrator {
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             auto_compact: true,
             keep_recent_tool_results: DEFAULT_KEEP_RECENT_TOOL_RESULTS,
+            compaction_cadence: DEFAULT_COMPACTION_CADENCE,
+            last_full_compact: Mutex::new(None),
             cancel: Arc::new(AtomicBool::new(false)),
             pause_gate: Mutex::new(false),
             pause_cv: std::sync::Condvar::new(),
@@ -641,6 +652,12 @@ impl Orchestrator {
     /// `0` disables clearing (everything kept until autocompact runs).
     pub fn set_keep_recent_tool_results(&mut self, n: usize) {
         self.keep_recent_tool_results = n;
+    }
+
+    /// Override the cadence of the iteration-cadenced tool-result
+    /// collapsing pass: run every N iterations, `0` disables it.
+    pub fn set_compaction_cadence(&mut self, n: usize) {
+        self.compaction_cadence = n;
     }
 
     /// Get a clone of the cancel flag. Wire this to your signal handler

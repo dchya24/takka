@@ -171,7 +171,8 @@ impl Orchestrator {
             // the next provider call.
             self.drain_steering();
 
-            self.maybe_autocompact();
+            self.maybe_autocompact(iteration);
+            self.maybe_cadence_compact(iteration);
 
             let mut messages = self.build_messages();
             if finalizing {
@@ -473,7 +474,8 @@ impl Orchestrator {
             // the next provider call.
             self.drain_steering();
 
-            self.maybe_autocompact();
+            self.maybe_autocompact(iteration);
+            self.maybe_cadence_compact(iteration);
 
             let mut messages = self.build_messages();
             if finalizing {
