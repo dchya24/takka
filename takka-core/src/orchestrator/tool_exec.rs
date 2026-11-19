@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use super::{Orchestrator, OrchestratorState};
 use crate::context::builder::{build_tool_call_responses, truncate_tool_result};
-use crate::tool_registry::{BatchCall, ScheduleEntry};
+use crate::tool_registry::{BatchCall, BatchOutcome, ScheduleEntry};
 
 /// Hasil eksekusi satu tool + metadata untuk `Event::ToolOutput`.
 struct SlotOutcome {
@@ -31,6 +31,47 @@ struct SlotOutcome {
     duration_ms: u64,
     success: bool,
     truncated: bool,
+}
+
+/// Error-shape markers worth ONE automatic in-loop retry: timeouts and
+/// flaky transport failures. Anything else (file not found, schema
+/// validation, permission denied) is persistent — retrying it just
+/// wastes a turn and teaches the model to repeat itself.
+const TRANSIENT_ERROR_MARKERS: [&str; 8] = [
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "rate limit",
+    "503",
+];
+
+/// Error shapes that are persistent by construction — checked first so a
+/// message that happens to contain both shapes never retries.
+const PERSISTENT_ERROR_MARKERS: [&str; 6] = [
+    "not found",
+    "no such file",
+    "permission denied",
+    "schema",
+    "invalid arguments",
+    "denied",
+];
+
+/// Classify a truncated tool-result string. `Some(error message)` when the
+/// call failed with a transient error worth one automatic retry; `None`
+/// when it succeeded or failed persistently.
+fn transient_tool_error(result: &str) -> Option<String> {
+    let msg = result.strip_prefix("Tool error: ")?;
+    let lower = msg.to_lowercase();
+    if PERSISTENT_ERROR_MARKERS.iter().any(|m| lower.contains(m)) {
+        return None;
+    }
+    TRANSIENT_ERROR_MARKERS
+        .iter()
+        .any(|m| lower.contains(m))
+        .then(|| msg.to_string())
 }
 
 /// Budget live output per tool (chars).
@@ -47,7 +88,9 @@ impl Orchestrator {
 
     /// Execute a tool, streaming progress deltas through `on_progress`.
     /// Returns the truncated result plus duration/success/truncated flags
-    /// so callers can emit an enriched `Event::ToolOutput`.
+    /// so callers can emit an enriched `Event::ToolOutput`. A transient
+    /// error triggers ONE in-loop retry with the same args; both attempts
+    /// land in a single annotated history entry.
     fn execute_tool_streaming(
         &self,
         name: &str,
@@ -64,9 +107,13 @@ impl Orchestrator {
             }
             Err(e) => format!("Tool error: {}", e),
         };
+        let (raw, retry_note) = self.apply_auto_retry(name, args, raw);
         let truncated = raw.len() > self.tool_result_max_chars;
-        let result = truncate_tool_result(&raw, self.tool_result_max_chars);
-        let success = !result.starts_with("Tool error");
+        let mut result = truncate_tool_result(&raw, self.tool_result_max_chars);
+        if let Some(note) = retry_note {
+            result = format!("{}\n{}", note, result);
+        }
+        let success = !raw.starts_with("Tool error");
         SlotOutcome {
             name: name.to_string(),
             id: String::new(), // diisi pemanggil
@@ -74,6 +121,71 @@ impl Orchestrator {
             duration_ms: start.elapsed().as_millis() as u64,
             success,
             truncated,
+        }
+    }
+
+    /// One automatic retry for a transient tool error (O-04/P-02):
+    /// re-execute once with the same args and annotate the final entry
+    /// with both attempts, so the model sees the failure history in one
+    /// message instead of being invited to repeat the call itself.
+    /// Persistent errors pass through untouched.
+    fn apply_auto_retry(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        raw: String,
+    ) -> (String, Option<String>) {
+        let Some(first_error) = transient_tool_error(&raw) else {
+            return (raw, None);
+        };
+        tracing::info!(
+            tool = %name,
+            error = %first_error,
+            "transient tool error; auto-retrying once"
+        );
+        let retry_raw = match self.tools.execute_streaming_by_name(name, args, &|_| {}) {
+            Ok(result) => {
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+            }
+            Err(e) => format!("Tool error: {}", e),
+        };
+        let note = if retry_raw.starts_with("Tool error") {
+            format!(
+                "[auto-retry] first attempt failed: {}; retry failed again: {}",
+                first_error,
+                retry_raw
+                    .strip_prefix("Tool error: ")
+                    .unwrap_or(&retry_raw)
+            )
+        } else {
+            format!("[auto-retry] first attempt failed: {}; retry succeeded", first_error)
+        };
+        (retry_raw, Some(note))
+    }
+
+    /// Batch-outcome variant of [`Self::apply_auto_retry`] for parallel
+    /// batch members: retry a transiently-failed call once and annotate.
+    fn apply_auto_retry_batch(
+        &self,
+        args: &serde_json::Value,
+        max_chars: usize,
+        outcome: BatchOutcome,
+    ) -> BatchOutcome {
+        let Some(first_error) = transient_tool_error(&outcome.output) else {
+            return outcome;
+        };
+        let (raw, note) = self.apply_auto_retry(&outcome.name, args, outcome.output.clone());
+        BatchOutcome {
+            name: outcome.name,
+            id: outcome.id,
+            output: format!(
+                "{}\n{}",
+                note.unwrap_or_default(),
+                truncate_tool_result(&raw, max_chars)
+            ),
+            duration_ms: outcome.duration_ms,
+            success: !raw.starts_with("Tool error"),
+            truncated: raw.len() > max_chars,
         }
     }
 
@@ -266,6 +378,16 @@ impl Orchestrator {
                     .collect();
                 let outcomes = self.tools.execute_batch(&calls, self.tool_result_max_chars);
                 for (&i, outcome) in members.iter().zip(outcomes) {
+                    // P-02: one in-loop retry for transient errors, with
+                    // both attempts annotated into the single entry.
+                    let outcome = match &slots[i] {
+                        Slot::Pending { args, .. } => self.apply_auto_retry_batch(
+                            args,
+                            self.tool_result_max_chars,
+                            outcome,
+                        ),
+                        _ => outcome,
+                    };
                     results[i] = Some(SlotOutcome {
                         name: outcome.name,
                         id: outcome.id,
@@ -518,6 +640,15 @@ impl Orchestrator {
                 match joined {
                     Ok(outcomes) => {
                         for (&i, outcome) in members.iter().zip(outcomes) {
+                            // P-02: one in-loop retry for transient errors.
+                            let outcome = match &slots[i] {
+                                Slot::Pending { args, .. } => self.apply_auto_retry_batch(
+                                    args,
+                                    max_chars,
+                                    outcome,
+                                ),
+                                _ => outcome,
+                            };
                             results[i] = Some(SlotOutcome {
                                 name: outcome.name,
                                 id: outcome.id,
@@ -612,7 +743,33 @@ impl Orchestrator {
 
                 match handle.await {
                     Ok((name, id, output, duration_ms, truncated)) => {
-                        let success = !output.starts_with("Tool error");
+                        // P-02: one in-loop retry for transient errors,
+                        // annotated into the single recorded entry.
+                        let (output, truncated, success) =
+                            if transient_tool_error(&output).is_some() {
+                                let args = match &slots[i] {
+                                    Slot::Pending { args, .. } => args.clone(),
+                                    _ => serde_json::Value::Null,
+                                };
+                                let (raw, note) =
+                                    self.apply_auto_retry(&name, &args, output);
+                                let result = match note {
+                                    Some(note) => format!(
+                                        "{}\n{}",
+                                        note,
+                                        truncate_tool_result(&raw, max_chars)
+                                    ),
+                                    None => truncate_tool_result(&raw, max_chars),
+                                };
+                                (
+                                    result,
+                                    raw.len() > max_chars,
+                                    !raw.starts_with("Tool error"),
+                                )
+                            } else {
+                                let success = !output.starts_with("Tool error");
+                                (output, truncated, success)
+                            };
                         results[i] = Some(SlotOutcome {
                             name,
                             id,

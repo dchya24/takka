@@ -613,6 +613,138 @@ fn semantic_loop_detection_resets_after_edit() {
     );
 }
 
+/// P-02: a stub tool whose first call fails with a transient (timeout)
+/// error and whose second call succeeds. The loop must auto-retry once
+/// in-loop and record ONE annotated history entry.
+struct FlakyTransientTool {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FlakyTransientTool {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl takka_core::tool::Tool for FlakyTransientTool {
+    fn name(&self) -> &str {
+        "flaky_read"
+    }
+    fn description(&self) -> &str {
+        "fails once with a timeout, then succeeds"
+    }
+    fn schema(&self) -> takka_core::tool::ToolSchema {
+        takka_core::tool::ToolSchema::new(self.name().to_string(), "flaky test tool")
+    }
+    fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
+        use std::sync::atomic::Ordering;
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(takka_core::tool::ToolError("operation timed out".to_string()))
+        } else {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+    fn metadata(&self) -> takka_core::tool::ToolMetadata {
+        takka_core::tool::ToolMetadata::read_only()
+    }
+}
+
+#[test]
+fn transient_tool_error_auto_retries_once_and_records_one_entry() {
+    let flaky = FlakyTransientTool::new();
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("c0", "flaky_read", &serde_json::json!({})),
+        support::text_response("recovered"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    let flaky2 = FlakyTransientTool { calls: flaky.calls.clone() };
+    tools.register(Box::new(flaky2));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let answer = orch.run("use the flaky tool").expect("run continues past retry");
+    assert_eq!(answer, "recovered");
+
+    // Exactly one annotated history entry; the model never sees the raw
+    // failure as a separate turn.
+    let matches = orch.search_memory("auto-retry");
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one annotated entry, got {:?}",
+        matches
+    );
+}
+
+/// Persistent errors (file not found) never retry: the tool executes
+/// exactly once and the recorded entry carries no auto-retry annotation.
+struct PersistentErrorTool {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PersistentErrorTool {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl takka_core::tool::Tool for PersistentErrorTool {
+    fn name(&self) -> &str {
+        "persistent_error"
+    }
+    fn description(&self) -> &str {
+        "always fails with a persistent error"
+    }
+    fn schema(&self) -> takka_core::tool::ToolSchema {
+        takka_core::tool::ToolSchema::new(self.name().to_string(), "persistent test tool")
+    }
+    fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
+        use std::sync::atomic::Ordering;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(takka_core::tool::ToolError(
+            "file not found: nope.txt".to_string(),
+        ))
+    }
+    fn metadata(&self) -> takka_core::tool::ToolMetadata {
+        takka_core::tool::ToolMetadata::read_only()
+    }
+}
+
+#[test]
+fn persistent_tool_error_never_retries() {
+    let persistent = PersistentErrorTool::new();
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("c0", "persistent_error", &serde_json::json!({})),
+        support::text_response("gave up"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    let persistent2 = PersistentErrorTool { calls: persistent.calls.clone() };
+    tools.register(Box::new(persistent2));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let answer = orch.run("use the broken tool").expect("run completes");
+    assert_eq!(answer, "gave up");
+
+    assert_eq!(
+        persistent.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "persistent error must execute exactly once (no retry)"
+    );
+    assert!(
+        orch.search_memory("auto-retry").is_empty(),
+        "no retry annotation expected for a persistent error"
+    );
+}
+
 /// Plan mode must deny state-changing tools. The model gets a "Blocked"
 /// message back as the tool result, then issues a final text response.
 #[test]
