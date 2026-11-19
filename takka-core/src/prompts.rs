@@ -51,6 +51,9 @@ Search funnel:
 Tool usage:
 - Prefer edit_file for surgical changes; pass enough surrounding context in old_string.
 - Run commands only when needed and prefer read-only commands first (ls, cat, git status, git log).
+- Prefer the grep tool over `run_command` shell grep: one call per pattern (no `|` chains,
+  no `echo ---` separators), each with its own path/pattern — shell pipelines trigger
+  a permission prompt, builtin grep calls do not.
 - When a tool result is large, narrow your next call (use offset/limit, more specific paths).
 
 ── Error Recovery ──────────────────────────────────────────

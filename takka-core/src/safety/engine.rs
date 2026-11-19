@@ -927,11 +927,15 @@ const AUTO_APPROVE_BLOCKING_FLAGS: [&str; 14] = [
 /// `git commit -m "fix: a; b"` must stay auto-approvable while
 /// `git status; curl evil` must not.
 ///
-/// Rejected outright: pipelines (`|`, `||`), output redirection (`>`, `>>`,
-/// `&>`), process substitution (`<(`, `>(`) and command substitution
-/// (`` ` ``, `$(`) — even inside quotes, since double quotes still execute it.
-/// Input redirection (`<`, `<<`) is allowed: reading is not writing, and it is
-/// how multi-line commit messages are usually passed (`git commit -F - <<EOF`).
+/// Rejected outright: output redirection (`>`, `>>`, `&>`), process
+/// substitution (`<(`, `>(`) and command substitution (`` ` ``, `$(`) — even
+/// inside quotes, since double quotes still execute it. Input redirection
+/// (`<`, `<<`) is allowed: reading is not writing, and it is how multi-line
+/// commit messages are usually passed (`git commit -F - <<EOF`).
+///
+/// Pipelines (`|`) are allowed ONLY when every stage is itself an
+/// auto-approved read-only command (e.g. `grep … | head -30`); `||` stays
+/// rejected since it is control flow, not a pipe.
 fn auto_approve_segments(command: &str) -> Option<Vec<&str>> {
     let command = command.trim();
     if command.is_empty()
@@ -974,8 +978,14 @@ fn auto_approve_segments(command: &str) -> Option<Vec<&str>> {
                 quote = Some(byte);
                 i += 1;
             }
-            b'|' | b'>' | b'&' if byte == b'&' && !command[i..].starts_with("&&") => return None,
-            b'|' | b'>' => return None,
+            b'&' if byte == b'&' && !command[i..].starts_with("&&") => return None,
+            b'>' => return None,
+            b'|' if command[i..].starts_with("||") => return None,
+            b'|' => {
+                segments.push(&command[segment_start..i]);
+                i += 1;
+                segment_start = i;
+            }
             b';' => {
                 segments.push(&command[segment_start..i]);
                 i += 1;
@@ -1040,6 +1050,18 @@ fn has_blocking_flag(segment: &str) -> bool {
 #[cfg(test)]
 mod dynamic_allow_tests {
     use super::*;
+
+    /// Read-only pipelines (`grep … | head`) auto-approve; a mutating stage
+    /// (`grep … | xargs rm`) or `||` control flow keeps prompting.
+    #[test]
+    fn read_only_pipeline_auto_approves() {
+        let safety = Safety::new();
+        assert!(safety.is_auto_approved_command("grep -rn foo src | head -30"));
+        assert!(safety.is_auto_approved_command("grep -rn foo src | grep -v spec | head -60"));
+        assert!(!safety.is_auto_approved_command("grep -rn foo src | xargs rm"));
+        assert!(!safety.is_auto_approved_command("grep foo src || echo fallback"));
+        assert!(!safety.is_auto_approved_command("grep foo src > /tmp/out.txt"));
+    }
 
     /// "Always allow" (the client's `Request::AllowCommand`): the exact
     /// command and longer prefix variants stop asking; chained commands
