@@ -269,6 +269,13 @@ impl Safety {
     }
 
     /// Does one (un-chained) command start with an auto-approve prefix?
+    ///
+    /// The "always allow" list (dynamic) is honored verbatim — it is an
+    /// explicit human decision. The static config list additionally runs
+    /// the per-binary content guard, because for some binaries the
+    /// read/write split lives in the *argument content*, not the flags
+    /// (`sed -n 's/x/y/w f'` writes, `python3 -c 'open(f,"w")'` writes,
+    /// `psql -c 'DROP …'` writes).
     fn matches_auto_approve_prefix(&self, command: &str) -> bool {
         let normalized = command.trim().to_lowercase();
         if self
@@ -284,6 +291,7 @@ impl Safety {
             let prefix = prefix.trim().to_lowercase();
             !prefix.is_empty()
                 && (normalized == prefix || normalized.starts_with(&format!("{prefix} ")))
+                && binary_content_guard(command)
         })
     }
 
@@ -1038,6 +1046,112 @@ fn unquoted_content(segment: &str) -> String {
         }
     }
     out
+}
+
+/// Binary-specific content guards: a prefix match alone is not proof of
+/// read-only for binaries whose read/write split lives in the argument
+/// content. Returns `false` to fall back to the normal confirmation
+/// prompt (fail-safe: unknown shapes prompt).
+fn binary_content_guard(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("sed ") {
+        return sed_guard(trimmed);
+    }
+    if lower.starts_with("python3 ") || lower.starts_with("python ") {
+        return python_guard(trimmed);
+    }
+    if lower.starts_with("psql ") {
+        return psql_guard(trimmed);
+    }
+    true
+}
+
+/// `sed -n '<script>'`: the prefix only proves print mode when the flag
+/// set hides no in-place mutation (`-i`, `-ni`) and the script is free
+/// of write/execute commands (`w`, `W`, `e`) attached to an address or
+/// a substitution (`2,5w f`, `s/old/new/w f`, `2,5e cmd`).
+fn sed_guard(segment: &str) -> bool {
+    // Raw segment on purpose: the script lives inside quotes and must
+    // stay visible. Quoted flags looking like flags is the safe
+    // direction — it only causes an extra prompt.
+    for token in segment.split_whitespace() {
+        if token.starts_with('-') && token.trim_start_matches('-').contains('i') {
+            return false;
+        }
+    }
+    let write_cmd = regex::Regex::new(r#"[0-9$,\s/][weW](?:[\s;,:'"]|$)"#).unwrap();
+    !write_cmd.is_match(segment)
+}
+
+/// `python3 -c '<code>'` / `python -c '<code>'`: auto-approve only when
+/// the code string carries no write-shaped pattern (checked against the
+/// raw segment so quoted mode strings stay visible).
+fn python_guard(segment: &str) -> bool {
+    let lower = segment.to_lowercase();
+    let write_open = regex::Regex::new(r#"(?i)open\s*\([^)]*['"][wax+]"#).unwrap();
+    if write_open.is_match(&lower) {
+        return false;
+    }
+    const WRITE_PATTERNS: [&str; 8] = [
+        "os.remove",
+        "os.unlink",
+        "os.system",
+        "shutil",
+        "subprocess",
+        "socket",
+        "__import__",
+        "popen",
+    ];
+    !WRITE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// `psql '<query>'` / `psql -c '<query>'`: auto-approve only read-shaped
+/// queries. The query (after the last `-c`) must start — ignoring
+/// whitespace and leading `--` comments — with SELECT, EXPLAIN or a
+/// backslash meta command (`\d…`, `\l`), and the whole query must be
+/// free of write-shaped SQL keywords (which also kills multi-statement
+/// queries like `SELECT 1; DROP TABLE t`). A query-less `psql` fails
+/// closed.
+fn psql_guard(segment: &str) -> bool {
+    let Some(idx) = segment.rfind("-c") else {
+        return false;
+    };
+    let mut query = segment[idx + 2..].trim();
+    // Peel one level of quoting.
+    if query.len() >= 2
+        && ((query.starts_with('\'') && query.ends_with('\''))
+            || (query.starts_with('"') && query.ends_with('"')))
+    {
+        query = &query[1..query.len() - 1];
+    }
+    // Ignore leading whitespace and `--` comment lines.
+    loop {
+        let trimmed = query.trim_start();
+        if trimmed.starts_with("--") {
+            let Some(nl) = trimmed.find('\n') else {
+                return false; // comment-only query: nothing readable
+            };
+            query = &trimmed[nl + 1..];
+        } else {
+            query = trimmed;
+            break;
+        }
+    }
+    let first = query
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let read_shape = first == "select" || first == "explain" || first.starts_with('\\');
+    if !read_shape {
+        return false;
+    }
+    let write_sql = regex::Regex::new(
+        r"(?i)\b(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|vacuum|begin)\b",
+    )
+    .unwrap();
+    !write_sql.is_match(query)
 }
 
 /// Token-wise flag check, so `--format=%H` does not match `-f`.

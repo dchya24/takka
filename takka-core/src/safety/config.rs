@@ -196,6 +196,21 @@ fn default_auto_approve_commands() -> Vec<String> {
         "du",
         "df",
         "printenv",
+        // Print-only sed (`sed -n '<script>'`); in-place `sed -i` and
+        // write commands inside the script stay gated (see the binary
+        // content guards in the safety engine).
+        "sed -n",
+        "sed -nE",
+        // `python3 -c` / `python -c`: auto-approve only when the code
+        // string carries no write-shaped pattern (engine-side guard).
+        "python3 -c",
+        "python -c",
+        // `psql -c`: auto-approve only read-shaped SQL (SELECT / EXPLAIN
+        // / backslash meta commands); writes keep prompting (engine-side
+        // guard). The bare prefix lets `psql -h host -c 'SELECT …'`
+        // through the prefix step; the guard still requires -c + a
+        // read-shaped query.
+        "psql",
         "cargo check",
         "cargo metadata",
         "cargo tree",
