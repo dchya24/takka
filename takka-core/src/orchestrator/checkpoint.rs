@@ -164,6 +164,11 @@ impl Orchestrator {
     /// checkpoint's recorded state is informational (what the previous
     /// run died doing). (Distinct from [`Orchestrator::resume`], the
     /// pause-release.)
+    ///
+    /// Runs of tool turns are compressed into one short `HistoryReplay`
+    /// summary each (P-05) so a tool-heavy resume shows what was already
+    /// explored. The summaries are replay events only — memory receives
+    /// the exact stored messages, unchanged and in order.
     pub fn resume_session(
         &mut self,
         store: SessionStore,
@@ -174,20 +179,46 @@ impl Orchestrator {
         {
             let mut mem = sync::lock(&self.memory);
             mem.clear();
-            for message in session.messages {
-                // Frontends replay the textual history as stream updates
-                // before the load ack; tool turns carry no standalone text
-                // and are skipped.
-                if matches!(
-                    message.role,
-                    crate::memory::MessageRole::User | crate::memory::MessageRole::Assistant
-                ) {
-                    self.events.emit(Event::HistoryReplay {
-                        role: message.role.as_str().to_string(),
-                        content: message.content.clone(),
-                    });
+            let mut iter = session.messages.into_iter().peekable();
+            // call-id -> target, from each assistant's tool_calls.
+            let mut targets: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            while let Some(message) = iter.next() {
+                match message.role.clone() {
+                    crate::memory::MessageRole::User | crate::memory::MessageRole::Assistant => {
+                        for call in &message.metadata.tool_calls {
+                            if let Some(target) = target_from_call_args(&call.function.arguments) {
+                                targets.insert(call.id.clone(), target);
+                            }
+                        }
+                        self.events.emit(Event::HistoryReplay {
+                            role: message.role.as_str().to_string(),
+                            content: message.content.clone(),
+                        });
+                        mem.add_message(message);
+                    }
+                    crate::memory::MessageRole::Tool { .. } => {
+                        // Consecutive tool turns collapse into one
+                        // summary replay event (UI context only).
+                        let mut run = vec![message];
+                        while matches!(
+                            iter.peek().map(|m| m.role.clone()),
+                            Some(crate::memory::MessageRole::Tool { .. })
+                        ) {
+                            run.push(iter.next().unwrap());
+                        }
+                        self.events.emit(Event::HistoryReplay {
+                            role: "assistant".to_string(),
+                            content: summarize_tool_run(&run, &targets),
+                        });
+                        for message in run {
+                            mem.add_message(message);
+                        }
+                    }
+                    crate::memory::MessageRole::System => {
+                        mem.add_message(message);
+                    }
                 }
-                mem.add_message(message);
             }
         }
         self.model = session.model;
@@ -200,5 +231,235 @@ impl Orchestrator {
             "session resumed"
         );
         Ok(())
+    }
+}
+
+/// Max summary lines per tool run; the rest collapse into a "+M more" tail.
+const TOOL_RUN_SUMMARY_LINES: usize = 20;
+
+/// Target string of one tool call from its JSON arguments
+/// (`command` > `path` > `file_path` — the safety engine's convention).
+fn target_from_call_args(arguments: &str) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    ["command", "path", "file_path"]
+        .iter()
+        .find_map(|key| args.get(key).and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+/// One compact summary of a consecutive run of tool messages (P-05):
+/// `tool_name(target) → outcome` lines, capped at
+/// [`TOOL_RUN_SUMMARY_LINES`]. A result starting with `Tool error:` or
+/// `Blocked:` shows its first line as the outcome; everything else
+/// reads `ok`.
+fn summarize_tool_run(
+    run: &[crate::memory::Message],
+    targets: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(run.len());
+    for message in run {
+        let name = match &message.role {
+            crate::memory::MessageRole::Tool { tool_name, .. } => tool_name.clone(),
+            _ => continue,
+        };
+        let call_id = message
+            .metadata
+            .tool_call_id
+            .as_deref()
+            .unwrap_or_default();
+        let target = targets.get(call_id).map(String::as_str).unwrap_or("-");
+        let outcome = if let Some(err) = message
+            .content
+            .strip_prefix("Tool error: ")
+            .or_else(|| message.content.strip_prefix("Blocked: "))
+        {
+            let first_line = err.lines().next().unwrap_or("");
+            let mut line: String = first_line.chars().take(80).collect();
+            if line.chars().count() < first_line.chars().count() {
+                line.push('\u{2026}');
+            }
+            format!("error: {line}")
+        } else {
+            "ok".to_string()
+        };
+        lines.push(format!("{name}({target}) → {outcome}"));
+    }
+
+    if lines.len() > TOOL_RUN_SUMMARY_LINES {
+        let overflow = lines.len() - TOOL_RUN_SUMMARY_LINES;
+        lines.truncate(TOOL_RUN_SUMMARY_LINES);
+        lines.push(format!("\u{2026} +{overflow} more"));
+    }
+    format!(
+        "[replayed tool work: {} calls]\n{}",
+        run.len(),
+        lines.join("\n")
+    )
+}
+
+#[cfg(test)]
+mod resume_summary_tests {
+    use super::*;
+    use crate::providers::{ChatResponse, ChatUsage, LLMProvider, ProviderError, ProviderResult, StreamResult};
+    use crate::tool_registry::ToolRegistry;
+    use crate::tool::{Tool, ToolError, ToolMetadata, ToolSchema};
+    use std::sync::Arc;
+
+    struct UnusedProvider;
+    impl LLMProvider for UnusedProvider {
+        fn provider_type(&self) -> &str { "unused" }
+        fn provider_id(&self) -> &str { "unused" }
+        fn chat(&self, _r: crate::providers::ChatRequest) -> ProviderResult<ChatResponse> {
+            Err(ProviderError::new("unused"))
+        }
+        fn chat_stream(&self, _r: crate::providers::ChatRequest) -> StreamResult<crate::providers::ChatChunk, ProviderError> {
+            Err(ProviderError::new("unused"))
+        }
+    }
+
+    struct StubReadTool {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl Tool for StubReadTool {
+        fn name(&self) -> &str { "stub_read" }
+        fn description(&self) -> &str { "stub read tool" }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(self.name().to_string(), "stub")
+        }
+        fn execute(&self, args: serde_json::Value) -> crate::tool::ToolResult<serde_json::Value> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 2 {
+                return Err(ToolError("operation timed out".into()));
+            }
+            Ok(serde_json::json!({"path": args["path"], "ok": true}))
+        }
+        fn metadata(&self) -> ToolMetadata { ToolMetadata::read_only() }
+    }
+
+    fn tool_message(name: &str, call_id: &str, result: &str) -> crate::memory::Message {
+        crate::memory::Message::tool(name, call_id, result)
+    }
+
+    fn assistant_with_calls(calls: Vec<crate::providers::ToolCallResponse>) -> crate::memory::Message {
+        crate::memory::Message::assistant_with_tool_calls("", calls)
+    }
+
+    fn call(id: &str, name: &str, args: &serde_json::Value) -> crate::providers::ToolCallResponse {
+        crate::providers::ToolCallResponse {
+            id: id.to_string(),
+            call_type: "function".into(),
+            function: crate::providers::ToolCallFunction {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    fn result_for(call_id: &str, ok: bool) -> String {
+        if ok {
+            format!("{{\"ok\": true, \"call\": \"{call_id}\"}}")
+        } else {
+            "Tool error: operation timed out".to_string()
+        }
+    }
+
+    #[test]
+    fn resume_replays_a_summary_per_tool_run_and_keeps_memory_identical() {
+        let dir = std::env::temp_dir().join(format!("resume_sum_{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&dir);
+
+        // Simulate a run's messages: user → assistant(tool_calls) → 3 tools → assistant.
+        let user = crate::memory::Message::user("explore");
+        let assistant = assistant_with_calls(vec![
+            call("c1", "stub_read", &serde_json::json!({"path": "src/main.rs"})),
+            call("c2", "stub_read", &serde_json::json!({"path": "src/lib.rs"})),
+            call("c3", "stub_read", &serde_json::json!({"path": "src/err.rs"})),
+        ]);
+        let t1 = tool_message("stub_read", "c1", &result_for("c1", true));
+        let t2 = tool_message("stub_read", "c2", &result_for("c2", true));
+        let t3 = tool_message("stub_read", "c3", &result_for("c3", false));
+        let final_assistant = crate::memory::Message::assistant("done");
+
+        let stored = vec![user.clone(), assistant.clone(), t1.clone(), t2.clone(), t3.clone(), final_assistant.clone()];
+        let mut session = crate::session::AgentSession::new("resume-sum-1", "m");
+        session.checkpoint("completed", stored.clone());
+        store.save(&session).unwrap();
+
+        let mut orch = Orchestrator::new(Arc::new(UnusedProvider), ToolRegistry::new());
+        let events: Arc<std::sync::Mutex<Vec<Event>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        orch.on_event(move |e| sink.lock().unwrap().push(e));
+        orch.resume_session(store, "resume-sum-1").expect("resume");
+
+        // Memory is byte-identical to the stored messages.
+        let loaded: Vec<crate::memory::Message> = sync::lock(&orch.memory).get_messages().to_vec();
+        assert_eq!(loaded.len(), stored.len(), "message count preserved");
+        for (a, b) in loaded.iter().zip(stored.iter()) {
+            assert_eq!(
+                serde_json::to_string(a).unwrap(),
+                serde_json::to_string(b).unwrap(),
+                "memory message must be byte-identical"
+            );
+        }
+
+        // One summary replay per tool run, with target + outcome lines.
+        let replays: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::HistoryReplay { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        let summary = replays
+            .iter()
+            .find(|c| c.contains("replayed tool work"))
+            .expect("tool-run summary replayed");
+        assert!(summary.contains("stub_read(src/main.rs) → ok"), "{summary}");
+        assert!(summary.contains("stub_read(src/lib.rs) → ok"), "{summary}");
+        assert!(
+            summary.contains("stub_read(src/err.rs) → error: operation timed out"),
+            "{summary}"
+        );
+        // User + assistant text replays still happen.
+        assert!(replays.iter().any(|c| c == "explore"));
+        assert!(replays.iter().any(|c| c == "done"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_run_summary_caps_at_20_lines_with_overflow_tail() {
+        let mut messages = vec![assistant_with_calls(Vec::new())];
+        let mut calls = Vec::new();
+        for i in 0..44 {
+            let id = format!("c{i}");
+            calls.push(call(&id, "stub_read", &serde_json::json!({"path": format!("f{i}.rs")})));
+            messages.push(tool_message("stub_read", &id, &result_for(&id, true)));
+        }
+        messages[0] = assistant_with_calls(calls);
+
+        let summary = summarize_tool_run(
+            &messages[1..],
+            &std::collections::HashMap::new(),
+        );
+        let body_lines: Vec<&str> = summary.lines().skip(1).collect();
+        assert_eq!(body_lines.len(), 21, "20 lines + overflow tail: {summary}");
+        assert!(body_lines[20].contains("+24 more"), "{summary}");
+        assert!(summary.contains("44 calls"));
+    }
+
+    #[test]
+    fn target_from_call_args_prefers_command_then_path() {
+        assert_eq!(
+            target_from_call_args(r#"{"command":"ls -la","path":"x"}"#).as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(
+            target_from_call_args(r#"{"file_path":"a.rs"}"#).as_deref(),
+            Some("a.rs")
+        );
+        assert_eq!(target_from_call_args("not json"), None);
     }
 }
