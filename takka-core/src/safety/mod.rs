@@ -994,6 +994,114 @@ mod auto_approve_tests {
         }
     }
 
+    // ── P-03: read-only guards for content-gated binaries ──────
+
+    /// `sed -n '<script>'` prints; `sed -i` mutates in place and keeps
+    /// prompting. Write commands inside the script (`w`, `e`) also gate.
+    #[test]
+    fn sed_n_print_is_auto_approved_and_in_place_still_prompts() {
+        let safety = Safety::new();
+        for command in [
+            "sed -n '2,5p' notes.txt",
+            "sed -n 's/old/new/gp' notes.txt",
+            "sed -nE '10,20p' notes.txt",
+        ] {
+            let decision = run(&safety, command);
+            assert!(
+                !decision.confirmation_required,
+                "{command} must not prompt, score={:?}",
+                decision.score
+            );
+        }
+        for command in [
+            "sed -i 's/old/new/g' notes.txt",
+            "sed -ni 's/old/new/g' notes.txt",
+            "sed --in-place 's/old/new/g' notes.txt",
+            "sed -n 's/old/new/w dump.txt' notes.txt",
+            "sed -n '2,5e id' notes.txt",
+        ] {
+            let decision = run(&safety, command);
+            assert!(
+                decision.confirmation_required,
+                "{command} must still ask, score={:?}",
+                decision.score
+            );
+        }
+    }
+
+    /// `python3 -c` / `python -c`: auto-approve only when the code string
+    /// is free of write-shaped patterns; anything write-ish falls back to
+    /// the normal prompt.
+    #[test]
+    fn python_dash_c_read_only_code_is_auto_approved() {
+        let safety = Safety::new();
+        for command in [
+            "python3 -c 'print(open(\"notes.txt\").read())'",
+            "python3 -c 'import json,sys; print(json.load(sys.stdin)[\"k\"])'",
+            "python -c 'print(1 + 1)'",
+        ] {
+            let decision = run(&safety, command);
+            assert!(
+                !decision.confirmation_required,
+                "{command} must not prompt, score={:?}",
+                decision.score
+            );
+        }
+        for command in [
+            "python3 -c 'open(\"out.txt\",\"w\").write(\"x\")'",
+            "python3 -c 'import os; os.remove(\"notes.txt\")'",
+            "python3 -c 'import shutil; shutil.rmtree(\"d\")'",
+            "python3 -c 'import subprocess; subprocess.run([\"ls\"])'",
+            "python -c 'import socket; socket.create_connection((\"h\",80))'",
+            "python -c '__import__(\"os\").system(\"ls\")'",
+        ] {
+            let decision = run(&safety, command);
+            assert!(
+                decision.confirmation_required,
+                "{command} must still ask, score={:?}",
+                decision.score
+            );
+        }
+    }
+
+    /// `psql -c`: read-shaped queries (SELECT / EXPLAIN / \d meta) run
+    /// without a prompt; write-shaped SQL and multi-statement queries
+    /// keep prompting.
+    #[test]
+    fn psql_dash_c_read_queries_are_auto_approved() {
+        let safety = Safety::new();
+        for command in [
+            "psql -c 'SELECT count(*) FROM users'",
+            r"psql -c '\dt'",
+            r"psql -c '\dn'",
+            "psql -c 'EXPLAIN ANALYZE SELECT 1'",
+            "psql -c '   -- session note\n SELECT 1'",
+            "psql -h db -c 'SELECT 1'",
+        ] {
+            let decision = run(&safety, command);
+            assert!(
+                !decision.confirmation_required,
+                "{command} must not prompt, score={:?}",
+                decision.score
+            );
+        }
+        for command in [
+            "psql -c 'INSERT INTO users VALUES (1)'",
+            "psql -c 'UPDATE users SET a = 1'",
+            "psql -c 'DELETE FROM users'",
+            "psql -c 'DROP TABLE users'",
+            "psql -c 'SELECT 1; DROP TABLE users'",
+            "psql -c 'CREATE TABLE t (a int)'",
+        ] {
+            let decision = run(&safety, command);
+            assert!(
+                decision.confirmation_required,
+                "{command} must still ask, score={:?}",
+                decision.score
+            );
+        }
+    }
+
     #[test]
     fn shell_chaining_disables_auto_approval() {
         let safety = Safety::new();
