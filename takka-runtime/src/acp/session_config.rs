@@ -120,7 +120,10 @@ pub(crate) fn permission_mode(mode_id: &str) -> Option<PermissionMode> {
 /// Reply body for a successful `session/load` / `session/resume`: the
 /// mode surface (permission modes) for the re-attached session.
 pub(crate) fn load_modes_reply(resume: bool) -> Value {
-    let modes = session_mode_state();
+    // session/load/resume replays the advertised mode surface; the
+    // re-attached engine restores its own state, so "default" stays the
+    // advertised current until the client re-syncs.
+    let modes = session_mode_state("default");
     if resume {
         serde_json::to_value(acp::ResumeSessionResponse::new().modes(modes))
             .expect("resume response serializes")

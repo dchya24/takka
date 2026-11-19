@@ -725,7 +725,14 @@ impl<T: Transport> RuntimeEngine<T> {
         orchestrator.set_cancel_handle(cancel);
         orchestrator.set_model(model);
         orchestrator.set_system_prompt(system_prompt);
-        orchestrator.set_permission_mode(overrides.permission_mode.unwrap_or_default());
+        // Boot permission mode: explicit override wins, then the
+        // per-project config default, then `default` (pre-existing).
+        orchestrator.set_permission_mode(
+            overrides
+                .permission_mode
+                .or(config.agent.default_permission_mode)
+                .unwrap_or_default(),
+        );
         if let Some(session_id) = overrides.session_id.as_deref() {
             // Stable session identity (ACP): persist under the adopted id so
             // `Request::LoadSession` can find the checkpoint later.

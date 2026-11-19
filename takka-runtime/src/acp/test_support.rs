@@ -292,6 +292,60 @@ pub(crate) fn hermetic_config_path() -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Hermetic config with `agent.default_permission_mode` set (P-04):
+/// same discard-port provider, sessions boot in `mode`.
+pub(crate) fn hermetic_config_with_default_mode_path(mode: &str) -> String {
+    let path = std::env::temp_dir().join(format!(
+        "takka-acp-test-mode-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    ));
+    let json = format!(
+        r#"{{
+  "providers": [
+    {{
+      "name": "hermetic-test",
+      "type": "openai-compatible",
+      "api_base": "http://127.0.0.1:9",
+      "api_key": "unused",
+      "models": [
+        {{ "model": "hermetic-model", "temperature": 0.0, "max_tokens": 64 }}
+      ]
+    }}
+  ],
+  "agent": {{ "default_permission_mode": "{mode}" }}
+}}"#
+    );
+    std::fs::write(&path, json).expect("write hermetic acp config with mode");
+    path.to_string_lossy().into_owned()
+}
+
+impl TestAcp {
+    /// Spawn with an explicit config path (hermetic variants for tests
+    /// that need a non-default `agent` block).
+    pub(crate) fn spawn_with_config(max_sessions: usize, config_path: String) -> Self {
+        let (tx, mut reader) = ChanReader::new();
+        let sink = Arc::new(VecSink::default());
+        let config = AcpConfig {
+            max_sessions,
+            config_path: Some(config_path),
+        };
+        let sink_for_serve = sink.clone();
+        let serve = std::thread::Builder::new()
+            .name("acp-serve-test".into())
+            .spawn(move || serve_over(&mut reader, sink_for_serve, config))
+            .expect("spawn the serve thread");
+        Self {
+            tx: Some(tx),
+            sink,
+            serve,
+        }
+    }
+}
+
 pub(crate) fn new_session(acp: &TestAcp, id: i64) -> String {
     let cwd = std::env::current_dir()
         .expect("process cwd")

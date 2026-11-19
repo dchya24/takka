@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::safety::PermissionMode;
 use crate::skills::discovery::DiscoveryConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +110,12 @@ pub struct AgentLoopConfig {
     /// means unlimited — the pre-ceiling behaviour.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+    /// Permission mode every new session boots in. `None` = `default`
+    /// (ask before writes) — the pre-existing behaviour. `plan` makes a
+    /// fresh session read-only from the first turn without the client
+    /// having to switch modes via the UI.
+    #[serde(default)]
+    pub default_permission_mode: Option<PermissionMode>,
     /// Planner agent configuration.
     #[serde(default)]
     pub planner: PlannerLoopConfig,
@@ -785,6 +792,34 @@ mod tests {
         let out = serde_json::to_string(&cfg).expect("serialize");
         let cfg2: Config = serde_json::from_str(&out).expect("reparse");
         assert_eq!(cfg2.agent.max_cost_usd, Some(2.5));
+    }
+
+    #[test]
+    fn default_permission_mode_round_trips() {
+        let json = r#"{
+            "providers": [{
+                "name": "p",
+                "type": "openai-compatible",
+                "api_base": "https://x",
+                "api_key": "k",
+                "models": [{"model": "m"}]
+            }],
+            "agent": { "default_permission_mode": "plan" }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.agent.default_permission_mode, Some(PermissionMode::Plan));
+
+        // Unset = default mode at boot (pre-existing behaviour).
+        let bare: Config = serde_json::from_str(
+            r#"{"providers":[{"name":"p","type":"openai-compatible","api_base":"https://x","api_key":"k","models":[{"model":"m"}]}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(bare.agent.default_permission_mode, None);
+
+        // Round trip.
+        let out = serde_json::to_string(&cfg).expect("serialize");
+        let cfg2: Config = serde_json::from_str(&out).expect("reparse");
+        assert_eq!(cfg2.agent.default_permission_mode, Some(PermissionMode::Plan));
     }
 
     #[test]
