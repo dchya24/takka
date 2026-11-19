@@ -119,14 +119,14 @@ pub(crate) fn validate_session_id(session_id: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// D9: takka permission modes as ACP session modes. The current mode is
-// always `default` at session creation; `session/set_mode` wiring (into
-// `InitOverrides.permission_mode`) lands with a later lane.
+// D9: takka permission modes as ACP session modes. The current mode at
+// session creation is the config's `agent.default_permission_mode` (or
+// `default` when unset); `session/set_mode` re-routes it at runtime.
 // ---------------------------------------------------------------------------
 
-pub(crate) fn session_mode_state() -> acp::SessionModeState {
+pub(crate) fn session_mode_state(current_mode_id: &str) -> acp::SessionModeState {
     acp::SessionModeState::new(
-        acp::SessionModeId::new("default"),
+        acp::SessionModeId::new(current_mode_id),
         vec![
             mode(
                 "default",
@@ -190,7 +190,7 @@ impl AcpService {
         }
 
         let mut response = acp::NewSessionResponse::new(acp::SessionId::new(session_id))
-            .modes(session_mode_state());
+            .modes(session_mode_state(&lock(&session.current_mode).clone()));
         if let Some(config) = self.adapter_config() {
             let current_model = lock(&session.current_model).clone();
             let current_mode = lock(&session.current_mode).clone();
@@ -219,18 +219,30 @@ impl AcpService {
 
         // Config-derived session state: the active model (qualified id)
         // and its context window — the `model` config option's value and
-        // the `UsageUpdate.size`. Default mode is `default` (D9).
-        let (current_model, context_size) = self
+        // the `UsageUpdate.size`. Boot permission mode comes from the
+        // config's `agent.default_permission_mode` (P-04); `default`
+        // when unset (D9).
+        let (current_model, context_size, default_mode) = self
             .adapter_config()
-            .and_then(|config| {
-                let model = config.active_model()?;
-                let provider = config.active_provider()?;
-                Some((
-                    format!("{}/{}", provider.name, model.model),
-                    u64::from(model.max_tokens),
-                ))
+            .map(|config| {
+                let (current_model, context_size) = config
+                    .active_model()
+                    .zip(config.active_provider())
+                    .map(|(model, provider)| {
+                        (
+                            format!("{}/{}", provider.name, model.model),
+                            u64::from(model.max_tokens),
+                        )
+                    })
+                    .unwrap_or_else(|| ("openai/gpt-4o".to_string(), 128_000));
+                let mode = config
+                    .agent
+                    .default_permission_mode
+                    .map(|mode| mode.as_str().to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                (current_model, context_size, mode)
             })
-            .unwrap_or_else(|| ("openai/gpt-4o".to_string(), 128_000));
+            .unwrap_or_else(|| ("openai/gpt-4o".to_string(), 128_000, "default".to_string()));
         let session = Arc::new(Session {
             id: session_id.to_owned(),
             req_tx,
@@ -240,7 +252,7 @@ impl AcpService {
             request_counter: AtomicU64::new(0),
             engine: Mutex::new(Some(engine_handle)),
             turn: Mutex::new(None),
-            current_mode: Mutex::new("default".to_string()),
+            current_mode: Mutex::new(default_mode.clone()),
             current_model: Mutex::new(current_model),
             context_size: std::sync::atomic::AtomicU64::new(context_size),
         });
@@ -251,7 +263,7 @@ impl AcpService {
             Request::Init {
                 overrides: InitOverrides {
                     config_path: self.config.config_path.clone(),
-                    permission_mode: None,
+                    permission_mode: takka_core::safety::PermissionMode::parse(&default_mode),
                     model: None,
                     system_prompt: None,
                     // The ACP session id IS the checkpoint id: a later
@@ -446,6 +458,32 @@ mod tests {
             .map(|m| m["id"].as_str().expect("mode id"))
             .collect();
         assert_eq!(ids, vec!["default", "plan", "yolo"]);
+        acp.close_and_join();
+    }
+
+    /// P-04: `agent.default_permission_mode: "plan"` boots new sessions
+    /// in plan mode without a client-side mode switch — the reply
+    /// advertises `plan` as the current mode.
+    #[test]
+    fn session_new_boots_in_the_config_default_permission_mode() {
+        let acp = TestAcp::spawn_with_config(
+            DEFAULT_MAX_SESSIONS,
+            hermetic_config_with_default_mode_path("plan"),
+        );
+        let _session = new_session(&acp, 1);
+        let response = acp.response(1);
+        let modes = &response["result"]["modes"];
+        assert_eq!(modes["currentModeId"], serde_json::json!("plan"));
+
+        // The configOptions mode select mirrors the effective mode.
+        let options = &response["result"]["configOptions"];
+        let mode_option = options
+            .as_array()
+            .expect("configOptions array")
+            .iter()
+            .find(|o| o["id"] == serde_json::json!("mode"))
+            .expect("mode config option");
+        assert_eq!(mode_option["currentValue"], serde_json::json!("plan"));
         acp.close_and_join();
     }
 
