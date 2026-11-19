@@ -17,6 +17,27 @@ use crate::AgenticError;
 
 use super::{LoopDetectionOutcome, Orchestrator, OrchestratorState};
 
+/// Which spend ceiling (if any) the latest usage report crossed
+/// (P-07). Checked per-run first, then per-session.
+pub(super) enum CostLimitCrossed {
+    None,
+    Run,
+    Session,
+}
+
+/// What [`Orchestrator::cost_limit_stop`] decided at the boundary.
+pub(super) enum CostStop {
+    /// Keep going.
+    None,
+    /// Run ceiling crossed: stop, keep the answer (policy outcome, not a
+    /// failure) — pre-existing behaviour.
+    Run(String),
+    /// Session ceiling crossed (P-07): stop and surface the session-limit
+    /// message as an error so the checkpoint reads `failed`, distinct
+    /// from a user cancel.
+    Session(String),
+}
+
 impl Orchestrator {
     pub fn run(&self, input: &str) -> Result<String, AgenticError> {
         self.run_with_attachments(input, Vec::new())
@@ -225,8 +246,8 @@ impl Orchestrator {
                     cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 });
             }
-            // Spend ceiling: price this call and remember whether it pushed
-            // the run over. The stop itself happens further down, after
+            // Spend ceilings: price this call and remember which (if any)
+            // was pushed over. The stop itself happens further down, after
             // this turn's work is finished (see `cost_limit_stop`).
             let cost_limit_reached = Self::accumulate_usage_cost(self, response.usage.as_ref());
 
@@ -323,9 +344,16 @@ impl Orchestrator {
                     self.clear_semantic_loop_detection();
                 }
 
-                if let Some(answer) = self.cost_limit_stop(cost_limit_reached) {
-                    sync::lock(&self.memory).add_message(Message::assistant(&content));
-                    return Ok(answer);
+                match self.cost_limit_stop(cost_limit_reached) {
+                    CostStop::None => {}
+                    CostStop::Run(answer) => {
+                        sync::lock(&self.memory).add_message(Message::assistant(&content));
+                        return Ok(answer);
+                    }
+                    CostStop::Session(message) => {
+                        sync::lock(&self.memory).add_message(Message::assistant(&content));
+                        return Err(AgenticError::Provider(message));
+                    }
                 }
             } else {
                 // No tool calls - model produced a final answer
@@ -342,8 +370,12 @@ impl Orchestrator {
 
                 sync::lock(&self.memory).add_message(Message::assistant(&content));
 
-                if self.cost_limit_stop(cost_limit_reached).is_some() {
-                    return Ok(content);
+                match self.cost_limit_stop(cost_limit_reached) {
+                    CostStop::None => {}
+                    // On a text answer the produced answer IS the result —
+                    // never the placeholder empty string.
+                    CostStop::Run(_) => return Ok(content),
+                    CostStop::Session(message) => return Err(AgenticError::Provider(message)),
                 }
 
                 self.set_state(OrchestratorState::Completed);
@@ -618,8 +650,8 @@ impl Orchestrator {
                     cache_creation_input_tokens: usage.cache_creation_input_tokens,
                 });
             }
-            // Spend ceiling: price this call and remember whether it pushed
-            // the run over. The stop itself happens further down, after
+            // Spend ceilings: price this call and remember which (if any)
+            // was pushed over. The stop itself happens further down, after
             // this turn's work is finished (see `cost_limit_stop`) — never
             // mid-stream.
             let cost_limit_reached = Self::accumulate_usage_cost(self, stream_usage.as_ref());
@@ -702,9 +734,16 @@ impl Orchestrator {
                     self.clear_semantic_loop_detection();
                 }
 
-                if let Some(answer) = self.cost_limit_stop(cost_limit_reached) {
-                    sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
-                    return Ok(answer);
+                match self.cost_limit_stop(cost_limit_reached) {
+                    CostStop::None => {}
+                    CostStop::Run(answer) => {
+                        sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
+                        return Ok(answer);
+                    }
+                    CostStop::Session(message) => {
+                        sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
+                        return Err(AgenticError::Provider(message));
+                    }
                 }
                 continue;
             }
@@ -723,8 +762,12 @@ impl Orchestrator {
 
             sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
 
-            if self.cost_limit_stop(cost_limit_reached).is_some() {
-                return Ok(content_buf);
+            match self.cost_limit_stop(cost_limit_reached) {
+                CostStop::None => {}
+                // On a text answer the produced answer IS the result —
+                // never the placeholder empty string.
+                CostStop::Run(_) => return Ok(content_buf),
+                CostStop::Session(message) => return Err(AgenticError::Provider(message)),
             }
 
             self.set_state(OrchestratorState::Completed);
@@ -739,23 +782,27 @@ impl Orchestrator {
     }
 
     /// Price one provider usage report against the model's list price and
-    /// add it to the run total. Returns `true` when the run has now crossed
-    /// `agent.max_cost_usd`.
+    /// add it to BOTH totals (run + session, P-07). Returns which ceiling
+    /// (if any) has now been crossed — checked in that order: per-run
+    /// first, then per-session.
     ///
     /// Unknown models have no list price, so nothing is added and the
-    /// ceiling stays unevaluated (fail-open — a wrong guess must never stop
+    /// ceilings stay unevaluated (fail-open — a wrong guess must never stop
     /// a run the user did not actually overspend). Providers that report no
     /// usage at all land here too, with the same outcome.
-    fn accumulate_usage_cost(&self, usage: Option<&crate::providers::ChatUsage>) -> bool {
+    fn accumulate_usage_cost(
+        &self,
+        usage: Option<&crate::providers::ChatUsage>,
+    ) -> CostLimitCrossed {
         let Some(usage) = usage else {
-            return false;
+            return CostLimitCrossed::None;
         };
         let Some(price) = crate::pricing::lookup(&self.model) else {
             tracing::debug!(
                 model = %self.model,
                 "no list price for model; spend ceiling cannot be evaluated"
             );
-            return false;
+            return CostLimitCrossed::None;
         };
         let cost = price.cost_usd(
             usage.prompt_tokens,
@@ -763,7 +810,13 @@ impl Orchestrator {
             usage.cache_read_input_tokens.unwrap_or(0),
             usage.cache_creation_input_tokens.unwrap_or(0),
         );
-        self.record_run_cost(cost)
+        if self.record_run_cost(cost) {
+            return CostLimitCrossed::Run;
+        }
+        if self.record_session_cost(cost) {
+            return CostLimitCrossed::Session;
+        }
+        CostLimitCrossed::None
     }
 
     /// Stop the run when the ceiling was crossed.
@@ -774,11 +827,37 @@ impl Orchestrator {
     /// call is always paid for and answered before the loop closes. The
     /// answer produced so far is still returned (`Ok`), because stopping on
     /// budget is a policy outcome, not a failure.
-    fn cost_limit_stop(&self, crossed: bool) -> Option<String> {
-        let max = self.max_cost_usd?;
-        if !crossed {
-            return None;
+    fn cost_limit_stop(&self, crossed: CostLimitCrossed) -> CostStop {
+        match crossed {
+            CostLimitCrossed::None => return CostStop::None,
+            CostLimitCrossed::Session => {
+                // Session ceiling (P-07): same boundary pattern as the run
+                // ceiling, but the run ends FAILED with the session-limit
+                // message so a ceiling stop never reads like a
+                // user-initiated cancel. `session_terminal` records it.
+                let max = self.max_cost_usd_per_session.unwrap_or_default();
+                let spent = self.session_cost_usd();
+                tracing::warn!(
+                    max,
+                    spent,
+                    "agent session stopped at agent.max_cost_usd_per_session"
+                );
+                self.clear_loop_detection();
+                self.events.emit(crate::events::Event::CostLimitExceeded {
+                    max_cost_usd: max,
+                    spent_usd: spent,
+                });
+                return CostStop::Session(format!(
+                    "Session cost limit reached: session spent ${spent:.4} of \
+                     agent.max_cost_usd_per_session ${max:.4}. The run stopped to protect the budget; \
+                     resume or raise the ceiling to continue."
+                ));
+            }
+            CostLimitCrossed::Run => {}
         }
+        let max = self
+            .max_cost_usd
+            .expect("run ceiling crossed without a configured run ceiling");
         let spent = self.run_cost_usd();
         tracing::warn!(max, spent, "agent run stopped at agent.max_cost_usd");
         self.clear_loop_detection();
@@ -787,7 +866,7 @@ impl Orchestrator {
             spent_usd: spent,
         });
         self.set_state(OrchestratorState::Completed);
-        Some(String::new())
+        CostStop::Run(String::new())
     }
 
     /// Steering poll (Fase 2b): called once per iteration boundary —

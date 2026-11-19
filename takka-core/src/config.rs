@@ -119,6 +119,12 @@ pub struct AgentLoopConfig {
     /// questions must not pay the extra call.
     #[serde(default)]
     pub plan_then_execute: bool,
+    /// Spend ceiling for the WHOLE session (P-07), in US dollars. Unlike
+    /// `max_cost_usd` (which guards one user turn and resets every run),
+    /// this accumulates across all runs of a session and stops the run
+    /// after the crossing turn. `None` (the default) = unlimited.
+    #[serde(default)]
+    pub max_cost_usd_per_session: Option<f64>,
     /// Permission mode every new session boots in. `None` = `default`
     /// (ask before writes) — the pre-existing behaviour. `plan` makes a
     /// fresh session read-only from the first turn without the client
@@ -750,6 +756,7 @@ mod tests {
         assert!(cfg.agent.max_cost_usd.is_none());
         assert_eq!(cfg.agent.compaction_cadence, None);
         assert!(!cfg.agent.plan_then_execute);
+        assert!(cfg.agent.max_cost_usd_per_session.is_none());
 
         // Planner config should have defaults when omitted.
         assert_eq!(cfg.agent.planner.max_steps, 20);
@@ -831,6 +838,26 @@ mod tests {
         let out = serde_json::to_string(&cfg).expect("serialize");
         let cfg2: Config = serde_json::from_str(&out).expect("reparse");
         assert_eq!(cfg2.agent.default_permission_mode, Some(PermissionMode::Plan));
+    }
+
+    #[test]
+    fn max_cost_usd_per_session_round_trips() {
+        let json = r#"{
+            "providers": [{
+                "name": "p",
+                "type": "openai-compatible",
+                "api_base": "https://x",
+                "api_key": "k",
+                "models": [{"model": "m"}]
+            }],
+            "agent": { "max_cost_usd_per_session": 5.0 }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.agent.max_cost_usd_per_session, Some(5.0));
+
+        let out = serde_json::to_string(&cfg).expect("serialize");
+        let cfg2: Config = serde_json::from_str(&out).expect("reparse");
+        assert_eq!(cfg2.agent.max_cost_usd_per_session, Some(5.0));
     }
 
     #[test]

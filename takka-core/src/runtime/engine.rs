@@ -759,6 +759,9 @@ impl<T: Transport> RuntimeEngine<T> {
         // Spend ceiling (`agent.max_cost_usd`): `None` leaves the loop
         // unlimited, exactly as before the key existed.
         orchestrator.set_max_cost_usd(config.agent.max_cost_usd);
+        // Session spend ceiling (P-07): `None` leaves the session
+        // unlimited, exactly as before the key existed.
+        orchestrator.set_max_cost_usd_per_session(config.agent.max_cost_usd_per_session);
         self.install_confirmation_handler(&mut orchestrator);
         self.install_steering_source(&mut orchestrator);
         self.orchestrator = Some(Arc::new(orchestrator));

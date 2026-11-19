@@ -815,6 +815,142 @@ fn plan_then_execute_off_makes_no_extra_call() {
     assert_eq!(recording.requests.lock().unwrap().len(), 1);
 }
 
+
+/// P-07: a session spend ceiling stops the run at the turn boundary
+/// after crossing, with the session-limit message (not the run-limit).
+#[test]
+fn session_cost_limit_stops_with_session_message() {
+    // 3 tool turns at $0.01 each (sonnet price via `usage`), session cap
+    // $0.02: crossing happens on turn 2's report; the stop lands at that
+    // turn's completion boundary — turn 3's provider call never happens.
+    let mut script = Vec::new();
+    for i in 0..3 {
+        let mut resp = support::tool_call_response(
+            &format!("call-{i}"),
+            "stub_read_a",
+            &serde_json::json!({"path": format!("s{i}.txt")}),
+        );
+        resp.usage = Some(support::usage(1000, 1000));
+        script.push(resp);
+    }
+    script.push(support::text_response("never reached"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(StubReadTool::new("stub_read_a")));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("claude-3-5-sonnet");
+    orch.set_max_cost_usd(None); // per-run ceiling off: only the session one may stop
+    orch.set_max_cost_usd_per_session(Some(0.02));
+
+    let err = orch
+        .run("spend the session budget")
+        .expect_err("session ceiling must stop the run");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Session cost limit reached"),
+        "expected the session-limit message, got: {msg}"
+    );
+    assert!(
+        !msg.contains("identical arguments"),
+        "must not read like a loop abort: {msg}"
+    );
+    assert!(
+        orch.session_cost_usd() >= 0.02,
+        "session accumulator kept the spend: {}",
+        orch.session_cost_usd()
+    );
+}
+
+/// P-07: without the config the behaviour is unchanged (unlimited).
+#[test]
+fn session_cost_limit_unset_is_unlimited() {
+    let mut resp = support::text_response("ok");
+    resp.usage = Some(support::usage(10_000, 10_000));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![resp]));
+    let mut orch = Orchestrator::new(provider, ToolRegistry::new());
+    assert_eq!(orch.max_cost_usd_per_session(), None);
+    let answer = orch.run("no ceiling").expect("unlimited run completes");
+    assert_eq!(answer, "ok");
+    assert!(orch.session_cost_usd() > 0.0, "cost still accumulated");
+}
+
+
+/// P-07: resume keeps the session cost accumulator — the ceiling does
+/// not reset silently across a resume.
+#[test]
+fn session_cost_limit_survives_resume() {
+    let dir = support::tempdir();
+    let store = takka_core::session::SessionStore::new(&dir);
+
+    // Turn 1: one $0.018 tool call. Session cap $0.02 → crossing lands on
+    // turn 2, so the session stops after ONE turn having spent $0.018.
+    let mut resp = support::tool_call_response(
+        "call-0",
+        "stub_read_a",
+        &serde_json::json!({"path": "r.txt"}),
+    );
+    resp.usage = Some(support::usage(1000, 1000));
+    let mut final_resp = support::text_response("done");
+    final_resp.usage = Some(support::usage(1000, 1000));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(StubReadTool::new("stub_read_a")));
+
+    let mut orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![
+        resp.clone(),
+        final_resp,
+    ])), tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("claude-3-5-sonnet");
+    orch.set_max_cost_usd_per_session(Some(0.02));
+    orch.set_session_store(store.clone());
+    // Session id is minted per run; capture it for the resume.
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    orch.on_event(move |e| sink.lock().unwrap().push(e));
+
+    // Run one turn's worth: the crossing lands on turn 2 (text) → the run
+    // ends FAILED with the session-limit message.
+    let err = orch
+        .run("first turn")
+        .expect_err("second turn crosses the session ceiling");
+    assert!(err.to_string().contains("Session cost limit reached"));
+    let spent = orch.session_cost_usd();
+    assert!(spent > 0.0, "accumulator holds the spend: {spent}");
+    let session_id = orch.session_id().expect("session tracked");
+
+    // Fresh orchestrator, resume: accumulator restored from the checkpoint.
+    let mut resumed = Orchestrator::new(
+        Arc::new(ScriptedProvider::new(vec![{
+            let mut r = support::text_response("continued");
+            r.usage = Some(support::usage(1000, 1000));
+            r
+        }])),
+        ToolRegistry::new(),
+    );
+    resumed.set_model("claude-3-5-sonnet");
+    resumed.set_max_cost_usd_per_session(Some(0.02));
+    resumed
+        .resume_session(store, &session_id)
+        .expect("resume");
+    assert!(
+        (resumed.session_cost_usd() - spent).abs() < 1e-9,
+        "resume must restore the session accumulator: {} vs {spent}",
+        resumed.session_cost_usd()
+    );
+
+    // One more $0.018 call pushes the restored total over → session stop.
+    let err = resumed
+        .run("second turn")
+        .expect_err("restored total crosses on the next call");
+    assert!(err.to_string().contains("Session cost limit reached"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// P-02: a stub tool whose first call fails with a transient (timeout)
 /// error and whose second call succeeds. The loop must auto-retry once
 /// in-loop and record ONE annotated history entry.

@@ -35,9 +35,11 @@ impl Orchestrator {
     }
 
     /// Drop the tracked session id — the next run opens a fresh
-    /// session document (REPL turn separation).
+    /// session document (REPL turn separation). The session cost
+    /// accumulator (P-07) resets with it: a new session starts at zero.
     pub fn reset_session(&mut self) {
         *sync::lock(&self.session_id) = None;
+        self.reset_session_cost();
     }
 
     /// Id of the session being tracked, if any.
@@ -148,6 +150,8 @@ impl Orchestrator {
             }
         }
         session.checkpoint(state, messages);
+        // P-07: persist the session cost accumulator with every checkpoint.
+        session.session_cost_usd = self.session_cost_usd();
         // O-05: persist the plan-then-execute step list in the `plan` slot.
         let plan_steps = sync::lock(&self.plan_steps).clone();
         if !plan_steps.is_empty() {
@@ -226,6 +230,9 @@ impl Orchestrator {
                 }
             }
         }
+        // P-07: restore the session cost accumulator so the session
+        // ceiling keeps counting across resumes instead of resetting.
+        self.set_session_cost_usd(session.session_cost_usd);
         // O-05: restore the plan from the checkpoint slot and announce it
         // so the next request prepends the plan state again.
         if let Some(plan) = session.plan.as_ref().and_then(|v| v.as_array()) {
