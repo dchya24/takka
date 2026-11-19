@@ -508,6 +508,111 @@ fn loop_detection_still_aborts_on_identical_args() {
     assert!(msg.contains("identical arguments"), "got: {}", msg);
 }
 
+/// Semantic loop detection: alternating two reads of the SAME file with
+/// different offsets never trips the exact-match guard, but it is still
+/// thrash. After enough same-target reads the loop must emit a steering
+/// nudge (Event::System) and keep going — NOT hard-abort.
+#[test]
+fn semantic_loop_detection_nudges_on_alternating_same_target_reads() {
+    let dir = support::tempdir();
+    let path = dir.join("thrash.txt");
+    std::fs::write(&path, "body").unwrap();
+
+    let read = |offset: i32| {
+        support::tool_call_response(
+            "c",
+            "read_file",
+            &serde_json::json!({ "path": path.to_string_lossy(), "offset": offset }),
+        )
+    };
+    // 6 turns alternating read(offset 1) / read(offset 50).
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        read(1),
+        read(50),
+        read(1),
+        read(50),
+        read(1),
+        read(50),
+        support::text_response("decided: file is fine"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(20);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            events_clone.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch
+        .run("check this file")
+        .expect("semantic nudge must not abort the run");
+    assert_eq!(answer, "decided: file is fine");
+
+    let captured = events.lock().unwrap();
+    assert!(
+        captured
+            .iter()
+            .any(|m| m.contains("re-reading") && m.contains("thrash.txt")),
+        "expected a re-reading nudge naming the target, got {:?}",
+        *captured
+    );
+}
+
+/// A legit read-after-edit sequence (read → edit → read the same file)
+/// must NOT trip the semantic detector: the edit resets the window.
+#[test]
+fn semantic_loop_detection_resets_after_edit() {
+    let dir = support::tempdir();
+    let path = dir.join("legit.txt");
+    std::fs::write(&path, "v1").unwrap();
+    let p = path.to_string_lossy().to_string();
+
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("r1", "read_file", &serde_json::json!({ "path": p })),
+        support::tool_call_response(
+            "w1",
+            "write_file",
+            &serde_json::json!({ "path": p, "content": "v2" }),
+        ),
+        support::tool_call_response("r2", "read_file", &serde_json::json!({ "path": p })),
+        support::text_response("edited and verified"),
+    ]));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(20);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            events_clone.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch.run("update the file").expect("run completes");
+    assert_eq!(answer, "edited and verified");
+    assert!(
+        events.lock().unwrap().iter().all(|m| !m.contains("re-reading")),
+        "read-after-edit must not be flagged as thrash"
+    );
+}
+
 /// Plan mode must deny state-changing tools. The model gets a "Blocked"
 /// message back as the tool result, then issues a final text response.
 #[test]

@@ -47,6 +47,40 @@ const LOOP_DETECTION_THRESHOLD: usize = 3;
 /// the window and is never fragmented by the trim.
 const LOOP_DETECTION_WINDOW: usize = 8;
 
+/// How many *semantically similar* calls (same tool, same target — args
+/// differing only in view-shift keys like `offset`) inside the semantic
+/// window trigger a steering nudge. Higher than the exact-match threshold:
+/// scattered same-file reads are common in real exploration, so only a
+/// sustained thrash run should fire.
+const SEMANTIC_LOOP_THRESHOLD: usize = 6;
+
+/// Sliding window for the semantic detector, in recorded calls.
+const SEMANTIC_LOOP_WINDOW: usize = 12;
+
+/// Arg keys that shift the *view* of a target, not the target itself.
+/// Two calls differing only in these are re-deriving the same answer —
+/// they collapse to the same semantic signature.
+const SEMANTIC_ARGS_NOISE_KEYS: [&str; 7] = [
+    "offset",
+    "line",
+    "line_offset",
+    "start_line",
+    "end_line",
+    "limit",
+    "head_limit",
+];
+
+/// Tools whose execution may have changed state, so the semantic loop
+/// window resets (a re-read after an edit is verification, not thrash).
+const STATE_CHANGING_TOOL_NAMES: [&str; 6] = [
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "apply_patch",
+    "run_command",
+    "run_script",
+];
+
 /// Default tool-result truncation limit (chars). Layer 1 of context compression.
 pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 25_000;
 
@@ -63,7 +97,7 @@ pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 6;
 /// (e.g. `skill("brainstorming")` vs `skill("debugging")`) are distinct
 /// signatures and do **not** count toward loop detection, so legitimate
 /// multi-step tool usage is never falsely flagged.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct ToolCallSignature {
     tool: String,
     /// Stable hash of the JSON arguments string. Hashed rather than stored
@@ -87,6 +121,31 @@ impl ToolCallSignature {
             args_hash: hasher.finish(),
             args_preview: truncate_args_preview(args, 120),
         }
+    }
+
+    /// Semantic variant: same signature type, but computed over args with
+    /// view-shift keys (offsets/limits) stripped and keys canonicalized,
+    /// so re-reading the same target at a different line range collapses
+    /// to one signature.
+    fn semantic(tool: &str, args: &str) -> Self {
+        Self::new(tool, &normalize_args_for_semantic(args))
+    }
+}
+
+/// Canonicalize tool args for the semantic detector: parse as JSON, drop
+/// [`SEMANTIC_ARGS_NOISE_KEYS`], sort keys (serde_json maps are already
+/// BTree-ordered by default), serialize compact. Non-object or unparseable
+/// args are compared as trimmed raw strings.
+fn normalize_args_for_semantic(args: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(serde_json::Value::Object(map)) => {
+            let filtered: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .filter(|(key, _)| !SEMANTIC_ARGS_NOISE_KEYS.contains(&key.as_str()))
+                .collect();
+            serde_json::to_string(&filtered).unwrap_or_else(|_| args.trim().to_string())
+        }
+        _ => args.trim().to_string(),
     }
 }
 
@@ -199,6 +258,17 @@ impl OrchestratorState {
 /// state-changing tool call may proceed.
 type ConfirmationHandler = Box<dyn Fn(ConfirmationRequest) -> bool + Send + Sync>;
 
+/// What [`Orchestrator::record_tool_calls_for_loop_detection`] decided.
+#[derive(Debug)]
+pub(super) enum LoopDetectionOutcome {
+    /// Keep going.
+    None,
+    /// Exact-match threshold crossed — hard abort, as before.
+    ExactAbort(ToolCallSignature, usize),
+    /// Semantic threshold crossed — steering nudge, run continues.
+    SemanticNudge(ToolCallSignature),
+}
+
 pub struct Orchestrator {
     provider: Arc<dyn LLMProvider>,
     tools: ToolRegistry,
@@ -215,6 +285,10 @@ pub struct Orchestrator {
     max_iterations: u32,
     /// Recent tool-call signatures for loop detection (sliding window).
     recent_tool_calls: Mutex<Vec<ToolCallSignature>>,
+    /// Recent *semantic* signatures for the second detector: same tool +
+    /// same target (args differing only in offset-ish keys). Cleared when
+    /// a state-changing tool executes or a run begins.
+    recent_semantic_calls: Mutex<Vec<ToolCallSignature>>,
     /// Cap individual tool result strings (Layer 1 of context compression).
     tool_result_max_chars: usize,
     /// Auto-compact memory when token usage exceeds the configured threshold.
@@ -278,6 +352,7 @@ impl Orchestrator {
             model: "glm-4.7".to_string(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             recent_tool_calls: Mutex::new(Vec::new()),
+            recent_semantic_calls: Mutex::new(Vec::new()),
             tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             auto_compact: true,
             keep_recent_tool_results: DEFAULT_KEEP_RECENT_TOOL_RESULTS,
@@ -351,8 +426,10 @@ impl Orchestrator {
         self.max_iterations = max.max(1);
     }
 
-    /// Record this turn's tool calls and return the offending signature
-    /// + run length if loop detection trips.
+    /// Record this turn's tool calls and return what loop detection made
+    /// of them: a hard abort (exact-match threshold crossed), a steering
+    /// nudge (semantic threshold crossed — thrash without progress), or
+    /// nothing.
     ///
     /// Two rules keep legitimate work from being flagged:
     ///
@@ -368,18 +445,26 @@ impl Orchestrator {
     /// A loop is then `LOOP_DETECTION_THRESHOLD` consecutive identical
     /// signatures in the recent window. Scattered repeats (e.g. legitimately
     /// re-reading a file after editing it) don't form a consecutive run and
-    /// won't trip the guard.
+    /// won't trip the guard. The semantic detector is softer: same tool +
+    /// same *target* (`SEMANTIC_ARGS_NOISE_KEYS` stripped) accumulating
+    /// `SEMANTIC_LOOP_THRESHOLD` times in its window produces a nudge, and
+    /// any state-changing tool resets that window.
     fn record_tool_calls_for_loop_detection(
         &self,
         calls: &[(&str, &str)],
-    ) -> Option<(ToolCallSignature, usize)> {
+    ) -> LoopDetectionOutcome {
         // De-dup within this turn (rule 2). N is tiny, so a linear
         // `contains` is cheaper than a HashSet and keeps first-seen order.
         let mut new_sigs: Vec<ToolCallSignature> = Vec::with_capacity(calls.len());
+        let mut new_semantic: Vec<ToolCallSignature> = Vec::with_capacity(calls.len());
         for (name, args) in calls {
             let sig = ToolCallSignature::new(name, args);
             if !new_sigs.contains(&sig) {
                 new_sigs.push(sig);
+            }
+            let semantic = ToolCallSignature::semantic(name, args);
+            if !new_semantic.contains(&semantic) {
+                new_semantic.push(semantic);
             }
         }
 
@@ -399,10 +484,43 @@ impl Orchestrator {
         for sig in &new_sigs {
             let run = Self::longest_consecutive_run(&recent, sig);
             if run >= LOOP_DETECTION_THRESHOLD {
-                return Some((sig.clone(), run));
+                return LoopDetectionOutcome::ExactAbort(sig.clone(), run);
             }
         }
-        None
+        drop(recent);
+
+        // Semantic detector: accumulate similar calls, count the ones
+        // matching a newly-seen signature, nudge when it crosses.
+        let mut semantic = sync::lock(&self.recent_semantic_calls);
+        semantic.extend(new_semantic.iter().cloned());
+        if semantic.len() > SEMANTIC_LOOP_WINDOW {
+            let split = semantic.len() - SEMANTIC_LOOP_WINDOW;
+            semantic.drain(0..split);
+        }
+        for sig in &new_semantic {
+            let count = semantic.iter().filter(|s| s == &sig).count();
+            if count >= SEMANTIC_LOOP_THRESHOLD {
+                // Reset so the nudge doesn't re-fire every turn while the
+                // (possibly continuing) thrash accumulates again.
+                semantic.clear();
+                return LoopDetectionOutcome::SemanticNudge(sig.clone());
+            }
+        }
+        LoopDetectionOutcome::None
+    }
+
+    /// Clear the semantic loop window. Called at run start and whenever a
+    /// state-changing tool executes (an edit legitimizes a re-read).
+    fn clear_semantic_loop_detection(&self) {
+        sync::lock(&self.recent_semantic_calls).clear();
+    }
+
+    /// Whether any of this turn's tool calls may have changed state; used
+    /// to reset the semantic loop window.
+    fn turn_is_state_changing(tool_calls: &[(String, String, String)]) -> bool {
+        tool_calls
+            .iter()
+            .any(|(_, name, _)| STATE_CHANGING_TOOL_NAMES.contains(&name.as_str()))
     }
 
     /// Length of the longest run of `target` appearing in consecutive
