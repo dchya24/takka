@@ -15,7 +15,7 @@ use crate::providers::ChatRequest;
 use crate::sync;
 use crate::AgenticError;
 
-use super::{Orchestrator, OrchestratorState};
+use super::{LoopDetectionOutcome, Orchestrator, OrchestratorState};
 
 impl Orchestrator {
     pub fn run(&self, input: &str) -> Result<String, AgenticError> {
@@ -62,7 +62,9 @@ impl Orchestrator {
         }
 
         // The spend ceiling guards one user turn: start each run at zero.
+        // Each user turn also restarts semantic loop detection.
         self.reset_run_cost();
+        self.clear_semantic_loop_detection();
 
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
@@ -72,6 +74,8 @@ impl Orchestrator {
 
         let tool_defs = self.tools.tool_definitions();
         let mut iteration: u32 = 0;
+        // Semantic loop-detector nudge pending for the next request.
+        let mut semantic_nudge: Option<crate::providers::ChatMessageRequest> = None;
 
         loop {
             iteration += 1;
@@ -142,10 +146,15 @@ impl Orchestrator {
                         self.max_iterations
                     ),
                 });
-            } else if approaching {
-                // Transient steering nudge — not saved to memory, so it
-                // only affects this one request.
-                messages.push(Self::wind_down_message());
+            } else {
+                if let Some(nudge) = semantic_nudge.take() {
+                    messages.push(nudge);
+                }
+                if approaching {
+                    // Transient steering nudge — not saved to memory, so it
+                    // only affects this one request.
+                    messages.push(Self::wind_down_message());
+                }
             }
             Self::log_request(iteration, &self.model, &messages);
             self.events.emit(crate::events::Event::ModelRequest {
@@ -229,20 +238,38 @@ impl Orchestrator {
                     .iter()
                     .map(|tc| (tc.function.name.as_str(), tc.function.arguments.as_str()))
                     .collect();
-                if let Some((sig, run)) = self.record_tool_calls_for_loop_detection(&loop_sigs) {
-                    tracing::warn!(
-                        tool = %sig.tool,
-                        args = %sig.args_preview,
-                        run = run,
-                        threshold = super::LOOP_DETECTION_THRESHOLD,
-                        "Loop detected: identical tool call repeated consecutively"
-                    );
-                    return Err(AgenticError::Provider(format!(
-                        "Loop detected: '{}' called {} times consecutively with identical \
-                         arguments ({}). The model is repeating itself without making progress. \
-                         Aborting to prevent an infinite loop.",
-                        sig.tool, run, sig.args_preview,
-                    )));
+                match self.record_tool_calls_for_loop_detection(&loop_sigs) {
+                    LoopDetectionOutcome::ExactAbort(sig, run) => {
+                        tracing::warn!(
+                            tool = %sig.tool,
+                            args = %sig.args_preview,
+                            run = run,
+                            threshold = super::LOOP_DETECTION_THRESHOLD,
+                            "Loop detected: identical tool call repeated consecutively"
+                        );
+                        return Err(AgenticError::Provider(format!(
+                            "Loop detected: '{}' called {} times consecutively with identical \
+                             arguments ({}). The model is repeating itself without making progress. \
+                             Aborting to prevent an infinite loop.",
+                            sig.tool, run, sig.args_preview,
+                        )));
+                    }
+                    LoopDetectionOutcome::SemanticNudge(sig) => {
+                        tracing::warn!(
+                            tool = %sig.tool,
+                            args = %sig.args_preview,
+                            threshold = super::SEMANTIC_LOOP_THRESHOLD,
+                            "Semantic loop detected: same tool + same target repeated"
+                        );
+                        self.events.emit(crate::events::Event::System {
+                            message: format!(
+                                "⚠️ Loop nudge: you keep re-reading the same target with {} ({}) — decide, change approach, or ask the user.",
+                                sig.tool, sig.args_preview
+                            ),
+                        });
+                        semantic_nudge = Some(Self::loop_nudge_message(&sig.args_preview));
+                    }
+                    LoopDetectionOutcome::None => {}
                 }
 
                 let tool_calls: Vec<(String, String, String)> = response
@@ -258,6 +285,11 @@ impl Orchestrator {
                     })
                     .collect();
                 self.handle_tool_calls(&content, &tool_calls);
+                // An edit legitimizes re-reading the same target: reset the
+                // semantic window after state-changing work.
+                if Self::turn_is_state_changing(&tool_calls) {
+                    self.clear_semantic_loop_detection();
+                }
 
                 if let Some(answer) = self.cost_limit_stop(cost_limit_reached) {
                     sync::lock(&self.memory).add_message(Message::assistant(&content));
@@ -337,7 +369,9 @@ impl Orchestrator {
         }
 
         // The spend ceiling guards one user turn: start each run at zero.
+        // Each user turn also restarts semantic loop detection.
         self.reset_run_cost();
+        self.clear_semantic_loop_detection();
 
         sync::lock(&self.memory).add_message(if attachments.is_empty() {
             Message::user(input)
@@ -347,6 +381,8 @@ impl Orchestrator {
 
         let tool_defs = self.tools.tool_definitions();
         let mut iteration: u32 = 0;
+        // Semantic loop-detector nudge pending for the next request.
+        let mut semantic_nudge: Option<crate::providers::ChatMessageRequest> = None;
 
         loop {
             iteration += 1;
@@ -414,8 +450,13 @@ impl Orchestrator {
                         self.max_iterations
                     ),
                 });
-            } else if approaching {
-                messages.push(Self::wind_down_message());
+            } else {
+                if let Some(nudge) = semantic_nudge.take() {
+                    messages.push(nudge);
+                }
+                if approaching {
+                    messages.push(Self::wind_down_message());
+                }
             }
             Self::log_request(iteration, &self.model, &messages);
             self.events.emit(crate::events::Event::ModelRequest {
@@ -555,24 +596,47 @@ impl Orchestrator {
                     .iter()
                     .map(|(_, name, args)| (name.as_str(), args.as_str()))
                     .collect();
-                if let Some((sig, run)) = self.record_tool_calls_for_loop_detection(&loop_sigs) {
-                    tracing::warn!(
-                        tool = %sig.tool,
-                        args = %sig.args_preview,
-                        run = run,
-                        threshold = super::LOOP_DETECTION_THRESHOLD,
-                        "Loop detected: identical tool call repeated consecutively"
-                    );
-                    return Err(AgenticError::Provider(format!(
-                        "Loop detected: '{}' called {} times consecutively with identical \
-                         arguments ({}). The model is repeating itself without making progress. \
-                         Aborting to prevent an infinite loop.",
-                        sig.tool, run, sig.args_preview,
-                    )));
+                match self.record_tool_calls_for_loop_detection(&loop_sigs) {
+                    LoopDetectionOutcome::ExactAbort(sig, run) => {
+                        tracing::warn!(
+                            tool = %sig.tool,
+                            args = %sig.args_preview,
+                            run = run,
+                            threshold = super::LOOP_DETECTION_THRESHOLD,
+                            "Loop detected: identical tool call repeated consecutively"
+                        );
+                        return Err(AgenticError::Provider(format!(
+                            "Loop detected: '{}' called {} times consecutively with identical \
+                             arguments ({}). The model is repeating itself without making progress. \
+                             Aborting to prevent an infinite loop.",
+                            sig.tool, run, sig.args_preview,
+                        )));
+                    }
+                    LoopDetectionOutcome::SemanticNudge(sig) => {
+                        tracing::warn!(
+                            tool = %sig.tool,
+                            args = %sig.args_preview,
+                            threshold = super::SEMANTIC_LOOP_THRESHOLD,
+                            "Semantic loop detected: same tool + same target repeated"
+                        );
+                        self.events.emit(crate::events::Event::System {
+                            message: format!(
+                                "⚠️ Loop nudge: you keep re-reading the same target with {} ({}) — decide, change approach, or ask the user.",
+                                sig.tool, sig.args_preview
+                            ),
+                        });
+                        semantic_nudge = Some(Self::loop_nudge_message(&sig.args_preview));
+                    }
+                    LoopDetectionOutcome::None => {}
                 }
 
                 self.handle_tool_calls_parallel(&content_buf, &accumulated_tool_calls)
                     .await;
+                // An edit legitimizes re-reading the same target: reset the
+                // semantic window after state-changing work.
+                if Self::turn_is_state_changing(&accumulated_tool_calls) {
+                    self.clear_semantic_loop_detection();
+                }
 
                 if let Some(answer) = self.cost_limit_stop(cost_limit_reached) {
                     sync::lock(&self.memory).add_message(Message::assistant(&content_buf));
@@ -827,6 +891,17 @@ impl Orchestrator {
              Start wrapping up: finish only the essential remaining steps, \
              then give your final answer to the user.",
         )
+    }
+
+    /// Steering nudge appended after the semantic loop detector trips:
+    /// transient (not saved to memory), affects only the next request.
+    fn loop_nudge_message(args_preview: &str) -> crate::providers::ChatMessageRequest {
+        crate::providers::ChatMessageRequest::user(format!(
+            "[system] You keep re-reading the same target ({}). You are thrashing without \
+             progress: decide based on what you already have, change your approach, or ask \
+             the user.",
+            args_preview
+        ))
     }
 
     /// Hard nudge injected on the final allowed iteration. Paired with
