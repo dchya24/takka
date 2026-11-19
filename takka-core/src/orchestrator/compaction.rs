@@ -46,6 +46,8 @@ impl Orchestrator {
                 self.events.emit(crate::events::Event::CompactionStarted);
                 match self.summarize_via_provider(&prompt) {
                     Ok(summary) => {
+                        self.full_compact_recently
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         let mut mem = sync::lock(&self.memory);
                         let r = mem.compact_with_summary(&summary);
                         tracing::info!(
@@ -68,6 +70,8 @@ impl Orchestrator {
         if mem.needs_compaction() {
             self.set_state(OrchestratorState::Compacting);
             self.events.emit(crate::events::Event::CompactionStarted);
+            self.full_compact_recently
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let result = mem.compact();
             tracing::info!(
                 summarized = result.summarized_count,
@@ -75,6 +79,35 @@ impl Orchestrator {
                 tokens_after = result.tokens_after,
                 "Memory autocompacted (heuristic)"
             );
+        }
+    }
+
+    /// O-03: light compaction pass every `compaction_cadence` iterations
+    /// (when enabled). Collapses tool results older than the verbatim
+    /// window to one-line summaries; a no-op right after a full compact
+    /// and when it didn't fire this iteration.
+    pub(super) fn maybe_cadenced_compact(&self, iteration: u32) {
+        if self.compaction_cadence == 0 {
+            return;
+        }
+        let fired = iteration % self.compaction_cadence as u32 == 0;
+        let just_compacted = self
+            .full_compact_recently
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if !fired || just_compacted {
+            return;
+        }
+        let collapsed = {
+            let mut mem = sync::lock(&self.memory);
+            mem.collapse_old_tool_results(self.keep_recent_tool_results)
+        };
+        if collapsed > 0 {
+            tracing::debug!(collapsed, iteration, "cadenced tool-result collapse");
+            self.events.emit(crate::events::Event::System {
+                message: format!(
+                    "\u{1f9f9} Collapsed {collapsed} old tool results to one-line summaries"
+                ),
+            });
         }
     }
 

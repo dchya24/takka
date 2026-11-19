@@ -98,7 +98,7 @@ pub const DEFAULT_KEEP_RECENT_TOOL_RESULTS: usize = 6;
 /// signatures and do **not** count toward loop detection, so legitimate
 /// multi-step tool usage is never falsely flagged.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct ToolCallSignature {
+pub(super) struct ToolCallSignature {
     tool: String,
     /// Stable hash of the JSON arguments string. Hashed rather than stored
     /// verbatim so the recent-call window stays small even when args are
@@ -336,6 +336,20 @@ pub struct Orchestrator {
     /// every run (see `run.rs`) and updated after each provider usage
     /// report.
     run_cost_usd: Mutex<f64>,
+    /// O-03: cadenced light compaction — every N agent-loop iterations,
+    /// collapse tool results older than the verbatim window to one-line
+    /// summaries. `0` disables the pass.
+    compaction_cadence: usize,
+    /// Set right after a full autocompact so the next cadenced pass is a
+    /// no-op (the two must not fight over the same messages).
+    full_compact_recently: AtomicBool,
+    /// O-05: opt-in plan-then-execute. When on, iteration 1 of a run asks
+    /// the model for a numbered step list first, stores it in the
+    /// `plan` checkpoint slot, and prepends it to every following
+    /// request.
+    plan_then_execute: bool,
+    /// Current plan steps (O-05), restored from checkpoints on resume.
+    plan_steps: Mutex<Vec<String>>,
 }
 
 impl Orchestrator {
@@ -366,6 +380,10 @@ impl Orchestrator {
             steering_source: None,
             max_cost_usd: None,
             run_cost_usd: Mutex::new(0.0),
+            compaction_cadence: 10,
+            full_compact_recently: AtomicBool::new(false),
+            plan_then_execute: false,
+            plan_steps: Mutex::new(Vec::new()),
         }
     }
 
@@ -608,6 +626,29 @@ impl Orchestrator {
     /// `0` disables clearing (everything kept until autocompact runs).
     pub fn set_keep_recent_tool_results(&mut self, n: usize) {
         self.keep_recent_tool_results = n;
+    }
+
+    /// Cadence of the light iteration-cadenced compaction pass (O-03):
+    /// every N agent-loop iterations older tool results are collapsed to
+    /// one-line summaries. `0` disables the pass; default 10.
+    pub fn set_compaction_cadence(&mut self, n: usize) {
+        self.compaction_cadence = n;
+    }
+
+    /// Enable plan-then-execute (O-05): iteration 1 of each run asks the
+    /// model for a numbered step list before acting; the plan is stored
+    /// in the `plan` checkpoint slot and prepended to every request.
+    pub fn set_plan_then_execute(&mut self, enabled: bool) {
+        self.plan_then_execute = enabled;
+    }
+
+    /// Current plan steps (O-05), in stored order.
+    pub fn plan_steps(&self) -> Vec<String> {
+        sync::lock(&self.plan_steps).clone()
+    }
+
+    pub(super) fn set_plan_steps(&self, steps: Vec<String>) {
+        *sync::lock(&self.plan_steps) = steps;
     }
 
     /// Get a clone of the cancel flag. Wire this to your signal handler

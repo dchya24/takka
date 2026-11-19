@@ -110,6 +110,15 @@ pub struct AgentLoopConfig {
     /// means unlimited — the pre-ceiling behaviour.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+    /// O-03: run the light tool-result collapse pass every N agent-loop
+    /// iterations. Default 10; `0` disables the pass.
+    #[serde(default)]
+    pub compaction_cadence: Option<usize>,
+    /// O-05: opt-in plan-then-execute — iteration 1 of each run asks the
+    /// model for a numbered step list first. Off by default: single-shot
+    /// questions must not pay the extra call.
+    #[serde(default)]
+    pub plan_then_execute: bool,
     /// Permission mode every new session boots in. `None` = `default`
     /// (ask before writes) — the pre-existing behaviour. `plan` makes a
     /// fresh session read-only from the first turn without the client
@@ -739,6 +748,8 @@ mod tests {
         assert!(cfg.agent.summarizer_model.is_none());
         // Unset spend ceiling = unlimited (pre-ceiling behaviour).
         assert!(cfg.agent.max_cost_usd.is_none());
+        assert_eq!(cfg.agent.compaction_cadence, None);
+        assert!(!cfg.agent.plan_then_execute);
 
         // Planner config should have defaults when omitted.
         assert_eq!(cfg.agent.planner.max_steps, 20);
@@ -820,6 +831,31 @@ mod tests {
         let out = serde_json::to_string(&cfg).expect("serialize");
         let cfg2: Config = serde_json::from_str(&out).expect("reparse");
         assert_eq!(cfg2.agent.default_permission_mode, Some(PermissionMode::Plan));
+    }
+
+    #[test]
+    fn loop_shaping_config_round_trips() {
+        let json = r#"{
+            "providers": [{
+                "name": "p",
+                "type": "openai-compatible",
+                "api_base": "https://x",
+                "api_key": "k",
+                "models": [{"model": "m"}]
+            }],
+            "agent": {
+                "compaction_cadence": 15,
+                "plan_then_execute": true
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).expect("parse");
+        assert_eq!(cfg.agent.compaction_cadence, Some(15));
+        assert!(cfg.agent.plan_then_execute);
+
+        let out = serde_json::to_string(&cfg).expect("serialize");
+        let cfg2: Config = serde_json::from_str(&out).expect("reparse");
+        assert_eq!(cfg2.agent.compaction_cadence, Some(15));
+        assert!(cfg2.agent.plan_then_execute);
     }
 
     #[test]

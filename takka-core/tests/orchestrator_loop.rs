@@ -23,7 +23,10 @@ use takka_core::{
 };
 
 mod support;
-use support::{tool_call, ScriptedProvider, StreamingScriptedProvider};
+use support::{
+    tool_call, CapturingScriptedProvider, RecordingProvider, ScriptedProvider,
+    StreamingScriptedProvider,
+};
 
 /// One realistic happy path: model says "use read_file", we let it run,
 /// model produces final text. Verifies the loop terminates, the tool
@@ -611,6 +614,205 @@ fn semantic_loop_detection_resets_after_edit() {
         events.lock().unwrap().iter().all(|m| !m.contains("re-reading")),
         "read-after-edit must not be flagged as thrash"
     );
+}
+
+/// Read-only stub (O-02: stripped at the 80% wind-down stage).
+struct StubReadTool {
+    name: String,
+}
+impl StubReadTool {
+    fn new(name: &str) -> Self {
+        Self { name: name.to_string() }
+    }
+}
+impl takka_core::tool::Tool for StubReadTool {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str { "read-only test tool" }
+    fn schema(&self) -> takka_core::tool::ToolSchema {
+        takka_core::tool::ToolSchema::new(self.name.clone(), "read-only test tool")
+    }
+    fn execute(&self, args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
+        Ok(serde_json::json!({"read": args["path"]}))
+    }
+    fn metadata(&self) -> takka_core::tool::ToolMetadata {
+        takka_core::tool::ToolMetadata::read_only()
+    }
+}
+
+/// Mutating stub (O-02: survives the 90% stage).
+struct StubWriteTool;
+impl takka_core::tool::Tool for StubWriteTool {
+    fn name(&self) -> &str { "stub_write" }
+    fn description(&self) -> &str { "mutating test tool" }
+    fn schema(&self) -> takka_core::tool::ToolSchema {
+        takka_core::tool::ToolSchema::new("stub_write".to_string(), "mutating test tool")
+    }
+    fn execute(&self, args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
+        Ok(serde_json::json!({"wrote": args["path"]}))
+    }
+    fn metadata(&self) -> takka_core::tool::ToolMetadata {
+        takka_core::tool::ToolMetadata::default()
+    }
+}
+
+
+/// O-02: graduated tool-budget shaping — shrinking tool_defs per stage.
+#[test]
+fn tool_budget_shaping_strips_stages() {
+    // 9 tool turns (alternating read tools, unique paths to stay clear of
+    // loop detection) + finalization turn = 10 iterations.
+    let mut script = Vec::new();
+    for i in 0..9 {
+        let (tool, path) = if i % 2 == 0 {
+            ("stub_read_a", format!("a{i}.txt"))
+        } else {
+            ("stub_read_b", format!("b{i}.txt"))
+        };
+        script.push(support::tool_call_response(
+            &format!("call-{i}"),
+            tool,
+            &serde_json::json!({"path": path}),
+        ));
+    }
+    script.push(support::text_response(""));
+    let recording = Arc::new(RecordingProvider::new(script));
+    let provider: Arc<dyn LLMProvider> = recording.clone();
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(StubReadTool::new("stub_read_a")));
+    tools.register(Box::new(StubReadTool::new("stub_read_b")));
+    tools.register(Box::new(StubWriteTool));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(10);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            events_clone.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch.run("shape the budget").expect("run completes");
+    assert_eq!(answer, "");
+
+    let counts = recording.tool_counts.lock().unwrap();
+    // Full set (3) for iterations 1..=7, mutating-only (1) at 80%/90%,
+    // tools stripped (0) on the finalization request.
+    assert_eq!(counts[0], 3, "full set early: {:?}", *counts);
+    assert_eq!(counts[7], 1, "80% stage keeps mutating tools: {:?}", *counts);
+    assert_eq!(counts[8], 1, "90% stage keeps mutating tools: {:?}", *counts);
+    assert_eq!(counts[9], 0, "finalization strips tools: {:?}", *counts);
+    let captured = events.lock().unwrap();
+    assert!(captured.iter().any(|m| m.contains("80%")), "{:?}", *captured);
+    assert!(captured.iter().any(|m| m.contains("90%")), "{:?}", *captured);
+}
+
+/// O-03: every 10 iterations old tool results collapse to one line.
+#[test]
+fn cadenced_compaction_collapses_old_tool_results() {
+    // 12 tool turns, unique paths (keeps loop detection quiet).
+    let mut script = Vec::new();
+    for i in 0..12 {
+        script.push(support::tool_call_response(
+            &format!("call-{i}"),
+            "stub_read_a",
+            &serde_json::json!({"path": format!("c{i}.txt")}),
+        ));
+    }
+    script.push(support::text_response("done"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(StubReadTool::new("stub_read_a")));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(30);
+
+    let answer = orch.run("read everything").expect("run completes");
+    assert_eq!(answer, "done");
+
+    // Older tool results (beyond the verbatim window of 6) are collapsed.
+    let collapsed = orch.search_memory("[collapsed]");
+    assert!(
+        !collapsed.is_empty(),
+        "expected collapsed tool results after iteration 10"
+    );
+    // Newest results stay verbatim.
+    let recent = orch.search_memory("c11.txt");
+    assert!(!recent.is_empty(), "newest tool result must stay verbatim");
+    let recent_line = &recent[0].1;
+    assert!(
+        !recent_line.contains("[collapsed]"),
+        "newest results must not be collapsed: {recent_line}"
+    );
+}
+
+/// O-05: plan-then-execute (flag on) — one plan call first, plan
+/// prepended to every following request.
+#[test]
+fn plan_then_execute_makes_one_plan_call_and_prepends_the_plan() {
+    let recording = Arc::new(CapturingScriptedProvider::new(vec![
+        // Plan call: numbered step list.
+        support::text_response("1. read the file\n2. edit the file\n3. verify"),
+        support::tool_call_response("w1", "stub_write", &serde_json::json!({"path": "x.txt"})),
+        support::text_response("finished the plan"),
+    ]));
+    let provider: Arc<dyn LLMProvider> = recording.clone();
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(StubWriteTool));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_plan_then_execute(true);
+
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    orch.on_event(move |event| events_clone.lock().unwrap().push(event));
+
+    let answer = orch.run("do the three steps").expect("run completes");
+    assert_eq!(answer, "finished the plan");
+
+    // PlanCreated announced with 3 steps; plan prepended to the tool turn.
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::PlanCreated { steps_total: 3 }
+    )));
+    assert_eq!(orch.plan_steps().len(), 3);
+    drop(events);
+
+    let requests = recording.requests.lock().unwrap().clone();
+    // 3 provider calls: plan + tool turn + final text.
+    assert_eq!(requests.len(), 3, "plan call must cost exactly one extra call");
+    let tool_turn = &requests[1];
+    let tool_turn_text: String = tool_turn
+        .messages
+        .iter()
+        .map(|m| m.content.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        tool_turn_text.contains("Current plan for this task"),
+        "plan state prepended: {tool_turn_text}"
+    );
+    assert!(tool_turn_text.contains("1. read the file"));
+}
+
+/// O-05: flag off — zero extra provider calls (single-shot stays cheap).
+#[test]
+fn plan_then_execute_off_makes_no_extra_call() {
+    let recording = Arc::new(CapturingScriptedProvider::new(vec![
+        support::text_response("plain answer"),
+    ]));
+    let provider: Arc<dyn LLMProvider> = recording.clone();
+    let mut orch = Orchestrator::new(provider, ToolRegistry::new());
+    orch.run("quick question").expect("run completes");
+    assert_eq!(recording.requests.lock().unwrap().len(), 1);
 }
 
 /// P-02: a stub tool whose first call fails with a transient (timeout)

@@ -11,13 +11,52 @@
 //! switch between them without other changes.
 
 use super::store::Memory;
-use super::types::{estimate_tokens, Message, SummarizedContext};
+use super::types::{estimate_tokens, Message, MessageRole, SummarizedContext};
 
 impl Memory {
     /// Check if compaction should be triggered.
     pub fn needs_compaction(&self) -> bool {
         let threshold = (self.config.max_tokens as f64 * self.config.compaction_threshold) as u32;
         self.total_tokens >= threshold
+    }
+
+    /// O-03 cadenced pass: collapse tool-result contents older than the
+    /// verbatim window (the newest `keep_recent_tool_results` tool
+    /// messages) to one-line summaries. Message structure is preserved —
+    /// roles and tool-call ids stay intact, only `content` shrinks — so
+    /// request building and checkpointing keep working. Already-collapsed
+    /// results are skipped, making repeat passes no-ops. Returns the
+    /// number of collapsed messages.
+    pub fn collapse_old_tool_results(&mut self, keep_recent_tool_results: usize) -> usize {
+        let tool_indices: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, MessageRole::Tool { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if tool_indices.len() <= keep_recent_tool_results {
+            return 0;
+        }
+        let collapse_slice = &tool_indices[..tool_indices.len() - keep_recent_tool_results];
+        let mut collapsed = 0;
+        for &i in collapse_slice {
+            let msg = &mut self.messages[i];
+            if msg.content.starts_with("[collapsed]") {
+                continue;
+            }
+            let first_line = msg.content.lines().next().unwrap_or("");
+            let mut line: String = first_line.chars().take(120).collect();
+            if line.chars().count() < first_line.chars().count() {
+                line.push('\u{2026}');
+            }
+            msg.content = format!("[collapsed] {line}");
+            collapsed += 1;
+        }
+        if collapsed > 0 {
+            self.recalculate_tokens();
+        }
+        collapsed
     }
 
     /// Compact memory: summarize older messages, keep recent + pinned.
