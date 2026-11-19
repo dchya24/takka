@@ -148,6 +148,11 @@ impl Orchestrator {
             }
         }
         session.checkpoint(state, messages);
+        // O-05: persist the plan-then-execute step list in the `plan` slot.
+        let plan_steps = sync::lock(&self.plan_steps).clone();
+        if !plan_steps.is_empty() {
+            session.plan = Some(serde_json::json!(plan_steps));
+        }
         if let Err(e) = store_guard.save(&session) {
             tracing::warn!(error = %e, "session checkpoint failed");
         }
@@ -219,6 +224,20 @@ impl Orchestrator {
                         mem.add_message(message);
                     }
                 }
+            }
+        }
+        // O-05: restore the plan from the checkpoint slot and announce it
+        // so the next request prepends the plan state again.
+        if let Some(plan) = session.plan.as_ref().and_then(|v| v.as_array()) {
+            let steps: Vec<String> = plan
+                .iter()
+                .filter_map(|step| step.as_str().map(str::to_string))
+                .collect();
+            if !steps.is_empty() {
+                self.events.emit(Event::PlanCreated {
+                    steps_total: steps.len(),
+                });
+                self.set_plan_steps(steps);
             }
         }
         self.model = session.model;

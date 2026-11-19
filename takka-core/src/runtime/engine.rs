@@ -750,6 +750,12 @@ impl<T: Transport> RuntimeEngine<T> {
         if let Some(max_iterations) = config.agent.max_iterations {
             orchestrator.set_max_iterations(max_iterations);
         }
+        // O-03 cadenced compaction + O-05 plan-then-execute (both default
+        // to the loop's compiled-in behaviour when unset).
+        orchestrator.set_compaction_cadence(config.agent.compaction_cadence.unwrap_or(10));
+        if config.agent.plan_then_execute {
+            orchestrator.set_plan_then_execute(true);
+        }
         // Spend ceiling (`agent.max_cost_usd`): `None` leaves the loop
         // unlimited, exactly as before the key existed.
         orchestrator.set_max_cost_usd(config.agent.max_cost_usd);

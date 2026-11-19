@@ -72,10 +72,24 @@ impl Orchestrator {
             Message::user_with_attachments(input, attachments)
         });
 
+        // O-05: opt-in plan-then-execute — iteration 1 asks the model for
+        // a numbered step list first (one extra provider call), stores it
+        // in the plan slot and prepends it to every following request.
+        if self.plan_then_execute && self.plan_steps().is_empty() {
+            if let Ok(steps) = self.request_plan() {
+                self.events.emit(crate::events::Event::PlanCreated {
+                    steps_total: steps.len(),
+                });
+                self.set_plan_steps(steps);
+            }
+        }
+
         let tool_defs = self.tools.tool_definitions();
         let mut iteration: u32 = 0;
         // Semantic loop-detector nudge pending for the next request.
         let mut semantic_nudge: Option<crate::providers::ChatMessageRequest> = None;
+        // O-02 wind-down stage announced last (announces fire once per stage).
+        let mut announced_stage: u8 = 0;
 
         loop {
             iteration += 1;
@@ -136,8 +150,26 @@ impl Orchestrator {
             self.drain_steering();
 
             self.maybe_autocompact();
+            // O-03: cadenced light pass — collapse stale tool results.
+            self.maybe_cadenced_compact(iteration);
 
             let mut messages = self.build_messages();
+            // O-05: prepend the compact plan state so the model doesn't
+            // re-derive the plan every iteration.
+            let plan_steps = self.plan_steps();
+            if !plan_steps.is_empty() {
+                messages.push(Self::plan_state_message(&plan_steps));
+            }
+            // O-02: stage the wind-down — shrink tool_defs before the
+            // request when approaching the iteration cap.
+            let (stage_tool_defs, stage_announce, stage_num) =
+                self.shape_tools_for_stage(iteration, finalizing, &tool_defs);
+            if let Some(message) = stage_announce {
+                if stage_num > announced_stage {
+                    announced_stage = stage_num;
+                    self.events.emit(crate::events::Event::System { message });
+                }
+            }
             if finalizing {
                 messages.push(Self::finalization_message());
                 self.events.emit(crate::events::Event::System {
@@ -165,7 +197,7 @@ impl Orchestrator {
             // return tool calls — the model is forced to answer in text.
             let mut request = ChatRequest::new(&self.model, messages);
             if !finalizing {
-                request = request.with_tools(tool_defs.clone());
+                request = request.with_tools(stage_tool_defs);
             }
             if let Some(ref prompt) = self.system_prompt {
                 request = request.with_system_prompt(prompt.clone());
@@ -379,10 +411,24 @@ impl Orchestrator {
             Message::user_with_attachments(input, attachments)
         });
 
+        // O-05: opt-in plan-then-execute — iteration 1 asks the model for
+        // a numbered step list first (one extra provider call), stores it
+        // in the plan slot and prepends it to every following request.
+        if self.plan_then_execute && self.plan_steps().is_empty() {
+            if let Ok(steps) = self.request_plan() {
+                self.events.emit(crate::events::Event::PlanCreated {
+                    steps_total: steps.len(),
+                });
+                self.set_plan_steps(steps);
+            }
+        }
+
         let tool_defs = self.tools.tool_definitions();
         let mut iteration: u32 = 0;
         // Semantic loop-detector nudge pending for the next request.
         let mut semantic_nudge: Option<crate::providers::ChatMessageRequest> = None;
+        // O-02 wind-down stage announced last (announces fire once per stage).
+        let mut announced_stage: u8 = 0;
 
         loop {
             iteration += 1;
@@ -440,8 +486,26 @@ impl Orchestrator {
             self.drain_steering();
 
             self.maybe_autocompact();
+            // O-03: cadenced light pass — collapse stale tool results.
+            self.maybe_cadenced_compact(iteration);
 
             let mut messages = self.build_messages();
+            // O-05: prepend the compact plan state so the model doesn't
+            // re-derive the plan every iteration.
+            let plan_steps = self.plan_steps();
+            if !plan_steps.is_empty() {
+                messages.push(Self::plan_state_message(&plan_steps));
+            }
+            // O-02: stage the wind-down — shrink tool_defs before the
+            // request when approaching the iteration cap.
+            let (stage_tool_defs, stage_announce, stage_num) =
+                self.shape_tools_for_stage(iteration, finalizing, &tool_defs);
+            if let Some(message) = stage_announce {
+                if stage_num > announced_stage {
+                    announced_stage = stage_num;
+                    self.events.emit(crate::events::Event::System { message });
+                }
+            }
             if finalizing {
                 messages.push(Self::finalization_message());
                 self.events.emit(crate::events::Event::System {
@@ -467,7 +531,7 @@ impl Orchestrator {
             // return tool calls — the model is forced to answer in text.
             let mut request = ChatRequest::new(&self.model, messages);
             if !finalizing {
-                request = request.with_tools(tool_defs.clone());
+                request = request.with_tools(stage_tool_defs);
             }
             request = request.stream();
             if let Some(ref prompt) = self.system_prompt {
@@ -893,6 +957,96 @@ impl Orchestrator {
         )
     }
 
+    // ── O-02 graduated tool-budget shaping ─────────────────────
+    //
+    // ≥80%: read-only tools are stripped from `tool_defs` (they are the
+    // high-cost re-derivation tools); ≥90%: only mutating (write/edit)
+    // tools remain; 100%: unchanged forced-finalization strip.
+    // Returns (defs, announce message, stage number 0-2).
+    fn shape_tools_for_stage(
+        &self,
+        iteration: u32,
+        finalizing: bool,
+        all: &[crate::providers::ToolDefinition],
+    ) -> (Vec<crate::providers::ToolDefinition>, Option<String>, u8) {
+        if finalizing {
+            return (Vec::new(), None, 0);
+        }
+        use crate::tool::Mutability;
+        let pct = (iteration * 100 / self.max_iterations.max(1)) as u16;
+        if pct >= 90 {
+            let defs: Vec<_> = all
+                .iter()
+                .filter(|d| {
+                    self.tools.metadata(&d.function.name).mutability == Mutability::Mutating
+                })
+                .cloned()
+                .collect();
+            (
+                defs,
+                Some(format!(
+                    "\u{26a0}\u{fe0f} Tool budget 90% (iteration {}/{}) — only write/edit tools remain",
+                    iteration, self.max_iterations
+                )),
+                2,
+            )
+        } else if pct >= 80 {
+            let defs: Vec<_> = all
+                .iter()
+                .filter(|d| {
+                    self.tools.metadata(&d.function.name).mutability != Mutability::ReadOnly
+                })
+                .cloned()
+                .collect();
+            (
+                defs,
+                Some(format!(
+                    "\u{26a0}\u{fe0f} Tool budget 80% (iteration {}/{}) — read-only tools disabled",
+                    iteration, self.max_iterations
+                )),
+                1,
+            )
+        } else {
+            (all.to_vec(), None, 0)
+        }
+    }
+
+    // ── O-05 plan-then-execute ─────────────────────────────────
+
+    /// One extra provider call: ask for a numbered step list for the
+    /// current task. Costs are accumulated like any other call.
+    fn request_plan(&self) -> Result<Vec<String>, AgenticError> {
+        let mut messages = self.build_messages();
+        messages.push(crate::providers::ChatMessageRequest::user(
+            "[system] Before acting, produce a short numbered step list for this task. \
+             One 'N. step' line per step, at most 20 steps. Do not call any tools in this reply.",
+        ));
+        let mut request = ChatRequest::new(&self.model, messages);
+        if let Some(ref prompt) = self.system_prompt {
+            request = request.with_system_prompt(prompt.clone());
+        }
+        let response = self
+            .provider
+            .chat(request)
+            .map_err(|e| AgenticError::Provider(e.0.clone()))?;
+        Self::accumulate_usage_cost(self, response.usage.as_ref());
+        Ok(parse_numbered_steps(&response.message.content.unwrap_or_default()))
+    }
+
+    /// Transient plan-state message prepended to every request while a
+    /// plan exists (not saved to memory).
+    fn plan_state_message(steps: &[String]) -> crate::providers::ChatMessageRequest {
+        let body: String = steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("{}. {}", i + 1, step))
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::providers::ChatMessageRequest::user(format!(
+            "[system] Current plan for this task (work through it step by step):\n{body}"
+        ))
+    }
+
     /// Steering nudge appended after the semantic loop detector trips:
     /// transient (not saved to memory), affects only the next request.
     fn loop_nudge_message(args_preview: &str) -> crate::providers::ChatMessageRequest {
@@ -914,6 +1068,30 @@ impl Orchestrator {
              provide your best final answer to the user now.",
         )
     }
+}
+
+/// Parse a model-produced step list: lines shaped like `1. step` /
+/// `2) step` (max 20 steps). Anything else is ignored.
+fn parse_numbered_steps(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return None;
+            }
+            let rest = &trimmed[digits.len()..];
+            let rest = rest
+                .strip_prefix('.')
+                .or_else(|| rest.strip_prefix(')'))?
+                .trim_start();
+            if rest.is_empty() {
+                return None;
+            }
+            Some(rest.to_string())
+        })
+        .take(20)
+        .collect()
 }
 
 /// Does the provider's stop reason mean "cut off at the output-token cap"?

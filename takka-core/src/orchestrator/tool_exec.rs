@@ -171,7 +171,7 @@ impl Orchestrator {
         max_chars: usize,
         outcome: BatchOutcome,
     ) -> BatchOutcome {
-        let Some(first_error) = transient_tool_error(&outcome.output) else {
+        let Some(_first_error) = transient_tool_error(&outcome.output) else {
             return outcome;
         };
         let (raw, note) = self.apply_auto_retry(&outcome.name, args, outcome.output.clone());
