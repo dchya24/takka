@@ -350,6 +350,14 @@ pub struct Orchestrator {
     plan_then_execute: bool,
     /// Current plan steps (O-05), restored from checkpoints on resume.
     plan_steps: Mutex<Vec<String>>,
+    /// Spend ceiling for the WHOLE session, in USD (P-07). `None`
+    /// (the default) means unlimited. Unlike `max_cost_usd` this is NOT
+    /// reset per run — it guards the session's total spend.
+    max_cost_usd_per_session: Option<f64>,
+    /// Cost accumulated across the whole session, in USD. Reset only by
+    /// `reset_session` (a new session), restored from the checkpoint on
+    /// resume.
+    session_cost_usd: Mutex<f64>,
 }
 
 impl Orchestrator {
@@ -384,6 +392,8 @@ impl Orchestrator {
             full_compact_recently: AtomicBool::new(false),
             plan_then_execute: false,
             plan_steps: Mutex::new(Vec::new()),
+            max_cost_usd_per_session: None,
+            session_cost_usd: Mutex::new(0.0),
         }
     }
 
@@ -584,6 +594,36 @@ impl Orchestrator {
         *sync::lock(&self.run_cost_usd)
     }
 
+    /// Set the session spend ceiling in USD (P-07). `None` (or a
+    /// non-positive value) means unlimited. Needs `&mut` — hosts call it
+    /// between runs (the runtime engine wires it from
+    /// `agent.max_cost_usd_per_session`).
+    pub fn set_max_cost_usd_per_session(&mut self, max: Option<f64>) {
+        self.max_cost_usd_per_session = max.filter(|max| *max > 0.0);
+    }
+
+    /// Configured session spend ceiling, if any.
+    pub fn max_cost_usd_per_session(&self) -> Option<f64> {
+        self.max_cost_usd_per_session
+    }
+
+    /// Cost accumulated across the whole session so far, in USD.
+    pub fn session_cost_usd(&self) -> f64 {
+        *sync::lock(&self.session_cost_usd)
+    }
+
+    /// Restore the session cost accumulator from a checkpoint (resume
+    /// must not silently reset the session ceiling's progress).
+    pub(super) fn set_session_cost_usd(&self, cost: f64) {
+        *sync::lock(&self.session_cost_usd) = cost.max(0.0);
+    }
+
+    /// Reset the session cost accumulator (P-07: a NEW session starts at
+    /// zero; runs never touch this). Part of `reset_session`'s job.
+    pub(super) fn reset_session_cost(&self) {
+        *sync::lock(&self.session_cost_usd) = 0.0;
+    }
+
     /// Reset the per-run cost accumulator (called at the start of every
     /// run, so the ceiling guards one user turn, not the whole session).
     pub(super) fn reset_run_cost(&self) {
@@ -601,6 +641,18 @@ impl Orchestrator {
         let mut spent = sync::lock(&self.run_cost_usd);
         *spent += cost_usd.max(0.0);
         match self.max_cost_usd {
+            Some(max) => *spent >= max,
+            None => false,
+        }
+    }
+
+    /// Accumulate one usage report into the SESSION total (P-07) and
+    /// report whether the session ceiling was crossed. Same `>=`
+    /// comparison as the run ceiling: spending the last cent stops.
+    pub(super) fn record_session_cost(&self, cost_usd: f64) -> bool {
+        let mut spent = sync::lock(&self.session_cost_usd);
+        *spent += cost_usd.max(0.0);
+        match self.max_cost_usd_per_session {
             Some(max) => *spent >= max,
             None => false,
         }

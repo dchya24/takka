@@ -23,7 +23,9 @@ use crate::memory::Message;
 use crate::AgenticError;
 
 /// Bump when the on-disk format changes.
-pub const SESSION_FORMAT_VERSION: u32 = 1;
+/// v2 adds `session_cost_usd` (P-07); v1 documents load with it at 0.0
+/// via `#[serde(default)]`.
+pub const SESSION_FORMAT_VERSION: u32 = 2;
 
 /// A recoverable snapshot of one agent session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,10 @@ pub struct AgentSession {
     pub task_state: Option<serde_json::Value>,
     /// How many checkpoints have been written for this session.
     pub checkpoint_count: u32,
+    /// Accumulated session spend in USD (P-07). v2 field; v1 documents
+    /// load with 0.0 (the ceiling progress starts over, visibly).
+    #[serde(default)]
+    pub session_cost_usd: f64,
 }
 
 impl AgentSession {
@@ -70,6 +76,7 @@ impl AgentSession {
             plan: None,
             task_state: None,
             checkpoint_count: 0,
+            session_cost_usd: 0.0,
         }
     }
 
@@ -296,6 +303,40 @@ mod tests {
         assert!(store.load("../escape").is_err());
         assert!(store.load("a/b").is_err());
         assert!(store.load("").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P-07: a v1 document (no `session_cost_usd`) loads cleanly with
+    /// the accumulator at 0.0 — the old format migrates on read.
+    #[test]
+    fn v1_session_without_session_cost_loads_with_zero() {
+        let dir = std::env::temp_dir().join(format!("sess_v1_{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("old.json"),
+            r#"{
+              "version": 1,
+              "session_id": "old",
+              "state": "completed",
+              "model": "m",
+              "created_at": "2026-01-01T00:00:00Z",
+              "updated_at": "2026-01-01T00:00:00Z",
+              "messages": [],
+              "checkpoint_count": 3
+            }"#,
+        )
+        .unwrap();
+        let loaded = store.load("old").expect("v1 document loads");
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.session_cost_usd, 0.0);
+
+        // New sessions save as v2 with the accumulator field.
+        let fresh = AgentSession::new("fresh", "m");
+        assert_eq!(fresh.version, SESSION_FORMAT_VERSION);
+        assert_eq!(fresh.version, 2);
+        assert_eq!(fresh.session_cost_usd, 0.0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
