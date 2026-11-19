@@ -90,7 +90,7 @@ impl Orchestrator {
         if self.compaction_cadence == 0 {
             return;
         }
-        let fired = iteration % self.compaction_cadence as u32 == 0;
+        let fired = iteration.is_multiple_of(self.compaction_cadence as u32);
         let just_compacted = self
             .full_compact_recently
             .swap(false, std::sync::atomic::Ordering::SeqCst);
