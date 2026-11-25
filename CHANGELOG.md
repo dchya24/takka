@@ -7,7 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-25
+
 ### Added
+- Core/orchestrator: **semantic loop detection (P-01)** — detects same-target
+  read/command thrashing and prolonged read-only streaks without edits, emitting
+  a steering nudge before hard-aborting on exact duplicates.
+- Core/orchestrator: **automatic transient tool retry (P-02)** — retries
+  transient tool failures (timeouts, temporary I/O errors) once in-loop before
+  recording an annotated result to memory.
+- Core/safety: **read-only binary allowlist & pipeline auto-approval (P-03)** —
+  auto-approves read-only pipelines and safe invocations of `sed -n`,
+  `python -c` / `python3 -c`, and `psql -c` (`SELECT`/`EXPLAIN`/`\d*`) while
+  keeping mutating variants gated.
+- Core/runtime: **per-project default permission mode (P-04)** — new
+  `agent.default_permission_mode` config key (`default` / `plan` / `yolo`)
+  applied at engine startup and advertised in ACP `session/new`.
+- Core/orchestrator: **compact tool-turn summaries on session resume (P-05)** —
+  `resume_session` replays consecutive tool runs as bounded `HistoryReplay`
+  summaries (up to 20 lines per run) without altering checkpoint message order.
+- Core/orchestrator: **graduated loop shaping (P-06)** — staged tool-budget
+  wind-down above 80%/90% of `max_iterations`, iteration-cadenced tool-result
+  compaction, and opt-in `plan_then_execute` checklist injection.
+- Core/orchestrator: **session-level spend ceiling (P-07)** — new
+  `agent.max_cost_usd_per_session` config key tracked across runs and persisted
+  in `AgentSession` checkpoints (`SESSION_FORMAT_VERSION = 2` with v1 migration).
+
+### Changed
+- **Removed full-screen `takka tui` mode** — consolidated the CLI around the
+  inline interactive REPL (`takka interactive`) and headless daemon/ACP modes.
+- Core/runtime/CLI: deduplicated Windows named-pipe endpoint hashing into
+  `takka_core::runtime::pipe_id` and split `daemon.rs`, `planner.rs`, and
+  `client.rs` into focused submodules.
+
+### Fixed
+- Core/providers: surface full `reqwest` error chains, remove total request
+  timeout on streaming calls, and deduplicate `Provider error:` prefixes.
+
+## [0.6.1] — 2026-11-16
+
+### Added
+- Runtime/CLI: **Windows named-pipe daemon transport (H-07)** — `--runtime daemon`
+  and `takka attach` now work over Win32 named pipes (`\\.\pipe\takka-<fnv1a64>`)
+  with the same shared-secret handshake as Unix domain sockets.
+- Core/CLI/runtime: **per-run USD spend ceiling (H-06)** — `agent.max_cost_usd`
+  config key, model list-price table, `Event::CostLimitExceeded`, and remaining
+  budget indicator in the CLI status bar.
+- Core/tools: **bounded shell subprocess execution (H-01)** — `run_command` and
+  `run_script` drain stdout and stderr concurrently with a 64 KiB stream cap,
+  enforce timeouts, observe cooperative cancellation, and kill the entire child
+  process group on expiry or cancel.
+- Core: **poison-tolerant mutex helper (H-02)** — `takka_core::sync::lock`
+  recovers poisoned mutexes across the engine, orchestrator, safety, ACP
+  adapter, daemon broker, and CLI render gates.
 - Runtime: **ACP adapter (Fase 4)** — `takka-runtime --acp` speaks the Agent
   Client Protocol v1 (JSON-RPC over stdio, the Zed editor integration
   surface): v1 protocol negotiation with capability advertisement (image

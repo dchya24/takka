@@ -1138,11 +1138,7 @@ fn psql_guard(segment: &str) -> bool {
             break;
         }
     }
-    let first = query
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let first = query.split_whitespace().next().unwrap_or("").to_lowercase();
     let read_shape = first == "select" || first == "explain" || first.starts_with('\\');
     if !read_shape {
         return false;

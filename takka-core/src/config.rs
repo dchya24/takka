@@ -825,7 +825,10 @@ mod tests {
             "agent": { "default_permission_mode": "plan" }
         }"#;
         let cfg: Config = serde_json::from_str(json).expect("parse");
-        assert_eq!(cfg.agent.default_permission_mode, Some(PermissionMode::Plan));
+        assert_eq!(
+            cfg.agent.default_permission_mode,
+            Some(PermissionMode::Plan)
+        );
 
         // Unset = default mode at boot (pre-existing behaviour).
         let bare: Config = serde_json::from_str(
@@ -837,7 +840,10 @@ mod tests {
         // Round trip.
         let out = serde_json::to_string(&cfg).expect("serialize");
         let cfg2: Config = serde_json::from_str(&out).expect("reparse");
-        assert_eq!(cfg2.agent.default_permission_mode, Some(PermissionMode::Plan));
+        assert_eq!(
+            cfg2.agent.default_permission_mode,
+            Some(PermissionMode::Plan)
+        );
     }
 
     #[test]

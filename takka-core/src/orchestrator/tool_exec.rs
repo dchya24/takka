@@ -153,12 +153,13 @@ impl Orchestrator {
             format!(
                 "[auto-retry] first attempt failed: {}; retry failed again: {}",
                 first_error,
-                retry_raw
-                    .strip_prefix("Tool error: ")
-                    .unwrap_or(&retry_raw)
+                retry_raw.strip_prefix("Tool error: ").unwrap_or(&retry_raw)
             )
         } else {
-            format!("[auto-retry] first attempt failed: {}; retry succeeded", first_error)
+            format!(
+                "[auto-retry] first attempt failed: {}; retry succeeded",
+                first_error
+            )
         };
         (retry_raw, Some(note))
     }
@@ -381,11 +382,9 @@ impl Orchestrator {
                     // P-02: one in-loop retry for transient errors, with
                     // both attempts annotated into the single entry.
                     let outcome = match &slots[i] {
-                        Slot::Pending { args, .. } => self.apply_auto_retry_batch(
-                            args,
-                            self.tool_result_max_chars,
-                            outcome,
-                        ),
+                        Slot::Pending { args, .. } => {
+                            self.apply_auto_retry_batch(args, self.tool_result_max_chars, outcome)
+                        }
                         _ => outcome,
                     };
                     results[i] = Some(SlotOutcome {
@@ -642,11 +641,9 @@ impl Orchestrator {
                         for (&i, outcome) in members.iter().zip(outcomes) {
                             // P-02: one in-loop retry for transient errors.
                             let outcome = match &slots[i] {
-                                Slot::Pending { args, .. } => self.apply_auto_retry_batch(
-                                    args,
-                                    max_chars,
-                                    outcome,
-                                ),
+                                Slot::Pending { args, .. } => {
+                                    self.apply_auto_retry_batch(args, max_chars, outcome)
+                                }
                                 _ => outcome,
                             };
                             results[i] = Some(SlotOutcome {
@@ -745,31 +742,29 @@ impl Orchestrator {
                     Ok((name, id, output, duration_ms, truncated)) => {
                         // P-02: one in-loop retry for transient errors,
                         // annotated into the single recorded entry.
-                        let (output, truncated, success) =
-                            if transient_tool_error(&output).is_some() {
-                                let args = match &slots[i] {
-                                    Slot::Pending { args, .. } => args.clone(),
-                                    _ => serde_json::Value::Null,
-                                };
-                                let (raw, note) =
-                                    self.apply_auto_retry(&name, &args, output);
-                                let result = match note {
-                                    Some(note) => format!(
-                                        "{}\n{}",
-                                        note,
-                                        truncate_tool_result(&raw, max_chars)
-                                    ),
-                                    None => truncate_tool_result(&raw, max_chars),
-                                };
-                                (
-                                    result,
-                                    raw.len() > max_chars,
-                                    !raw.starts_with("Tool error"),
-                                )
-                            } else {
-                                let success = !output.starts_with("Tool error");
-                                (output, truncated, success)
+                        let (output, truncated, success) = if transient_tool_error(&output)
+                            .is_some()
+                        {
+                            let args = match &slots[i] {
+                                Slot::Pending { args, .. } => args.clone(),
+                                _ => serde_json::Value::Null,
                             };
+                            let (raw, note) = self.apply_auto_retry(&name, &args, output);
+                            let result = match note {
+                                Some(note) => {
+                                    format!("{}\n{}", note, truncate_tool_result(&raw, max_chars))
+                                }
+                                None => truncate_tool_result(&raw, max_chars),
+                            };
+                            (
+                                result,
+                                raw.len() > max_chars,
+                                !raw.starts_with("Tool error"),
+                            )
+                        } else {
+                            let success = !output.starts_with("Tool error");
+                            (output, truncated, success)
+                        };
                         results[i] = Some(SlotOutcome {
                             name,
                             id,

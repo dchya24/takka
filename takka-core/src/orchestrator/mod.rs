@@ -477,10 +477,7 @@ impl Orchestrator {
     /// same *target* (`SEMANTIC_ARGS_NOISE_KEYS` stripped) accumulating
     /// `SEMANTIC_LOOP_THRESHOLD` times in its window produces a nudge, and
     /// any state-changing tool resets that window.
-    fn record_tool_calls_for_loop_detection(
-        &self,
-        calls: &[(&str, &str)],
-    ) -> LoopDetectionOutcome {
+    fn record_tool_calls_for_loop_detection(&self, calls: &[(&str, &str)]) -> LoopDetectionOutcome {
         // De-dup within this turn (rule 2). N is tiny, so a linear
         // `contains` is cheaper than a HashSet and keeps first-seen order.
         let mut new_sigs: Vec<ToolCallSignature> = Vec::with_capacity(calls.len());

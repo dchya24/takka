@@ -1109,7 +1109,9 @@ impl Orchestrator {
             .chat(request)
             .map_err(|e| AgenticError::Provider(e.0.clone()))?;
         Self::accumulate_usage_cost(self, response.usage.as_ref());
-        Ok(parse_numbered_steps(&response.message.content.unwrap_or_default()))
+        Ok(parse_numbered_steps(
+            &response.message.content.unwrap_or_default(),
+        ))
     }
 
     /// Transient plan-state message prepended to every request while a
