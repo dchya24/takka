@@ -9,7 +9,7 @@
 takka is a Rust-based coding agent that can inspect a codebase, edit files,
 run commands, use external tools, and work through multi-step development tasks
 from your terminal. It combines a reusable agent runtime with a standalone CLI
-for one-shot tasks, an interactive REPL, and a full-screen TUI.
+for one-shot tasks, an interactive inline REPL, and a headless daemon/ACP runtime.
 
 > takka is under active development. Review commands and file changes before
 > approving them, especially when using permissive execution modes.
@@ -22,8 +22,8 @@ for one-shot tasks, an interactive REPL, and a full-screen TUI.
   web access, memory, questions, task tracking, and patch application.
 - **Multiple providers** — OpenAI-compatible and Anthropic-compatible APIs with
   configurable models and capabilities.
-- **Terminal interfaces** — one-shot commands, an inline interactive REPL, and
-  a full-screen `ratatui` TUI.
+- **Terminal interfaces** — one-shot commands, an inline interactive REPL
+  powered by `ratatui`, and a headless daemon/ACP mode (`takka-runtime`).
 - **Context and persistence** — project instructions, persistent memory,
   session history, token-aware compaction, and prompt caching support.
 - **Extensibility** — MCP servers and discoverable `SKILL.md` skills.
@@ -35,7 +35,8 @@ for one-shot tasks, an interactive REPL, and a full-screen TUI.
 | Crate | Purpose |
 |---|---|
 | [`takka-core`](takka-core/) | Agent loop, providers, tools, memory, safety, MCP, planning, and skills. |
-| [`takka-cli`](takka-cli/) | The `takka` executable, configuration commands, REPL, and TUI. |
+| [`takka-cli`](takka-cli/) | The `takka` executable, configuration commands, and interactive REPL. |
+| [`takka-runtime`](takka-runtime/) | Headless JSON Lines / ACP v1 runtime and local-socket daemon broker. |
 
 ## Supported Platforms
 
@@ -65,7 +66,7 @@ Default destinations:
 
 The installer installs **two** binaries into the same directory:
 
-- `takka` — the CLI (parser, renderer, REPL/TUI)
+- `takka` — the CLI (parser, renderer, interactive REPL)
 - `takka-runtime` — the headless agent daemon the CLI spawns for every
   run (protocol: JSON Lines over stdin/stdout). The CLI looks for the
   runtime next to its own binary, or via the `TAKKA_RUNTIME_BIN`
@@ -212,9 +213,6 @@ takka run "explain the architecture of this repository"
 # Start the inline REPL
 takka interactive
 
-# Start the full-screen interface
-takka tui
-
 # Attach to the long-lived daemon (a daemon must already be running —
 # `attach` never auto-starts one), or run a one-off task through it via
 # --runtime daemon (which auto-spawns the daemon when absent)
@@ -224,8 +222,8 @@ takka --runtime daemon run "explain the architecture of this repository"
 
 `takka attach` drops you into the REPL routed through the running daemon's
 engine; the daemon keeps the session alive across attach/detach cycles, and
-`takka attach --shutdown` stops it. On Windows use `--runtime embedded`
-(the default) or `--runtime spawn` instead — daemon mode is Unix-only for now.
+`takka attach --shutdown` stops it. Both Unix domain sockets and Windows named
+pipes are supported.
 
 Useful configuration and discovery commands:
 
@@ -238,9 +236,6 @@ takka --help
 
 ## Known Limitations and Roadmap
 
-- [ ] Daemon mode (`--runtime daemon` / `takka attach`) is Unix-only for now;
-      the Windows named-pipe transport is still a TODO — use `--runtime embedded`
-      or `--runtime spawn` on Windows.
 - [ ] Publish Linux ARM64/aarch64 and Windows ARM64 prebuilt releases.
 - [ ] Distribute through package managers such as Homebrew, Scoop, Winget,
       and community Linux repositories.

@@ -1,7 +1,7 @@
 # Roadmap
 
-> Consolidated current-state + next-steps for the takka CLI + core library.
-> Last updated: 2026-11-12.
+> Consolidated current-state + next-steps for the takka CLI, runtime, and core library.
+> Last updated: 2026-11-25.
 
 This replaces the older `PLAN.md` / `IMPLEMENTATION_ROADMAP.md` /
 `QUICK_START_IMPLEMENTATION.md` triad
@@ -12,12 +12,15 @@ this repo.
 
 ## What this project is
 
-A two-crate workspace:
+A three-crate workspace:
 
 - **`takka-core`** — Rust library: agent loop, tools, memory, safety, MCP
-  client, multi-provider LLM support, streaming.
-- **`takka-cli`** — standalone binary: shared widgets stack (`ratatui`),
-  inline + full-screen TUI modes, REPL with slash commands, config wizard.
+  client, multi-provider LLM support, streaming, planning, and skills.
+- **`takka-cli`** — standalone binary: `ratatui`-based inline widget stack,
+  interactive REPL with slash commands and completions, config wizard.
+- **`takka-runtime`** — headless runtime binary: JSON Lines protocol v2,
+  local-socket daemon broker (Unix domain sockets and Windows named pipes),
+  and ACP v1 adapter (`--acp`).
 
 Reference docs:
 - Product framing — [AGENTIC_PRD.md](AGENTIC_PRD.md)
@@ -50,9 +53,9 @@ Foundation is complete; coverage of the architecture spec is at ~95%.
 
 | Layer | Surface |
 |-------|---------|
-| Modes | `takka run`, `takka interactive`, `takka tui`, `takka config …`. `--mode default|plan|yolo`. |
-| REPL | Custom `crossterm`/ratatui input loop + slash commands (`/help`, `/new`, `/config`, `/history`, `/tools`, `/stats`, `/mcp`, `/sessions`, `/models`, `/plan`, `/search`, `/image`, `/provider`, `/quit`). `@` file completion (auto-detects images for vision channel), `/` command completion, `/models ` model completion. Sessions auto-saved to `~/.config/takka/sessions/`. Resize-safe prompt with active provider/model metadata. |
-| Widgets | One ratatui-based stack used by inline + TUI: markdown, spinner, progress, panels, badges, headers, tool-call panel, unified-diff renderer. Capability detection (`NO_COLOR`, `TERM=dumb`, isatty, `--color`). Zero raw `\x1b[` escapes in the source. |
+| Modes | `takka run`, `takka interactive`, `takka attach`, `takka config …`. `--mode default\|plan\|yolo`. |
+| REPL | Custom `crossterm`/ratatui inline input loop + slash commands (`/help`, `/new`, `/clear`, `/config`, `/history`, `/tools`, `/stats`, `/mcp`, `/sessions`, `/models`, `/skills`, `/plan`, `/search`, `/image`, `/thoughts`, `/provider`, `/queue`, `/timeline`, `/quit`). `@` file completion (auto-detects images for vision channel), `/` command completion, `/models ` model completion. Sessions auto-saved to `~/.config/takka/sessions/`. Resize-safe prompt with active provider/model metadata. |
+| Widgets | Ratatui-based inline stack: markdown, spinner, progress, panels, badges, headers, tool-call panel, unified-diff renderer. Capability detection (`NO_COLOR`, `TERM=dumb`, isatty, `--color`). Zero raw `\x1b[` escapes in the source. |
 | Safety UX | Risk-coloured confirmation panel. Diff preview in the confirmation prompt for `write_file` / `edit_file` / `apply_patch`. |
 | Cancel | Two-stage Ctrl+C → cooperative cancel (process-global `Arc<AtomicBool>`). |
 
@@ -93,29 +96,38 @@ Next: sisa Fase UX dari design yang sama sudah landed — streaming preview, mid
 
 ## Open work
 
-**Hardening backlog (2026-11-14):** source audit found a real P0 (shell tools
-have no enforced timeout, a stdout/stderr pipe deadlock, and no cancellation —
-`run_script`'s `timeout` parameter is ignored) plus poisoning `.lock().unwrap()`
-sites, duplicated token estimation, and god files. Tracked item by item in
-[`../tasks/14112026-harness-hardening-backlog.md`](../tasks/14112026-harness-hardening-backlog.md).
+**Hardening backlog (2026-11-14, closed):** H-01 through H-07 in
+[`../tasks/14112026-harness-hardening-backlog.md`](../tasks/14112026-harness-hardening-backlog.md)
+are all landed on `dev`: bounded shell execution with process-group kill and
+cooperative cancel (H-01), poison-tolerant mutex helpers via `takka_core::sync`
+(H-02), unified char-class token estimator (H-03), god-file splits across
+`commands`, `acp`, `interactive`, `daemon`, `planner`, and `client` (H-04),
+ACP conformance documentation sync (H-05), per-run and per-session USD spend
+ceilings (H-06 / P-07), and Windows named-pipe daemon transport (H-07).
 
-**Protocol:** Fase 2a (capabilities + strict init + notification opt-out), **Fase 2b: steer/follow-up queue** (`Request::Steer` + `--queue-mode` + `/queue`), dan **Fase 3a: daemon mode** (Unix socket broker + token + `takka attach`; satu sesi aktif) sudah landed. **Fase 4: ACP juga landed (2026-11-11, PR #10–#15)** — keputusan 2026-11-10: ACP menggantikan rencana lama "SDK bahasa lain" (dibatalkan). `takka-runtime --acp` melayani ACP v1 (JSON-RPC over stdio, permukaan integrasi Zed): sesi multi (bounded), prompt streaming, mode, cancel, turn-limit; **stored-session lifecycle (`session/load` + `session/resume` di atas checkpoint store) landed 2026-11-14** — thread lama bisa dibuka lagi setelah restart, error "loading or resuming sessions is not supported" hilang; conformance hermetik kini 24-check (`scripts/acp-conformance.sh`), gate CI ubuntu+macOS (T-08). Sisa ACP: **bukti sesi Zed nyata** (manual). **Fase 3b: multiplexing multi-sesi (bump protokol berikutnya)** menyusul belakangan. Revisi ACP: [agentclientprotocol.com](https://agentclientprotocol.com).
+**Orchestrator & safety improvements (2026-11-19, closed):** P-01 through P-07 in
+[`../tasks/19112026-takka-improv-priorities.md`](../tasks/19112026-takka-improv-priorities.md)
+are all landed on `dev`: semantic loop detection (P-01), automatic single retry
+for transient tool errors (P-02), read-only binary allowlist for `sed -n`,
+`python -c`, and `psql -c` (P-03), per-project `default_permission_mode`
+(P-04), compact tool-turn summaries on session resume (P-05), graduated
+tool-budget shaping + iteration-cadenced compaction + opt-in plan-then-execute
+(P-06), and session-level spend ceiling `max_cost_usd_per_session` (P-07).
 
-**Packaging (C):** ditunda (keputusan 2026-11-10 — jangan dibuka tanpa persetujuan eksplisit).
+**Protocol & daemon (landed):** Phase 2a (capabilities + strict init +
+notification opt-out), Phase 2b (steer/follow-up queue via `Request::Steer`,
+`--queue-mode`, `/queue`), Phase 3a (daemon mode over Unix domain sockets and
+Windows named pipes with shared-secret handshake and `takka attach`), and
+Phase 4 (`takka-runtime --acp` serving ACP v1 over stdio with `session/load`
+and `session/resume`, gated by the 24-check `scripts/acp-conformance.sh` suite)
+are all landed. Remaining optional work: manual real-Zed session verification,
+and **Phase 3b: multi-session daemon multiplexing** (postponed).
 
-**Daemon (open):** daemon mode masih **Unix-only** — transport named pipe untuk Windows belum diimplementasikan (`takka --runtime daemon` gagal dengan pesan aksi di Windows).
+**UI surface (2026-11-25):** the separate full-screen `takka tui` mode was
+removed in favor of a single, well-maintained inline interactive REPL
+(`takka interactive`).
 
-**Fase UX (landed 2026-11-09):** inisiatif `initiative-repl-ux-hardening` selesai — (R2) streaming preview live di inline REPL, (R1) input-during-run steer/queue di REPL + TUI, (R3) TUI slash-command + `@`-file completion. Rincian di `CHANGELOG.md` bagian [0.6.0] "REPL/TUI UX hardening"; arsip di `_bmad-output/initiative-repl-ux-hardening/`.
-
-**CI (closed):** daemon smoke test macOS (#2) — dua bug macOS/BSD nyata (accept mewarisi `O_NONBLOCK`; path socket melebihi `SUN_LEN`), diperbaiki dan ditutup via PR #11 (2026-11-11).
-
-**Test flaky (closed):** env race `ENV_LOCK` + poisoning cascade dan deadline dinding tetap pada event-wait helpers (#4) — diperbaiki (ENV_LOCK `into_inner()` recovery, drop-order guard, quiet-window deadlines) dan ditutup via PR #13 + #14 (2026-11-12). Sisa opsional: dua cancel-smoke Windows tetap keluarga timing-flake yang dikenal (sudah jarang muncul); hardening menyusul kalau muncul lagi.
-
-Sized by effort. Each item has its own home in
-[`../tasks/tasks-core-agentic.md`](../tasks/tasks-core-agentic.md) or
-[`../tasks/tasks-agentic-cli.md`](../tasks/tasks-agentic-cli.md).
-
-Prioritas saat ini (keputusan 2026-11-10, diperbarui 2026-11-12): housekeeping docs, ACP (Fase 4), dan CI debt (#2, #4) tuntas. Tersisa: bukti sesi Zed nyata (manual), Fase 3b multiplexing, packaging (ditunda).
+**Packaging (C):** postponed (do not reopen without explicit user sign-off).
 
 ### Quick wins (under a day each)
 
