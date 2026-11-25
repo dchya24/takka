@@ -46,7 +46,7 @@
 //! surface the shared-secret handshake exists to close.
 
 #[cfg(any(test, windows))]
-pub(crate) mod pipe_id;
+pub(crate) use takka_core::runtime::pipe_id;
 #[cfg(any(unix, windows))]
 mod platform;
 #[cfg(all(test, any(unix, windows)))]

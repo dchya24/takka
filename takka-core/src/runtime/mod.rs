@@ -8,6 +8,7 @@
 //! Engine + transport land with the decoupling commits that follow.
 
 pub mod engine;
+pub mod pipe_id;
 pub mod protocol;
 pub mod transport;
 
