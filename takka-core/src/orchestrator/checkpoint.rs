@@ -288,11 +288,7 @@ fn summarize_tool_run(
             crate::memory::MessageRole::Tool { tool_name, .. } => tool_name.clone(),
             _ => continue,
         };
-        let call_id = message
-            .metadata
-            .tool_call_id
-            .as_deref()
-            .unwrap_or_default();
+        let call_id = message.metadata.tool_call_id.as_deref().unwrap_or_default();
         let target = targets.get(call_id).map(String::as_str).unwrap_or("-");
         let outcome = if let Some(err) = message
             .content
@@ -326,47 +322,38 @@ fn summarize_tool_run(
 #[cfg(test)]
 mod resume_summary_tests {
     use super::*;
-    use crate::providers::{ChatResponse, ChatUsage, LLMProvider, ProviderError, ProviderResult, StreamResult};
+    use crate::providers::{
+        ChatResponse, LLMProvider, ProviderError, ProviderResult, StreamResult,
+    };
     use crate::tool_registry::ToolRegistry;
-    use crate::tool::{Tool, ToolError, ToolMetadata, ToolSchema};
     use std::sync::Arc;
 
     struct UnusedProvider;
     impl LLMProvider for UnusedProvider {
-        fn provider_type(&self) -> &str { "unused" }
-        fn provider_id(&self) -> &str { "unused" }
+        fn provider_type(&self) -> &str {
+            "unused"
+        }
+        fn provider_id(&self) -> &str {
+            "unused"
+        }
         fn chat(&self, _r: crate::providers::ChatRequest) -> ProviderResult<ChatResponse> {
             Err(ProviderError::new("unused"))
         }
-        fn chat_stream(&self, _r: crate::providers::ChatRequest) -> StreamResult<crate::providers::ChatChunk, ProviderError> {
+        fn chat_stream(
+            &self,
+            _r: crate::providers::ChatRequest,
+        ) -> StreamResult<crate::providers::ChatChunk, ProviderError> {
             Err(ProviderError::new("unused"))
         }
-    }
-
-    struct StubReadTool {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-    impl Tool for StubReadTool {
-        fn name(&self) -> &str { "stub_read" }
-        fn description(&self) -> &str { "stub read tool" }
-        fn schema(&self) -> ToolSchema {
-            ToolSchema::new(self.name().to_string(), "stub")
-        }
-        fn execute(&self, args: serde_json::Value) -> crate::tool::ToolResult<serde_json::Value> {
-            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n == 2 {
-                return Err(ToolError("operation timed out".into()));
-            }
-            Ok(serde_json::json!({"path": args["path"], "ok": true}))
-        }
-        fn metadata(&self) -> ToolMetadata { ToolMetadata::read_only() }
     }
 
     fn tool_message(name: &str, call_id: &str, result: &str) -> crate::memory::Message {
         crate::memory::Message::tool(name, call_id, result)
     }
 
-    fn assistant_with_calls(calls: Vec<crate::providers::ToolCallResponse>) -> crate::memory::Message {
+    fn assistant_with_calls(
+        calls: Vec<crate::providers::ToolCallResponse>,
+    ) -> crate::memory::Message {
         crate::memory::Message::assistant_with_tool_calls("", calls)
     }
 
@@ -397,16 +384,35 @@ mod resume_summary_tests {
         // Simulate a run's messages: user → assistant(tool_calls) → 3 tools → assistant.
         let user = crate::memory::Message::user("explore");
         let assistant = assistant_with_calls(vec![
-            call("c1", "stub_read", &serde_json::json!({"path": "src/main.rs"})),
-            call("c2", "stub_read", &serde_json::json!({"path": "src/lib.rs"})),
-            call("c3", "stub_read", &serde_json::json!({"path": "src/err.rs"})),
+            call(
+                "c1",
+                "stub_read",
+                &serde_json::json!({"path": "src/main.rs"}),
+            ),
+            call(
+                "c2",
+                "stub_read",
+                &serde_json::json!({"path": "src/lib.rs"}),
+            ),
+            call(
+                "c3",
+                "stub_read",
+                &serde_json::json!({"path": "src/err.rs"}),
+            ),
         ]);
         let t1 = tool_message("stub_read", "c1", &result_for("c1", true));
         let t2 = tool_message("stub_read", "c2", &result_for("c2", true));
         let t3 = tool_message("stub_read", "c3", &result_for("c3", false));
         let final_assistant = crate::memory::Message::assistant("done");
 
-        let stored = vec![user.clone(), assistant.clone(), t1.clone(), t2.clone(), t3.clone(), final_assistant.clone()];
+        let stored = vec![
+            user.clone(),
+            assistant.clone(),
+            t1.clone(),
+            t2.clone(),
+            t3.clone(),
+            final_assistant.clone(),
+        ];
         let mut session = crate::session::AgentSession::new("resume-sum-1", "m");
         session.checkpoint("completed", stored.clone());
         store.save(&session).unwrap();
@@ -461,15 +467,16 @@ mod resume_summary_tests {
         let mut calls = Vec::new();
         for i in 0..44 {
             let id = format!("c{i}");
-            calls.push(call(&id, "stub_read", &serde_json::json!({"path": format!("f{i}.rs")})));
+            calls.push(call(
+                &id,
+                "stub_read",
+                &serde_json::json!({"path": format!("f{i}.rs")}),
+            ));
             messages.push(tool_message("stub_read", &id, &result_for(&id, true)));
         }
         messages[0] = assistant_with_calls(calls);
 
-        let summary = summarize_tool_run(
-            &messages[1..],
-            &std::collections::HashMap::new(),
-        );
+        let summary = summarize_tool_run(&messages[1..], &std::collections::HashMap::new());
         let body_lines: Vec<&str> = summary.lines().skip(1).collect();
         assert_eq!(body_lines.len(), 21, "20 lines + overflow tail: {summary}");
         assert!(body_lines[20].contains("+24 more"), "{summary}");

@@ -611,7 +611,11 @@ fn semantic_loop_detection_resets_after_edit() {
     let answer = orch.run("update the file").expect("run completes");
     assert_eq!(answer, "edited and verified");
     assert!(
-        events.lock().unwrap().iter().all(|m| !m.contains("re-reading")),
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|m| !m.contains("re-reading")),
         "read-after-edit must not be flagged as thrash"
     );
 }
@@ -622,12 +626,18 @@ struct StubReadTool {
 }
 impl StubReadTool {
     fn new(name: &str) -> Self {
-        Self { name: name.to_string() }
+        Self {
+            name: name.to_string(),
+        }
     }
 }
 impl takka_core::tool::Tool for StubReadTool {
-    fn name(&self) -> &str { &self.name }
-    fn description(&self) -> &str { "read-only test tool" }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "read-only test tool"
+    }
     fn schema(&self) -> takka_core::tool::ToolSchema {
         takka_core::tool::ToolSchema::new(self.name.clone(), "read-only test tool")
     }
@@ -642,8 +652,12 @@ impl takka_core::tool::Tool for StubReadTool {
 /// Mutating stub (O-02: survives the 90% stage).
 struct StubWriteTool;
 impl takka_core::tool::Tool for StubWriteTool {
-    fn name(&self) -> &str { "stub_write" }
-    fn description(&self) -> &str { "mutating test tool" }
+    fn name(&self) -> &str {
+        "stub_write"
+    }
+    fn description(&self) -> &str {
+        "mutating test tool"
+    }
     fn schema(&self) -> takka_core::tool::ToolSchema {
         takka_core::tool::ToolSchema::new("stub_write".to_string(), "mutating test tool")
     }
@@ -654,7 +668,6 @@ impl takka_core::tool::Tool for StubWriteTool {
         takka_core::tool::ToolMetadata::default()
     }
 }
-
 
 /// O-02: graduated tool-budget shaping — shrinking tool_defs per stage.
 #[test]
@@ -702,12 +715,28 @@ fn tool_budget_shaping_strips_stages() {
     // Full set (3) for iterations 1..=7, mutating-only (1) at 80%/90%,
     // tools stripped (0) on the finalization request.
     assert_eq!(counts[0], 3, "full set early: {:?}", *counts);
-    assert_eq!(counts[7], 1, "80% stage keeps mutating tools: {:?}", *counts);
-    assert_eq!(counts[8], 1, "90% stage keeps mutating tools: {:?}", *counts);
+    assert_eq!(
+        counts[7], 1,
+        "80% stage keeps mutating tools: {:?}",
+        *counts
+    );
+    assert_eq!(
+        counts[8], 1,
+        "90% stage keeps mutating tools: {:?}",
+        *counts
+    );
     assert_eq!(counts[9], 0, "finalization strips tools: {:?}", *counts);
     let captured = events.lock().unwrap();
-    assert!(captured.iter().any(|m| m.contains("80%")), "{:?}", *captured);
-    assert!(captured.iter().any(|m| m.contains("90%")), "{:?}", *captured);
+    assert!(
+        captured.iter().any(|m| m.contains("80%")),
+        "{:?}",
+        *captured
+    );
+    assert!(
+        captured.iter().any(|m| m.contains("90%")),
+        "{:?}",
+        *captured
+    );
 }
 
 /// O-03: every 10 iterations old tool results collapse to one line.
@@ -779,16 +808,19 @@ fn plan_then_execute_makes_one_plan_call_and_prepends_the_plan() {
 
     // PlanCreated announced with 3 steps; plan prepended to the tool turn.
     let events = events.lock().unwrap();
-    assert!(events.iter().any(|e| matches!(
-        e,
-        Event::PlanCreated { steps_total: 3 }
-    )));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::PlanCreated { steps_total: 3 })));
     assert_eq!(orch.plan_steps().len(), 3);
     drop(events);
 
     let requests = recording.requests.lock().unwrap().clone();
     // 3 provider calls: plan + tool turn + final text.
-    assert_eq!(requests.len(), 3, "plan call must cost exactly one extra call");
+    assert_eq!(
+        requests.len(),
+        3,
+        "plan call must cost exactly one extra call"
+    );
     let tool_turn = &requests[1];
     let tool_turn_text: String = tool_turn
         .messages
@@ -810,11 +842,10 @@ fn plan_then_execute_off_makes_no_extra_call() {
         support::text_response("plain answer"),
     ]));
     let provider: Arc<dyn LLMProvider> = recording.clone();
-    let mut orch = Orchestrator::new(provider, ToolRegistry::new());
+    let orch = Orchestrator::new(provider, ToolRegistry::new());
     orch.run("quick question").expect("run completes");
     assert_eq!(recording.requests.lock().unwrap().len(), 1);
 }
-
 
 /// P-07: a session spend ceiling stops the run at the turn boundary
 /// after crossing, with the session-limit message (not the run-limit).
@@ -870,13 +901,12 @@ fn session_cost_limit_unset_is_unlimited() {
     let mut resp = support::text_response("ok");
     resp.usage = Some(support::usage(10_000, 10_000));
     let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![resp]));
-    let mut orch = Orchestrator::new(provider, ToolRegistry::new());
+    let orch = Orchestrator::new(provider, ToolRegistry::new());
     assert_eq!(orch.max_cost_usd_per_session(), None);
     let answer = orch.run("no ceiling").expect("unlimited run completes");
     assert_eq!(answer, "ok");
     assert!(orch.session_cost_usd() > 0.0, "cost still accumulated");
 }
-
 
 /// P-07: resume keeps the session cost accumulator — the ceiling does
 /// not reset silently across a resume.
@@ -899,10 +929,10 @@ fn session_cost_limit_survives_resume() {
     let tools = ToolRegistry::new();
     tools.register(Box::new(StubReadTool::new("stub_read_a")));
 
-    let mut orch = Orchestrator::new(Arc::new(ScriptedProvider::new(vec![
-        resp.clone(),
-        final_resp,
-    ])), tools);
+    let mut orch = Orchestrator::new(
+        Arc::new(ScriptedProvider::new(vec![resp.clone(), final_resp])),
+        tools,
+    );
     orch.set_permission_mode(PermissionMode::Yolo);
     orch.set_model("claude-3-5-sonnet");
     orch.set_max_cost_usd_per_session(Some(0.02));
@@ -933,9 +963,7 @@ fn session_cost_limit_survives_resume() {
     );
     resumed.set_model("claude-3-5-sonnet");
     resumed.set_max_cost_usd_per_session(Some(0.02));
-    resumed
-        .resume_session(store, &session_id)
-        .expect("resume");
+    resumed.resume_session(store, &session_id).expect("resume");
     assert!(
         (resumed.session_cost_usd() - spent).abs() < 1e-9,
         "resume must restore the session accumulator: {} vs {spent}",
@@ -979,7 +1007,9 @@ impl takka_core::tool::Tool for FlakyTransientTool {
     fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
         use std::sync::atomic::Ordering;
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            Err(takka_core::tool::ToolError("operation timed out".to_string()))
+            Err(takka_core::tool::ToolError(
+                "operation timed out".to_string(),
+            ))
         } else {
             Ok(serde_json::json!({"ok": true}))
         }
@@ -998,13 +1028,17 @@ fn transient_tool_error_auto_retries_once_and_records_one_entry() {
     ]));
 
     let tools = ToolRegistry::new();
-    let flaky2 = FlakyTransientTool { calls: flaky.calls.clone() };
+    let flaky2 = FlakyTransientTool {
+        calls: flaky.calls.clone(),
+    };
     tools.register(Box::new(flaky2));
 
-    let mut orch = Orchestrator::new(provider, tools);
+    let orch = Orchestrator::new(provider, tools);
     orch.set_permission_mode(PermissionMode::Yolo);
 
-    let answer = orch.run("use the flaky tool").expect("run continues past retry");
+    let answer = orch
+        .run("use the flaky tool")
+        .expect("run continues past retry");
     assert_eq!(answer, "recovered");
 
     // Exactly one annotated history entry; the model never sees the raw
@@ -1063,10 +1097,12 @@ fn persistent_tool_error_never_retries() {
     ]));
 
     let tools = ToolRegistry::new();
-    let persistent2 = PersistentErrorTool { calls: persistent.calls.clone() };
+    let persistent2 = PersistentErrorTool {
+        calls: persistent.calls.clone(),
+    };
     tools.register(Box::new(persistent2));
 
-    let mut orch = Orchestrator::new(provider, tools);
+    let orch = Orchestrator::new(provider, tools);
     orch.set_permission_mode(PermissionMode::Yolo);
 
     let answer = orch.run("use the broken tool").expect("run completes");
