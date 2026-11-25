@@ -107,7 +107,7 @@ fn daemon_mode_unsupported_message_is_actionable() {
 /// sees it once sees it everywhere.
 #[test]
 fn takka_runtime_exports_the_same_unsupported_message() {
-    let runtime = include_str!("../../../takka-runtime/src/daemon.rs");
+    let runtime = include_str!("../../../takka-runtime/src/daemon/mod.rs");
     assert!(
         runtime.contains(DAEMON_NOT_SUPPORTED_MESSAGE),
         "takka-runtime's not_supported_error drifted from the CLI message"
