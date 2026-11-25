@@ -197,19 +197,6 @@ pub enum Command {
     )]
     Interactive,
 
-    /// Start TUI mode (full-screen interactive)
-    #[command(long_about = "Start a full-screen TUI session.\n\
-        \n\
-        Features:\n\
-        - Rich markdown rendering\n\
-        - Animated progress indicators\n\
-        - Dropdown for / commands\n\
-        - Dropdown for @ file completion\n\
-        - Scrollable message history\n\
-        \n\
-        Keybindings: /help, Ctrl+C to cancel, Ctrl+D to quit")]
-    Tui,
-
     /// Attach to a running takka daemon
     #[command(long_about = "Attach this CLI to an already-running takka daemon\n\
         (takka-runtime --daemon) over its unix socket.\n\

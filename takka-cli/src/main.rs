@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     // in explicitly. The file log keeps full detail either way.
     let interactive_session = matches!(
         &cli.command,
-        None | Some(Command::Interactive) | Some(Command::Attach { .. }) | Some(Command::Tui)
+        None | Some(Command::Interactive) | Some(Command::Attach { .. })
     );
     let console_filter = if cli.debug {
         EnvFilter::new("debug")
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
         loaded
     } else {
         match &cli.command {
-            Some(Command::Run { .. }) | Some(Command::Interactive) | Some(Command::Tui) | None => {
+            Some(Command::Run { .. }) | Some(Command::Interactive) | None => {
                 use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
                 use ratatui::text::{Line, Span as RSpan};
                 use widgets::{components, inline};
@@ -305,10 +305,6 @@ async fn main() -> Result<()> {
                 commands.attach_daemon(false).await?;
                 interactive::run(commands).await?;
             }
-        }
-        Some(Command::Tui) => {
-            commands = commands.with_interactive_mode(true);
-            tui::run_tui(std::sync::Arc::new(tokio::sync::Mutex::new(commands))).await?;
         }
         Some(Command::Config(action)) => {
             commands.config(action)?;
