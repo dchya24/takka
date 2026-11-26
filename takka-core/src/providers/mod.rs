@@ -9,7 +9,9 @@ pub use anthropic::{
     AnthropicProviderConfig, AnthropicResponse, AnthropicStreamDelta, AnthropicStreamEvent,
     AnthropicStreamMessage, AnthropicUsage, RetryConfig,
 };
-pub use cassette::{request_fingerprint, CassetteProvider, Exchange};
+pub use cassette::{
+    chunks_from_response, request_fingerprint, response_from_chunks, CassetteProvider, Exchange,
+};
 pub use openai::{OpenAIProvider, OpenAIProviderConfig};
 
 use serde::{Deserialize, Serialize};

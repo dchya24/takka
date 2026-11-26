@@ -8,8 +8,14 @@
 //!
 //! [`CassetteProvider`] replays those exchanges in order, one per `chat()`
 //! call. It is deterministic, free and hermetic: no network, no credentials,
-//! no ambient config. This step (A1) is replay-only and non-streaming;
-//! streaming replay and record mode are separate steps of
+//! no ambient config. It serves both `chat()` and `chat_stream()`:
+//!
+//! * an exchange with a `response` is replayed as-is for `chat()` and
+//!   synthesised into a one-chunk stream for `chat_stream()`;
+//! * an exchange with recorded `chunks` is replayed chunk by chunk for
+//!   `chat_stream()` and folded into a `ChatResponse` for `chat()`.
+//!
+//! Record mode is a separate step of
 //! `docs/superpowers/plans/2026-11-26-eval-harness-and-record-replay.md`.
 //!
 //! # Strictness
@@ -24,7 +30,8 @@
 //!   sequence only.
 
 use super::{
-    ChatChunk, ChatRequest, ChatResponse, LLMProvider, ProviderError, ProviderResult, StreamResult,
+    ChatChunk, ChatMessageResponse, ChatRequest, ChatResponse, LLMProvider, ProviderError,
+    ProviderResult, StreamResult, ToolCallDelta, ToolCallFunction, ToolCallResponse,
 };
 use crate::runtime::pipe_id::fnv1a64;
 use crate::sync;
@@ -44,7 +51,119 @@ pub struct Exchange {
     pub seq: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
-    pub response: ChatResponse,
+    /// Full response (non-streaming recording or hand-authored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ChatResponse>,
+    /// Recorded stream chunks (streaming recording).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<ChatChunk>,
+}
+
+impl Exchange {
+    fn to_response(&self) -> ProviderResult<ChatResponse> {
+        match (&self.response, self.chunks.is_empty()) {
+            (Some(r), _) => Ok(r.clone()),
+            (None, false) => Ok(response_from_chunks(&self.chunks)),
+            (None, true) => Err(ProviderError::new(format!(
+                "cassette seq {}: exchange has neither response nor chunks",
+                self.seq
+            ))),
+        }
+    }
+
+    fn to_chunks(&self) -> ProviderResult<Vec<ChatChunk>> {
+        if !self.chunks.is_empty() {
+            return Ok(self.chunks.clone());
+        }
+        match &self.response {
+            Some(r) => Ok(chunks_from_response(r)),
+            None => Err(ProviderError::new(format!(
+                "cassette seq {}: exchange has neither response nor chunks",
+                self.seq
+            ))),
+        }
+    }
+}
+
+/// Encode a full response as a single stream chunk (text delta plus every
+/// tool call with complete arguments), the shape the orchestrator's stream
+/// accumulator already handles.
+pub fn chunks_from_response(resp: &ChatResponse) -> Vec<ChatChunk> {
+    let tool_calls = resp
+        .message
+        .tool_calls
+        .iter()
+        .enumerate()
+        .map(|(i, tc)| ToolCallDelta {
+            index: i as u32,
+            id: Some(tc.id.clone()),
+            function_name: Some(tc.function.name.clone()),
+            function_arguments: Some(tc.function.arguments.clone()),
+        })
+        .collect();
+    vec![ChatChunk {
+        id: resp.id.clone(),
+        delta: resp.message.content.clone().unwrap_or_default(),
+        finish_reason: resp.finish_reason.clone(),
+        tool_calls,
+        usage: resp.usage.clone(),
+    }]
+}
+
+/// Fold recorded stream chunks back into one response: text deltas are
+/// concatenated, tool-call deltas are merged by `index` (arguments appended),
+/// and the last `finish_reason` / `usage` seen win.
+pub fn response_from_chunks(chunks: &[ChatChunk]) -> ChatResponse {
+    let mut content = String::new();
+    let mut calls: Vec<(String, String, String)> = Vec::new(); // id, name, args
+    let mut finish_reason = None;
+    let mut usage = None;
+    for c in chunks {
+        content.push_str(&c.delta);
+        for d in &c.tool_calls {
+            let i = d.index as usize;
+            while calls.len() <= i {
+                calls.push(Default::default());
+            }
+            if let Some(id) = &d.id {
+                calls[i].0 = id.clone();
+            }
+            if let Some(n) = &d.function_name {
+                calls[i].1.push_str(n);
+            }
+            if let Some(a) = &d.function_arguments {
+                calls[i].2.push_str(a);
+            }
+        }
+        if c.finish_reason.is_some() {
+            finish_reason = c.finish_reason.clone();
+        }
+        if c.usage.is_some() {
+            usage = c.usage.clone();
+        }
+    }
+    ChatResponse {
+        id: chunks.first().map(|c| c.id.clone()).unwrap_or_default(),
+        model: String::new(),
+        message: ChatMessageResponse {
+            role: "assistant".into(),
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
+            tool_calls: calls
+                .into_iter()
+                .map(|(id, name, arguments)| ToolCallResponse {
+                    id,
+                    call_type: "function".into(),
+                    function: ToolCallFunction { name, arguments },
+                })
+                .collect(),
+        },
+        finish_reason,
+        usage,
+    }
 }
 
 /// Stable fingerprint of the parts of a request that should force a
@@ -135,6 +254,21 @@ impl LLMProvider for CassetteProvider {
     }
 
     fn chat(&self, request: ChatRequest) -> ProviderResult<ChatResponse> {
+        self.take_next(&request)?.to_response()
+    }
+
+    fn chat_stream(&self, request: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
+        let chunks = self.take_next(&request)?.to_chunks()?;
+        Ok(Box::pin(futures::stream::iter(
+            chunks.into_iter().map(Ok::<_, ProviderError>),
+        )))
+    }
+}
+
+impl CassetteProvider {
+    /// Pop the next exchange, enforcing exhaustion and strict fingerprints.
+    /// A failed match leaves the queue untouched.
+    fn take_next(&self, request: &ChatRequest) -> ProviderResult<Exchange> {
         let mut q = sync::lock(&self.queue);
         let Some(next) = q.front() else {
             return Err(ProviderError::new(
@@ -143,7 +277,7 @@ impl LLMProvider for CassetteProvider {
         };
         if self.strict {
             if let Some(expected) = &next.fingerprint {
-                let actual = request_fingerprint(&request);
+                let actual = request_fingerprint(request);
                 if *expected != actual {
                     return Err(ProviderError::new(format!(
                         "cassette mismatch at seq {}: request fingerprint {actual} != recorded \
@@ -153,14 +287,7 @@ impl LLMProvider for CassetteProvider {
                 }
             }
         }
-        // Checked non-empty above.
-        Ok(q.pop_front().expect("front() was Some").response)
-    }
-
-    fn chat_stream(&self, _request: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
-        Err(ProviderError::new(
-            "cassette: streaming replay is not implemented yet",
-        ))
+        Ok(q.pop_front().expect("front() was Some"))
     }
 }
 
@@ -191,7 +318,8 @@ mod tests {
         Exchange {
             seq,
             fingerprint: fp,
-            response: resp(text),
+            response: Some(resp(text)),
+            chunks: vec![],
         }
     }
 
@@ -291,9 +419,120 @@ mod tests {
         assert!(err.0.contains("line 1"), "{}", err.0);
     }
 
+    async fn collect(p: &CassetteProvider, r: ChatRequest) -> Vec<ChatChunk> {
+        use futures::StreamExt;
+        let stream = p.chat_stream(r).expect("stream");
+        stream.map(|c| c.expect("chunk")).collect().await
+    }
+
+    #[tokio::test]
+    async fn response_exchange_streams_as_one_chunk() {
+        let p = CassetteProvider::from_exchanges(vec![ex(0, None, "hello")]);
+        let chunks = collect(&p, req("x")).await;
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta, "hello");
+        assert_eq!(chunks[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_stream_with_distinct_indices() {
+        let mut r = resp("");
+        r.message.tool_calls = vec![
+            ToolCallResponse {
+                id: "a".into(),
+                call_type: "function".into(),
+                function: ToolCallFunction {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCallResponse {
+                id: "b".into(),
+                call_type: "function".into(),
+                function: ToolCallFunction {
+                    name: "glob".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ];
+        let p = CassetteProvider::from_exchanges(vec![Exchange {
+            seq: 0,
+            fingerprint: None,
+            response: Some(r),
+            chunks: vec![],
+        }]);
+        let chunks = collect(&p, req("x")).await;
+        let idx: Vec<u32> = chunks[0].tool_calls.iter().map(|t| t.index).collect();
+        assert_eq!(idx, vec![0, 1]);
+    }
+
+    fn chunk(delta: &str, calls: Vec<ToolCallDelta>, fin: Option<&str>) -> ChatChunk {
+        ChatChunk {
+            id: "c".into(),
+            delta: delta.into(),
+            finish_reason: fin.map(Into::into),
+            tool_calls: calls,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_chunks_replay_in_order_and_fold_for_chat() {
+        let chunks = vec![
+            chunk("Hel", vec![], None),
+            chunk(
+                "lo",
+                vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("t1".into()),
+                    function_name: Some("read_file".into()),
+                    function_arguments: Some("{\"pa".into()),
+                }],
+                None,
+            ),
+            chunk(
+                "",
+                vec![ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    function_name: None,
+                    function_arguments: Some("th\":\"x\"}".into()),
+                }],
+                Some("tool_calls"),
+            ),
+        ];
+        let mk = || {
+            CassetteProvider::from_exchanges(vec![Exchange {
+                seq: 0,
+                fingerprint: None,
+                response: None,
+                chunks: chunks.clone(),
+            }])
+        };
+        let streamed = collect(&mk(), req("x")).await;
+        let deltas: Vec<&str> = streamed.iter().map(|c| c.delta.as_str()).collect();
+        assert_eq!(deltas, vec!["Hel", "lo", ""]);
+
+        let folded = mk().chat(req("x")).unwrap();
+        assert_eq!(folded.message.content.as_deref(), Some("Hello"));
+        assert_eq!(folded.message.tool_calls[0].id, "t1");
+        assert_eq!(folded.message.tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            folded.message.tool_calls[0].function.arguments,
+            "{\"path\":\"x\"}"
+        );
+        assert_eq!(folded.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
     #[test]
-    fn streaming_is_explicitly_unsupported() {
-        let p = CassetteProvider::from_exchanges(vec![]);
-        assert!(p.chat_stream(req("x")).is_err());
+    fn empty_exchange_is_an_error() {
+        let p = CassetteProvider::from_exchanges(vec![Exchange {
+            seq: 3,
+            fingerprint: None,
+            response: None,
+            chunks: vec![],
+        }]);
+        let err = p.chat(req("x")).unwrap_err();
+        assert!(err.0.contains("seq 3"), "{}", err.0);
     }
 }
