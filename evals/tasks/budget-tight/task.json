@@ -1,0 +1,19 @@
+{
+  "id": "budget-tight",
+  "prompt": "flag.txt contains `off`. Change it to `on`. You have a very small tool budget, so be direct. Do not edit test.sh.",
+  "tags": [
+    "feature",
+    "budget",
+    "shell"
+  ],
+  "max_iterations": 3,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  },
+  "expect": {
+    "max_iterations_used": 3
+  }
+}

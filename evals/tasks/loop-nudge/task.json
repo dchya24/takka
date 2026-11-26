@@ -1,0 +1,19 @@
+{
+  "id": "loop-nudge",
+  "prompt": "msg.txt contains a misspelling of the word 'receive'. Fix the spelling. Do not edit test.sh.",
+  "tags": [
+    "bugfix",
+    "loop-detection",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  },
+  "expect": {
+    "min_loop_nudges": 1
+  }
+}

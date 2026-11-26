@@ -2301,12 +2301,25 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "tempfile",
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
  "tokio-test",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "takka-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "takka-core",
+ "tempfile",
 ]
 
 [[package]]

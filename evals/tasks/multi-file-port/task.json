@@ -1,0 +1,16 @@
+{
+  "id": "multi-file-port",
+  "prompt": "The service port 8080 is hardcoded in more than one file. Move it to 9090 everywhere it is hardcoded. Do not edit test.sh.",
+  "tags": [
+    "refactor",
+    "multi-file",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  }
+}
