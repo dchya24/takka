@@ -142,14 +142,15 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let port = free_port().unwrap();
-        let svc = start(
-            &spec("python3 -m http.server $EVAL_PORT --bind 127.0.0.1", 10),
-            dir.path(),
-            dir.path(),
-            port,
+        // A bare socket: `http.server` can hang in `getfqdn()` on CI hosts.
+        std::fs::write(
+            dir.path().join("listen.py"),
+            "import os, socket, time\ns = socket.socket()\ns.bind((\"127.0.0.1\", int(os.environ[\"EVAL_PORT\"])))\ns.listen()\ntime.sleep(60)\n",
         )
-        .expect("service becomes ready");
+        .unwrap();
+        let port = free_port().unwrap();
+        let svc = start(&spec("python3 listen.py", 10), dir.path(), dir.path(), port)
+            .expect("service becomes ready");
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         assert!(TcpStream::connect(addr).is_ok());
         drop(svc);

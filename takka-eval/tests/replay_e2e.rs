@@ -7,6 +7,14 @@ use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 
+const LISTEN_PY: &str = r#"import os, socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(os.environ["EVAL_PORT"])))
+s.listen()
+time.sleep(60)
+"#;
+
 fn call(i: usize, name: &str, args: serde_json::Value) -> String {
     json!({"seq": i, "response": {"id": format!("r{i}"), "model": "eval-model",
         "message": {"role": "assistant", "content": null,
@@ -263,12 +271,14 @@ fn setup_service_is_reachable_from_verify() {
     std::fs::write(
         dir.join("task.json"),
         json!({"id": "svc", "prompt": "do nothing at {port}",
-            "setup": {"command": "python3 -m http.server $EVAL_PORT --bind 127.0.0.1",
-                "ready_timeout_secs": 30},
-            "verify": {"command": "python3 -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/' % os.environ['EVAL_PORT'])\""}})
+            "setup": {"command": "python3 listen.py", "ready_timeout_secs": 30},
+            "verify": {"command": "python3 -c \"import os,socket; socket.create_connection(('127.0.0.1', int(os.environ['EVAL_PORT'])), 5)\""}})
         .to_string(),
     )
     .unwrap();
+    // A bare socket, not `http.server`: that calls `socket.getfqdn()` while
+    // binding, which can hang on CI hosts without working reverse DNS.
+    std::fs::write(dir.join("listen.py"), LISTEN_PY).unwrap();
     std::fs::write(dir.join("cassette.jsonl"), text(0, "ok")).unwrap();
     let (code, stdout, stderr) = run(tmp.path(), &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
