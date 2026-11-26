@@ -157,12 +157,19 @@ impl Tool for FetchTool {
                     .user_agent(USER_AGENT)
                     .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
                     .build()
-                    .map_err(|e| ToolError::new(format!("HTTP client error: {}", e)))?;
+                    .map_err(|e| {
+                        ToolError::new(format!(
+                            "HTTP client error: {}",
+                            crate::providers::reqwest_chain(&e)
+                        ))
+                    })?;
 
-                let resp = client
-                    .get(url)
-                    .send()
-                    .map_err(|e| ToolError::new(format!("Fetch failed: {}", e)))?;
+                let resp = client.get(url).send().map_err(|e| {
+                    ToolError::new(format!(
+                        "Fetch failed: {}",
+                        crate::providers::reqwest_chain(&e)
+                    ))
+                })?;
 
                 let status = resp.status();
                 let content_type = resp
@@ -179,9 +186,12 @@ impl Tool for FetchTool {
                     )));
                 }
 
-                let raw = resp
-                    .text()
-                    .map_err(|e| ToolError::new(format!("Failed to read body: {}", e)))?;
+                let raw = resp.text().map_err(|e| {
+                    ToolError::new(format!(
+                        "Failed to read body: {}",
+                        crate::providers::reqwest_chain(&e)
+                    ))
+                })?;
 
                 let cleaned = if is_htmlish(&content_type, &raw) {
                     html_to_text(&raw)
@@ -357,6 +367,26 @@ mod tests {
         assert!(out.contains("second"));
         // Should be split onto separate lines, not concatenated.
         assert!(out.lines().count() >= 2);
+    }
+
+    /// A URL on a port nothing listens on: bind to get a free port, then
+    /// close the listener so connecting is refused deterministically.
+    fn refused_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/status")
+    }
+
+    #[test]
+    fn fetch_connection_failure_keeps_the_root_cause() {
+        let err = FetchTool::new()
+            .execute(serde_json::json!({"url": refused_url()}))
+            .expect_err("nothing listens on that port");
+        let msg = err.to_string().to_lowercase();
+        // reqwest's Display alone says only "error sending request for url";
+        // the cause ("Connection refused") is what retry logic needs.
+        assert!(msg.contains("connection refused"), "got: {msg}");
     }
 
     #[test]

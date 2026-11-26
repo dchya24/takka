@@ -1,0 +1,19 @@
+{
+  "id": "transient-retry",
+  "prompt": "flag.txt contains `no`. Change it to `yes`. Do not edit test.sh.",
+  "tags": [
+    "feature",
+    "auto-retry",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  },
+  "expect": {
+    "min_auto_retries": 1
+  }
+}
