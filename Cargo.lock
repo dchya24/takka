@@ -2274,6 +2274,7 @@ dependencies = [
  "serde",
  "serde_json",
  "takka-core",
+ "tempfile",
  "termcolor",
  "tokio",
  "tracing",

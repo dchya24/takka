@@ -50,7 +50,7 @@ pub use attachments::{
 pub use capabilities::ModelCapabilities;
 pub use config::{
     AgentLoopConfig, BreakpointStrategy, CacheConfig, Config, ModelConfig, ModelOutput,
-    OutputConfig, PlannerLoopConfig, ProviderConfig, SafetyConfig, SkillsConfig,
+    OutputConfig, PlannerLoopConfig, ProviderConfig, SafetyConfig, SkillsConfig, UpdatesConfig,
 };
 pub use context::{BuildOptions, ContextBudget, ContextEngine};
 pub use events::{Event, EventType};

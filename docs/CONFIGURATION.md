@@ -195,6 +195,23 @@ Use **either** stdio (`command` + `args`) **or** HTTP (`url`), not both.
 
 ---
 
+### Update check
+
+```json
+{ "updates": { "check": true } }
+```
+
+When `updates.check` is `true` (the default), the interactive REPL checks GitHub
+Releases in the background at most once every 24 hours and, if a newer release
+exists, shows a one-line hint under the banner on the next start. It never
+installs anything; run `takka update` to upgrade. The last result is cached in
+`~/.config/takka/update-check.json`.
+
+Disable it with `"updates": { "check": false }` or by setting the environment
+variable `TAKKA_NO_UPDATE_CHECK=1`. `takka run`, the daemon and ACP never check.
+
+---
+
 ## 2. Output Mapping
 
 This represents how models should be displayed externally (e.g., UI dropdown).

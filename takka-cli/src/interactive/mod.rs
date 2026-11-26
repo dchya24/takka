@@ -292,6 +292,15 @@ pub async fn run(mut commands: Commands) -> Result<()> {
 
     print_banner(&model_info, &stats);
 
+    // Release hint from the last background check; a refresh (if due) runs on
+    // a detached thread and shows up on the next start. Never blocks the REPL.
+    let update_check = takka_core::Config::load()
+        .map(|c| c.updates.check)
+        .unwrap_or(true);
+    if let Some(line) = crate::update_notice::startup(update_check) {
+        crate::update_notice::print_hint(&line);
+    }
+
     let mut buffer = InputBuffer::new();
     let mut dropdown: Option<Dropdown> = None;
     let mut conversation: Vec<ConversationEntry> = Vec::new();

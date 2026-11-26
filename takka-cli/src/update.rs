@@ -54,6 +54,12 @@ pub fn check_for_update() -> Result<Option<UpdateInfo>> {
     }
 }
 
+/// Tag of the latest published release (e.g. `v0.8.0`), without picking an
+/// asset. Used by the background notifier.
+pub(crate) fn latest_tag() -> Result<String> {
+    Ok(fetch_latest_release()?.tag_name)
+}
+
 /// Check for update and print result inline (for `takka update --check`).
 pub fn check_and_print() -> Result<()> {
     inline::print_blank();
@@ -276,7 +282,7 @@ fn install_binary(tmp_path: &Path) -> Result<()> {
 
 /// Returns `true` if `remote_tag` (e.g. "v0.3.0") is newer than
 /// `local_version` (e.g. "0.2.0").
-fn is_newer(remote_tag: &str, local_version: &str) -> Result<bool> {
+pub(crate) fn is_newer(remote_tag: &str, local_version: &str) -> Result<bool> {
     let remote = parse_version(trim_v_prefix(remote_tag))?;
     let local = parse_version(local_version)?;
 
