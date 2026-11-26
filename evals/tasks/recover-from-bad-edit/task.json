@@ -1,0 +1,16 @@
+{
+  "id": "recover-from-bad-edit",
+  "prompt": "version.txt holds the version. Bump it from 1.0 to 1.1. Do not edit test.sh.",
+  "tags": [
+    "bugfix",
+    "error-recovery",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  }
+}

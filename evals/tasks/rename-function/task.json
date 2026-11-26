@@ -1,0 +1,16 @@
+{
+  "id": "rename-function",
+  "prompt": "Rename the shell function calc_total to compute_total in every file that uses it. Behaviour must not change. Do not edit test.sh.",
+  "tags": [
+    "refactor",
+    "multi-file",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  }
+}

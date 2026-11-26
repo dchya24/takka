@@ -108,7 +108,7 @@ Two deliverables, in dependency order:
   when:* `cargo run -p takka-eval -- --lane replay` passes on that task.
 - **B2** Metrics extraction from the event stream + summary table + unit tests
   over canned event sequences.
-- **B3** Seed suite of 8–12 tasks covering: bugfix, small feature, refactor,
+- **B3 (done, with caveats below)** Seed suite of 8–12 tasks covering: bugfix, small feature, refactor,
   multi-file edit, "needs exploration", a task that tempts loops (should trigger
   P-01 nudge), a transient-failure task (P-02), and a budget-tight task (P-06).
   Record cassettes with one real model.
@@ -137,6 +137,25 @@ Two deliverables, in dependency order:
   already in the workspace.
 - Seed tasks use POSIX `sh` fixtures so verification is fast and needs no
   per-task toolchain build.
+
+## B3 outcome and caveats
+
+- Nine `sh`-fixture tasks ship in `evals/tasks/`: bugfix, new-file feature,
+  flag feature, multi-file edit, rename refactor, exploration, error recovery,
+  a loop-thrash task (`expect.min_loop_nudges`), and a tight-budget task
+  (`expect.max_iterations_used`).
+- **Cassettes are hand-authored, not recorded.** Recording needs a real provider
+  and credentials, which must not be used from an unattended session. They
+  exercise the harness and orchestrator wiring; they say nothing about model
+  quality. Run the live lane (B5) to get real numbers, and re-record with
+  `CassetteProvider::record` when a cassette should reflect a real model.
+- **No seed task for transient auto-retry (P-02).** It cannot be triggered
+  deterministically offline: `run_command` timeouts come back as an `Ok` JSON
+  result (not `Tool error:`), and `fetch` connection failures surface reqwest's
+  top-level message only ("error sending request for url ..."), which the
+  transient classifier's markers do not match. P-02 stays covered by the core
+  stub-tool test. The `fetch` wording gap is a likely real bug worth its own
+  fix (`providers::reqwest_chain` already shows the pattern).
 
 ## Order and size
 

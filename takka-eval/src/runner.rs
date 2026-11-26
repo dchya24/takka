@@ -3,7 +3,7 @@
 
 use crate::child::{ChildOutcome, ProviderSource};
 use crate::metrics::{self, Metrics};
-use crate::task::Task;
+use crate::task::{ExpectSpec, Task};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -158,6 +158,10 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         .map(|o| metrics::from_events(&o.events, &model))
         .unwrap_or_default();
 
+    if failure.is_none() {
+        failure = check_expectations(&metrics, &task.spec.expect);
+    }
+
     Ok(TaskResult {
         id: task.spec.id.clone(),
         tags: task.spec.tags.clone(),
@@ -171,6 +175,36 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         model,
         metrics,
     })
+}
+
+/// `Some(reason)` when the run did not exhibit the behaviour a task expects.
+pub fn check_expectations(m: &Metrics, e: &ExpectSpec) -> Option<String> {
+    if m.loop_nudges < e.min_loop_nudges {
+        return Some(format!(
+            "expected at least {} loop nudge(s), saw {}",
+            e.min_loop_nudges, m.loop_nudges
+        ));
+    }
+    if m.auto_retries < e.min_auto_retries {
+        return Some(format!(
+            "expected at least {} auto-retry annotation(s), saw {}",
+            e.min_auto_retries, m.auto_retries
+        ));
+    }
+    if let Some(max) = e.max_iterations_used {
+        if m.iterations > max {
+            return Some(format!(
+                "expected at most {max} iterations, used {}",
+                m.iterations
+            ));
+        }
+    }
+    if let Some(want) = &e.limit_hit {
+        if m.limit_hit.as_deref() != Some(want.as_str()) {
+            return Some(format!("expected limit {want:?}, saw {:?}", m.limit_hit));
+        }
+    }
+    None
 }
 
 fn failed_result(task: &Task, model: &Option<String>, reason: String) -> TaskResult {
@@ -346,6 +380,48 @@ mod tests {
         let status = wait_timeout(&mut child, Duration::from_millis(100)).unwrap();
         assert!(status.is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn expectations_pass_by_default_and_fail_when_unmet() {
+        let m = Metrics {
+            iterations: 5,
+            loop_nudges: 1,
+            ..Default::default()
+        };
+        assert_eq!(check_expectations(&m, &ExpectSpec::default()), None);
+        let ok = ExpectSpec {
+            min_loop_nudges: 1,
+            max_iterations_used: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(check_expectations(&m, &ok), None);
+        let nudges = ExpectSpec {
+            min_loop_nudges: 2,
+            ..Default::default()
+        };
+        assert!(check_expectations(&m, &nudges)
+            .unwrap()
+            .contains("loop nudge"));
+        let retries = ExpectSpec {
+            min_auto_retries: 1,
+            ..Default::default()
+        };
+        assert!(check_expectations(&m, &retries)
+            .unwrap()
+            .contains("auto-retry"));
+        let iters = ExpectSpec {
+            max_iterations_used: Some(4),
+            ..Default::default()
+        };
+        assert!(check_expectations(&m, &iters)
+            .unwrap()
+            .contains("at most 4"));
+        let limit = ExpectSpec {
+            limit_hit: Some("cost".into()),
+            ..Default::default()
+        };
+        assert!(check_expectations(&m, &limit).unwrap().contains("limit"));
     }
 
     #[test]

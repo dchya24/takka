@@ -22,6 +22,23 @@ pub struct VerifySpec {
     pub forbid_paths: Vec<String>,
 }
 
+/// Behaviour the run must exhibit besides passing verification. Used by tasks
+/// that exist to exercise one orchestrator feature (loop nudge, auto-retry,
+/// budget wind-down); unmet expectations fail the task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExpectSpec {
+    #[serde(default)]
+    pub min_loop_nudges: u32,
+    #[serde(default)]
+    pub min_auto_retries: u32,
+    /// The run must finish within this many provider round trips.
+    #[serde(default)]
+    pub max_iterations_used: Option<u32>,
+    /// Exact limit that must have ended the run (`cost`, `max_turn_requests`, ...).
+    #[serde(default)]
+    pub limit_hit: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpec {
     pub id: String,
@@ -40,6 +57,8 @@ pub struct TaskSpec {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     pub verify: VerifySpec,
+    #[serde(default)]
+    pub expect: ExpectSpec,
 }
 
 #[derive(Debug, Clone)]
