@@ -66,16 +66,19 @@ Two deliverables, in dependency order:
 ### Design
 - New workspace crate `takka-eval` (binary + library). Not part of the shipped
   `takka` binary; keeps `takka-core` free of eval-only dependencies.
-- **Task spec** (`evals/tasks/<id>/task.toml` + `repo/` fixture):
-  ```toml
-  id = "fix-off-by-one"
-  prompt = "The test in tests/pagination.rs fails. Fix the bug."
-  tags = ["bugfix", "rust"]
-  max_iterations = 20
-  max_cost_usd = 0.50
-  [verify]
-  command = "cargo test --quiet"      # exit 0 = success
-  forbid_paths = ["tests/"]           # agent must not edit tests
+- **Task spec** (`evals/tasks/<id>/task.json` + `repo/` fixture):
+  ```json
+  {
+    "id": "fix-off-by-one",
+    "prompt": "The test in tests/pagination.rs fails. Fix the bug.",
+    "tags": ["bugfix", "rust"],
+    "max_iterations": 20,
+    "max_cost_usd": 0.50,
+    "verify": {
+      "command": "cargo test --quiet",
+      "forbid_paths": ["tests/"]
+    }
+  }
   ```
 - **Runner**: copy fixture to a temp dir, build a hermetic engine config
   (cwd = temp dir, `permission_mode = yolo`, safety sandbox paths = temp dir),
@@ -96,7 +99,7 @@ Two deliverables, in dependency order:
     actually compare model/prompt/orchestrator changes. Never in default CI.
 
 ### Steps
-- **B0** Spike (½ day): confirm the cleanest headless entry point —
+- **B0 (done)** Spike (½ day): confirm the cleanest headless entry point —
   `Engine::with_provider` over an in-memory `Transport` vs `Orchestrator::run`
   directly. Write findings to this doc. *Done when:* a 20-line example runs one
   scripted task in a temp dir and prints its events.
@@ -115,6 +118,25 @@ Two deliverables, in dependency order:
   `max_cost_usd`, repeat count `--n` for variance.
 - **B6** CI wiring for the replay lane — **touches `.github/`; ask first.**
   Until approved, document the command in `CONTRIBUTING.md`.
+
+## B0 findings (spike result)
+
+- `Engine::initialize` hard-wires `OpenAIProvider` from the ambient config and
+  reads project instructions, skills and persistent memory from the developer's
+  machine. It is the wrong entry point for a hermetic eval.
+- Drive `Orchestrator` directly: inject any `Arc<dyn LLMProvider>`, register
+  `builtin_tools_with_deps(ToolDeps::new())`, `PermissionMode::Yolo`, a prompt
+  from `assemble_system_prompt(None, None, None, None)`, and collect `Event`s
+  via `on_event` (events are `Serialize`).
+- Builtin tools resolve relative paths against the **process cwd**, which is not
+  safe to change in a shared process. Each task therefore runs in a **child
+  process** (`takka-eval child`, re-exec of the same binary) with the temp
+  workdir as cwd. The parent verifies independently and derives metrics from the
+  child's serialized events.
+- Task specs are `task.json`, not TOML: no new dependency, and `serde_json` is
+  already in the workspace.
+- Seed tasks use POSIX `sh` fixtures so verification is fast and needs no
+  per-task toolchain build.
 
 ## Order and size
 

@@ -4,6 +4,7 @@ members = [
     "takka-core",
     "takka-cli",
     "takka-runtime",
+    "takka-eval",
 ]
 
 [workspace.package]

@@ -2310,6 +2310,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "takka-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "takka-core",
+ "tempfile",
+]
+
+[[package]]
 name = "takka-runtime"
 version = "0.1.0"
 dependencies = [
