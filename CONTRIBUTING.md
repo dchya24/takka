@@ -17,10 +17,24 @@ cargo audit   # if installed
 
 The CI pipeline runs exactly these checks, so passing locally means a green PR.
 
+### Agent evals
+
+`takka-eval` runs a fixed task suite against the agent loop and reports pass
+rate, iterations, tool calls, cost and loop-detector hits. The replay lane is
+hermetic (no network, no credentials) and is what a normal PR should run:
+
+```sh
+cargo run -p takka-eval -- run --baseline evals/baselines/replay.jsonl
+```
+
+It also runs as part of `cargo test --workspace` on Unix. See `evals/README.md`
+for the live lane, task layout and cassettes.
+
 ## Project Layout
 
 - `takka-core/` — library crate with the agent core (memory, tools, safety, model providers)
 - `takka-cli/` — binary crate (`takka`) providing the interactive CLI
+- `takka-eval/` — eval harness (`evals/` holds its tasks and baselines)
 
 ## Code Style
 

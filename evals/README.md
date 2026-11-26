@@ -56,3 +56,19 @@ replay fail until the cassette is re-recorded.
 `evals/baselines/replay.jsonl` is the replay lane's last accepted result. Replay
 is deterministic, so it guards harness and orchestrator plumbing; compare live
 runs against a live baseline of your own, never against this one.
+
+## Running the real engine against a cassette (developer switch)
+
+The same cassettes can drive the real `takka` engine, REPL or daemon without
+code changes. This is a developer tool, not a user feature:
+
+```bash
+TAKKA_CASSETTE=/tmp/session.jsonl takka interactive   # auto: records, then replays
+TAKKA_CASSETTE=/tmp/session.jsonl TAKKA_CASSETTE_MODE=replay takka run "..."
+```
+
+`TAKKA_CASSETTE_MODE` is `replay`, `record` or `auto` (default: replay when the
+file exists, else record; `record` always starts a fresh file). Set
+`TAKKA_CASSETTE_LOOSE=1` to replay by sequence and ignore fingerprints. An
+invalid setting is an error rather than a silent fall back to the real
+provider, and model switching is refused while the switch is on.

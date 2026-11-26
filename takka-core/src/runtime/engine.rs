@@ -673,7 +673,11 @@ impl<T: Transport> RuntimeEngine<T> {
             .model
             .clone()
             .unwrap_or_else(|| provider_config.default_model.clone());
-        let provider: Arc<dyn LLMProvider> = Arc::new(OpenAIProvider::new(provider_config));
+        // Developer switch (`TAKKA_CASSETTE`): replay/record this session.
+        let provider = crate::providers::wrap_provider_from_env(Arc::new(OpenAIProvider::new(
+            provider_config,
+        )))
+        .map_err(|e| e.to_string())?;
 
         let cancel = Arc::new(AtomicBool::new(false));
         let mut deps = self.runtime_tool_deps();
@@ -1139,6 +1143,14 @@ fn apply_session_model(
     provider_name: &str,
     model_id: &str,
 ) -> Result<(), String> {
+    // Rebuilding the provider would drop the cassette (or, recording, truncate
+    // it), so refuse before touching the persisted config.
+    if crate::providers::cassette_env_active() {
+        return Err(format!(
+            "switching models is unavailable while {} is set",
+            crate::providers::cassette::ENV_CASSETTE
+        ));
+    }
     let (active_provider, active_model) = session_config.activate_model(provider_name, model_id)?;
     let _ = active_provider;
     // Persist the reorder so a restart keeps the choice. Best-effort: a

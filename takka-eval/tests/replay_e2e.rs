@@ -1,4 +1,7 @@
 //! End-to-end: the real binary, real child process, replay lane.
+//!
+//! Unix only: fixtures and verify commands are POSIX `sh`.
+#![cfg(unix)]
 
 use serde_json::json;
 use std::path::Path;

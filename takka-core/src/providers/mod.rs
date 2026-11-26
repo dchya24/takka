@@ -13,6 +13,7 @@ pub use cassette::{
     chunks_from_response, request_fingerprint, response_from_chunks, scrub, CassetteProvider,
     Exchange,
 };
+pub use cassette::{env_active as cassette_env_active, wrap_from_env as wrap_provider_from_env};
 pub use openai::{OpenAIProvider, OpenAIProviderConfig};
 
 use serde::{Deserialize, Serialize};

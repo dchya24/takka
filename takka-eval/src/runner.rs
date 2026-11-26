@@ -425,6 +425,7 @@ mod tests {
         assert_eq!(hit, vec!["src/x"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn wait_timeout_kills_a_hung_process() {
         let mut child = Command::new("sh")

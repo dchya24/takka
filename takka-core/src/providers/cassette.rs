@@ -346,6 +346,77 @@ impl CassetteProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Developer switch (environment)
+// ---------------------------------------------------------------------------
+//
+// Deliberately undocumented outside this file and the eval README: it exists
+// to run the real engine/CLI/daemon against a cassette without code changes.
+//
+//   TAKKA_CASSETTE=<path>          enable (unset = feature is off)
+//   TAKKA_CASSETTE_MODE=<mode>     `replay`, `record`, or `auto` (default):
+//                                  `auto` replays when the file exists and
+//                                  records when it does not
+//   TAKKA_CASSETTE_LOOSE=1         replay by sequence only (ignore fingerprints)
+
+/// Environment variable that enables the cassette developer switch.
+pub const ENV_CASSETTE: &str = "TAKKA_CASSETTE";
+/// `replay`, `record` or `auto` (default).
+pub const ENV_CASSETTE_MODE: &str = "TAKKA_CASSETTE_MODE";
+/// Any non-empty value other than `0` replays by sequence only.
+pub const ENV_CASSETTE_LOOSE: &str = "TAKKA_CASSETTE_LOOSE";
+
+/// Whether the cassette developer switch is on for this process.
+pub fn env_active() -> bool {
+    std::env::var(ENV_CASSETTE).is_ok_and(|v| !v.is_empty())
+}
+
+/// Wrap `inner` according to the environment. Returns `inner` unchanged when
+/// the switch is off; an invalid setting is an error, never a silent fall
+/// back to the real provider (which would spend money the caller expected a
+/// cassette to cover).
+pub fn wrap_from_env(inner: Arc<dyn LLMProvider>) -> ProviderResult<Arc<dyn LLMProvider>> {
+    let path = std::env::var(ENV_CASSETTE).ok().filter(|v| !v.is_empty());
+    let mode = std::env::var(ENV_CASSETTE_MODE).ok();
+    let loose = std::env::var(ENV_CASSETTE_LOOSE).is_ok_and(|v| !v.is_empty() && v != "0");
+    wrap_with(inner, path.as_deref(), mode.as_deref(), loose)
+}
+
+fn wrap_with(
+    inner: Arc<dyn LLMProvider>,
+    path: Option<&str>,
+    mode: Option<&str>,
+    loose: bool,
+) -> ProviderResult<Arc<dyn LLMProvider>> {
+    let Some(path) = path else {
+        return Ok(inner);
+    };
+    let exists = Path::new(path).is_file();
+    let replay = match mode.unwrap_or("auto") {
+        "replay" => {
+            if !exists {
+                return Err(ProviderError::new(format!(
+                    "{ENV_CASSETTE_MODE}=replay but cassette {path} does not exist"
+                )));
+            }
+            true
+        }
+        "record" => false,
+        "auto" => exists,
+        other => {
+            return Err(ProviderError::new(format!(
+                "{ENV_CASSETTE_MODE}={other:?} is invalid (expected replay, record or auto)"
+            )))
+        }
+    };
+    if replay {
+        let p = CassetteProvider::from_path(path)?;
+        Ok(Arc::new(if loose { p.loose() } else { p }))
+    } else {
+        Ok(Arc::new(CassetteProvider::record(inner, path)?))
+    }
+}
+
 /// Appends scrubbed exchanges to the cassette file.
 struct Recorder {
     path: PathBuf,
@@ -849,5 +920,74 @@ mod tests {
             scrub("short and plain", &["short".to_string()]),
             "short and plain"
         );
+    }
+
+    // ---- environment switch ------------------------------------------
+
+    #[test]
+    fn env_switch_off_returns_inner_untouched() {
+        let inner = fake("live");
+        let out = wrap_with(inner.clone(), None, Some("record"), false).unwrap();
+        assert!(Arc::ptr_eq(&inner, &out));
+    }
+
+    #[test]
+    fn env_auto_records_then_replays() {
+        let (_d, path) = tmp_cassette();
+        let p = path.to_str().unwrap();
+        // First run: file missing -> record through to the live provider.
+        let first = wrap_with(fake("from live"), Some(p), None, false).unwrap();
+        assert_eq!(text_of(&first.chat(req("q")).unwrap()), "from live");
+        // Second run: file exists -> replay, the live provider is not used.
+        let second = wrap_with(fake("WRONG"), Some(p), None, false).unwrap();
+        assert_eq!(text_of(&second.chat(req("q")).unwrap()), "from live");
+    }
+
+    #[test]
+    fn env_replay_requires_existing_cassette() {
+        let (_d, path) = tmp_cassette();
+        let err = wrap_with(
+            fake("x"),
+            Some(path.to_str().unwrap()),
+            Some("replay"),
+            false,
+        )
+        .err()
+        .expect("must fail");
+        assert!(err.0.contains("does not exist"), "{}", err.0);
+    }
+
+    #[test]
+    fn env_record_overwrites_and_invalid_mode_errors() {
+        let (_d, path) = tmp_cassette();
+        let p = path.to_str().unwrap();
+        wrap_with(fake("one"), Some(p), Some("record"), false)
+            .unwrap()
+            .chat(req("a"))
+            .unwrap();
+        // `record` starts a fresh file even though one exists.
+        let again = wrap_with(fake("two"), Some(p), Some("record"), false).unwrap();
+        again.chat(req("b")).unwrap();
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(lines, 1);
+
+        let err = wrap_with(fake("x"), Some(p), Some("bogus"), false)
+            .err()
+            .expect("must fail");
+        assert!(err.0.contains("invalid"), "{}", err.0);
+    }
+
+    #[test]
+    fn env_loose_replays_despite_changed_prompt() {
+        let (_d, path) = tmp_cassette();
+        let p = path.to_str().unwrap();
+        wrap_with(fake("ans"), Some(p), Some("record"), false)
+            .unwrap()
+            .chat(req("original"))
+            .unwrap();
+        let strict = wrap_with(fake("x"), Some(p), Some("replay"), false).unwrap();
+        assert!(strict.chat(req("changed")).is_err());
+        let loose = wrap_with(fake("x"), Some(p), Some("replay"), true).unwrap();
+        assert_eq!(text_of(&loose.chat(req("changed")).unwrap()), "ans");
     }
 }
