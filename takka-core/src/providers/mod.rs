@@ -10,7 +10,8 @@ pub use anthropic::{
     AnthropicStreamMessage, AnthropicUsage, RetryConfig,
 };
 pub use cassette::{
-    chunks_from_response, request_fingerprint, response_from_chunks, CassetteProvider, Exchange,
+    chunks_from_response, request_fingerprint, response_from_chunks, scrub, CassetteProvider,
+    Exchange,
 };
 pub use openai::{OpenAIProvider, OpenAIProviderConfig};
 

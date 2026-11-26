@@ -15,8 +15,16 @@
 //! * an exchange with recorded `chunks` is replayed chunk by chunk for
 //!   `chat_stream()` and folded into a `ChatResponse` for `chat()`.
 //!
-//! Record mode is a separate step of
-//! `docs/superpowers/plans/2026-11-26-eval-harness-and-record-replay.md`.
+//! # Recording
+//!
+//! [`CassetteProvider::record`] wraps a real provider and appends every
+//! exchange to a cassette file (the file is truncated when recording starts).
+//! `chat()` calls are stored as a `response`, `chat_stream()` calls as the
+//! observed `chunks`, written when the stream ends cleanly (a stream that
+//! errors midway is not recorded). Each line is passed through [`scrub`]
+//! before it reaches disk: only request/response bodies are ever stored,
+//! never headers or config, and API-key-shaped strings and the values of
+//! secret-looking environment variables are replaced with `[REDACTED]`.
 //!
 //! # Strictness
 //!
@@ -37,8 +45,10 @@ use crate::runtime::pipe_id::fnv1a64;
 use crate::sync;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 
 /// How many trailing messages feed the fingerprint. Earlier messages are
 /// covered transitively (they produced the later ones) and excluding them
@@ -195,6 +205,8 @@ pub fn request_fingerprint(req: &ChatRequest) -> String {
 pub struct CassetteProvider {
     queue: Mutex<VecDeque<Exchange>>,
     strict: bool,
+    /// `Some` in record mode: the wrapped provider and the cassette writer.
+    recording: Option<(Arc<dyn LLMProvider>, Arc<Recorder>)>,
 }
 
 impl CassetteProvider {
@@ -213,6 +225,7 @@ impl CassetteProvider {
         Ok(Self {
             queue: Mutex::new(exchanges),
             strict: true,
+            recording: None,
         })
     }
 
@@ -229,7 +242,32 @@ impl CassetteProvider {
         Self {
             queue: Mutex::new(exchanges.into()),
             strict: true,
+            recording: None,
         }
+    }
+
+    /// Record mode: forward every call to `inner` and append the exchange to
+    /// the cassette at `path`, truncating any existing file first.
+    pub fn record(inner: Arc<dyn LLMProvider>, path: impl Into<PathBuf>) -> ProviderResult<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ProviderError::new(format!("cassette {}: {e}", path.display())))?;
+            }
+        }
+        std::fs::File::create(&path)
+            .map_err(|e| ProviderError::new(format!("cassette {}: {e}", path.display())))?;
+        let recorder = Arc::new(Recorder {
+            path,
+            next_seq: Mutex::new(0),
+            extra_secrets: secrets_from_env(),
+        });
+        Ok(Self {
+            queue: Mutex::new(VecDeque::new()),
+            strict: true,
+            recording: Some((inner, recorder)),
+        })
     }
 
     /// Ignore fingerprints and replay purely by sequence.
@@ -254,10 +292,27 @@ impl LLMProvider for CassetteProvider {
     }
 
     fn chat(&self, request: ChatRequest) -> ProviderResult<ChatResponse> {
+        if let Some((inner, recorder)) = &self.recording {
+            let fingerprint = request_fingerprint(&request);
+            let response = inner.chat(request)?;
+            recorder.append(fingerprint, Some(response.clone()), Vec::new())?;
+            return Ok(response);
+        }
         self.take_next(&request)?.to_response()
     }
 
     fn chat_stream(&self, request: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
+        if let Some((inner, recorder)) = &self.recording {
+            let fingerprint = request_fingerprint(&request);
+            let stream = inner.chat_stream(request)?;
+            return Ok(Box::pin(RecordingStream {
+                inner: stream,
+                chunks: Vec::new(),
+                recorder: recorder.clone(),
+                fingerprint,
+                finished: false,
+            }));
+        }
         let chunks = self.take_next(&request)?.to_chunks()?;
         Ok(Box::pin(futures::stream::iter(
             chunks.into_iter().map(Ok::<_, ProviderError>),
@@ -289,6 +344,128 @@ impl CassetteProvider {
         }
         Ok(q.pop_front().expect("front() was Some"))
     }
+}
+
+/// Appends scrubbed exchanges to the cassette file.
+struct Recorder {
+    path: PathBuf,
+    next_seq: Mutex<usize>,
+    extra_secrets: Vec<String>,
+}
+
+impl Recorder {
+    fn append(
+        &self,
+        fingerprint: String,
+        response: Option<ChatResponse>,
+        chunks: Vec<ChatChunk>,
+    ) -> ProviderResult<()> {
+        use std::io::Write;
+        // Hold the lock across the write so seq order matches file order.
+        let mut seq = sync::lock(&self.next_seq);
+        let exchange = Exchange {
+            seq: *seq,
+            fingerprint: Some(fingerprint),
+            response,
+            chunks,
+        };
+        let line = serde_json::to_string(&exchange)
+            .map_err(|e| ProviderError::new(format!("cassette encode: {e}")))?;
+        let line = scrub(&line, &self.extra_secrets);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| ProviderError::new(format!("cassette {}: {e}", self.path.display())))?;
+        writeln!(file, "{line}")
+            .map_err(|e| ProviderError::new(format!("cassette {}: {e}", self.path.display())))?;
+        *seq += 1;
+        Ok(())
+    }
+}
+
+/// Passes chunks through unchanged and records them once the stream ends.
+struct RecordingStream {
+    inner: Pin<Box<dyn futures::Stream<Item = Result<ChatChunk, ProviderError>> + Send + Sync>>,
+    chunks: Vec<ChatChunk>,
+    recorder: Arc<Recorder>,
+    fingerprint: String,
+    /// Set after the exchange is written, or after an error (not recorded).
+    finished: bool,
+}
+
+impl futures::Stream for RecordingStream {
+    type Item = Result<ChatChunk, ProviderError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.chunks.push(chunk.clone());
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                if !this.finished {
+                    this.finished = true;
+                    let chunks = std::mem::take(&mut this.chunks);
+                    if let Err(e) = this.recorder.append(this.fingerprint.clone(), None, chunks) {
+                        log::warn!("cassette: failed to record stream: {e}");
+                    }
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+const REDACTED: &str = "[REDACTED]";
+/// Environment values shorter than this are not treated as secrets (avoids
+/// redacting things like `KEY=1`).
+const MIN_SECRET_LEN: usize = 12;
+
+fn secret_patterns() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(concat!(
+            r"sk-[A-Za-z0-9_-]{16,}",
+            r"|gh[pousr]_[A-Za-z0-9]{20,}",
+            r"|AKIA[0-9A-Z]{16}",
+            r"|xox[abprs]-[A-Za-z0-9-]{10,}",
+            r"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,}",
+        ))
+        .expect("static secret regex is valid")
+    })
+}
+
+/// Values of environment variables whose names look secret.
+fn secrets_from_env() -> Vec<String> {
+    std::env::vars()
+        .filter(|(k, v)| {
+            let k = k.to_ascii_uppercase();
+            v.len() >= MIN_SECRET_LEN
+                && ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+                    .iter()
+                    .any(|w| k.contains(w))
+        })
+        .map(|(_, v)| v)
+        .collect()
+}
+
+/// Replace API-key-shaped strings and every occurrence of `extra_secrets`
+/// with `[REDACTED]`. Applied to the serialized JSON line; replacements
+/// contain no quote or backslash, so the line stays valid JSON.
+pub fn scrub(text: &str, extra_secrets: &[String]) -> String {
+    let mut out = secret_patterns().replace_all(text, REDACTED).into_owned();
+    for s in extra_secrets {
+        if s.len() >= MIN_SECRET_LEN {
+            out = out.replace(s.as_str(), REDACTED);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -534,5 +711,143 @@ mod tests {
         }]);
         let err = p.chat(req("x")).unwrap_err();
         assert!(err.0.contains("seq 3"), "{}", err.0);
+    }
+
+    // ---- record mode -------------------------------------------------
+
+    /// Provider that returns fixed responses/chunks, standing in for a real one.
+    struct Fake {
+        text: String,
+        stream_chunks: Vec<ChatChunk>,
+        fail_stream: bool,
+    }
+    impl LLMProvider for Fake {
+        fn provider_type(&self) -> &str {
+            "fake"
+        }
+        fn provider_id(&self) -> &str {
+            "fake"
+        }
+        fn chat(&self, _r: ChatRequest) -> ProviderResult<ChatResponse> {
+            Ok(resp(&self.text))
+        }
+        fn chat_stream(&self, _r: ChatRequest) -> StreamResult<ChatChunk, ProviderError> {
+            let mut items: Vec<Result<ChatChunk, ProviderError>> =
+                self.stream_chunks.iter().cloned().map(Ok).collect();
+            if self.fail_stream {
+                items.push(Err(ProviderError::new("boom")));
+            }
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+    }
+
+    fn fake(text: &str) -> Arc<dyn LLMProvider> {
+        Arc::new(Fake {
+            text: text.into(),
+            stream_chunks: vec![chunk("a", vec![], None), chunk("b", vec![], Some("stop"))],
+            fail_stream: false,
+        })
+    }
+
+    fn tmp_cassette() -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("nested/dir/c.jsonl");
+        (d, p)
+    }
+
+    #[test]
+    fn record_then_replay_round_trip_is_strict() {
+        let (_d, path) = tmp_cassette();
+        let rec = CassetteProvider::record(fake("recorded answer"), &path).unwrap();
+        let live = rec.chat(req("question")).unwrap();
+        assert_eq!(text_of(&live), "recorded answer");
+
+        let replay = CassetteProvider::from_path(&path).unwrap();
+        assert_eq!(replay.remaining(), 1);
+        // Same request replays...
+        assert_eq!(
+            text_of(&replay.chat(req("question")).unwrap()),
+            "recorded answer"
+        );
+        // ...a changed prompt is rejected by the recorded fingerprint.
+        let replay = CassetteProvider::from_path(&path).unwrap();
+        let err = replay.chat(req("different question")).unwrap_err();
+        assert!(err.0.contains("mismatch at seq 0"), "{}", err.0);
+    }
+
+    #[test]
+    fn record_assigns_increasing_seq_and_truncates_old_file() {
+        let (_d, path) = tmp_cassette();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "stale garbage\n").unwrap();
+        let rec = CassetteProvider::record(fake("x"), &path).unwrap();
+        rec.chat(req("1")).unwrap();
+        rec.chat(req("2")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let seqs: Vec<usize> = text
+            .lines()
+            .map(|l| serde_json::from_str::<Exchange>(l).unwrap().seq)
+            .collect();
+        assert_eq!(seqs, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn record_stream_then_replay_chunks() {
+        let (_d, path) = tmp_cassette();
+        let rec = CassetteProvider::record(fake("unused"), &path).unwrap();
+        let live = collect(&rec, req("q")).await;
+        assert_eq!(live.len(), 2);
+
+        let replay = CassetteProvider::from_path(&path).unwrap();
+        let replayed = collect(&replay, req("q")).await;
+        let deltas: Vec<&str> = replayed.iter().map(|c| c.delta.as_str()).collect();
+        assert_eq!(deltas, vec!["a", "b"]);
+        assert_eq!(replayed[1].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test]
+    async fn failed_stream_is_not_recorded() {
+        use futures::StreamExt;
+        let (_d, path) = tmp_cassette();
+        let inner: Arc<dyn LLMProvider> = Arc::new(Fake {
+            text: String::new(),
+            stream_chunks: vec![chunk("a", vec![], None)],
+            fail_stream: true,
+        });
+        let rec = CassetteProvider::record(inner, &path).unwrap();
+        let items: Vec<_> = rec.chat_stream(req("q")).unwrap().collect().await;
+        assert!(items.last().unwrap().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn recorded_secrets_are_scrubbed_but_line_stays_valid() {
+        let (_d, path) = tmp_cassette();
+        let rec = CassetteProvider::record(
+            fake("here is the key sk-abcdefghijklmnopqrstuvwxyz0123 and Bearer abcdefghijklmnop12345"),
+            &path,
+        )
+        .unwrap();
+        rec.chat(req("q")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("sk-abcdefghijkl"), "{text}");
+        assert!(!text.contains("abcdefghijklmnop12345"), "{text}");
+        assert!(text.contains(REDACTED));
+        // Still parses.
+        CassetteProvider::from_jsonl(&text).unwrap();
+    }
+
+    #[test]
+    fn scrub_handles_patterns_and_extra_secrets() {
+        let out = scrub(
+            "ghp_abcdefghijklmnopqrstuv AKIAABCDEFGHIJKLMNOP my-env-secret-value-1234 ok",
+            &["my-env-secret-value-1234".to_string(), "short".to_string()],
+        );
+        assert_eq!(out, format!("{r} {r} {r} ok", r = REDACTED));
+        // Short extras are ignored, ordinary text is untouched.
+        assert_eq!(
+            scrub("short and plain", &["short".to_string()]),
+            "short and plain"
+        );
     }
 }
