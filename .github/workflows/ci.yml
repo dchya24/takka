@@ -68,6 +68,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: bash scripts/acp-conformance.sh
 
+  # Agent eval harness, replay lane: hermetic (cassettes, no network, no
+  # credentials). Fails when a task fails or the run regresses against the
+  # committed baseline. POSIX only: fixtures and verify commands use `sh`.
+  evals-replay:
+    name: Evals (replay)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p takka-eval -- run --baseline evals/baselines/replay.jsonl
+
   installers:
     name: Installer scripts
     strategy:
