@@ -188,7 +188,12 @@ impl Tool for WebSearchTool {
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
-            .map_err(|e| ToolError::new(format!("HTTP client error: {}", e)))?;
+            .map_err(|e| {
+                ToolError::new(format!(
+                    "HTTP client error: {}",
+                    crate::providers::reqwest_chain(&e)
+                ))
+            })?;
 
         let hits = match backend {
             Backend::Tavily => search_tavily(&client, query, max_results)?,
@@ -313,7 +318,12 @@ fn search_tavily(
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
-        .map_err(|e| ToolError::new(format!("Tavily request failed: {}", e)))?;
+        .map_err(|e| {
+            ToolError::new(format!(
+                "Tavily request failed: {}",
+                crate::providers::reqwest_chain(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(ToolError::new(format!(
@@ -322,9 +332,12 @@ fn search_tavily(
         )));
     }
 
-    let parsed: TavilyResponse = resp
-        .json()
-        .map_err(|e| ToolError::new(format!("Tavily response parse error: {}", e)))?;
+    let parsed: TavilyResponse = resp.json().map_err(|e| {
+        ToolError::new(format!(
+            "Tavily response parse error: {}",
+            crate::providers::reqwest_chain(&e)
+        ))
+    })?;
 
     Ok(parsed
         .results
@@ -374,7 +387,12 @@ fn search_brave(
         .header("Accept", "application/json")
         .query(&[("q", query), ("count", &max_results.to_string())])
         .send()
-        .map_err(|e| ToolError::new(format!("Brave request failed: {}", e)))?;
+        .map_err(|e| {
+            ToolError::new(format!(
+                "Brave request failed: {}",
+                crate::providers::reqwest_chain(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(ToolError::new(format!(
@@ -383,9 +401,12 @@ fn search_brave(
         )));
     }
 
-    let parsed: BraveResponse = resp
-        .json()
-        .map_err(|e| ToolError::new(format!("Brave response parse error: {}", e)))?;
+    let parsed: BraveResponse = resp.json().map_err(|e| {
+        ToolError::new(format!(
+            "Brave response parse error: {}",
+            crate::providers::reqwest_chain(&e)
+        ))
+    })?;
 
     Ok(parsed
         .web
@@ -423,7 +444,12 @@ fn search_duckduckgo(
         .get("https://html.duckduckgo.com/html/")
         .query(&[("q", query)])
         .send()
-        .map_err(|e| ToolError::new(format!("DuckDuckGo request failed: {}", e)))?;
+        .map_err(|e| {
+            ToolError::new(format!(
+                "DuckDuckGo request failed: {}",
+                crate::providers::reqwest_chain(&e)
+            ))
+        })?;
 
     if !resp.status().is_success() {
         return Err(ToolError::new(format!(
@@ -432,9 +458,12 @@ fn search_duckduckgo(
         )));
     }
 
-    let html = resp
-        .text()
-        .map_err(|e| ToolError::new(format!("Failed to read DuckDuckGo body: {}", e)))?;
+    let html = resp.text().map_err(|e| {
+        ToolError::new(format!(
+            "Failed to read DuckDuckGo body: {}",
+            crate::providers::reqwest_chain(&e)
+        ))
+    })?;
 
     Ok(parse_duckduckgo_html(&html, max_results))
 }

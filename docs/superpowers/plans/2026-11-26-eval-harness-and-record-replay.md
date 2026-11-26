@@ -149,13 +149,13 @@ Two deliverables, in dependency order:
   exercise the harness and orchestrator wiring; they say nothing about model
   quality. Run the live lane (B5) to get real numbers, and re-record with
   `CassetteProvider::record` when a cassette should reflect a real model.
-- **No seed task for transient auto-retry (P-02).** It cannot be triggered
-  deterministically offline: `run_command` timeouts come back as an `Ok` JSON
-  result (not `Tool error:`), and `fetch` connection failures surface reqwest's
-  top-level message only ("error sending request for url ..."), which the
-  transient classifier's markers do not match. P-02 stays covered by the core
-  stub-tool test. The `fetch` wording gap is a likely real bug worth its own
-  fix (`providers::reqwest_chain` already shows the pattern).
+- **Transient auto-retry (P-02) is covered by `transient-retry`**, which fetches
+  a closed local port (`expect.min_auto_retries`). It was missing at first
+  because `fetch` surfaced only reqwest's top-level message ("error sending
+  request for url ..."), which the transient classifier could not match; `fetch`
+  and `web_search` now keep the full cause chain (`providers::reqwest_chain`).
+  Note `run_command` timeouts still come back as an `Ok` JSON result, so they
+  are not retried.
 
 ## Order and size
 

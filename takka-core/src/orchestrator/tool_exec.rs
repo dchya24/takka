@@ -1111,3 +1111,39 @@ mod preview_diff_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod transient_classification_tests {
+    use super::transient_tool_error;
+    use crate::tool::Tool;
+    use crate::tools::FetchTool;
+
+    #[test]
+    fn real_fetch_connection_failure_is_transient() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = FetchTool::new()
+            .execute(serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}))
+            .expect_err("nothing listens on that port");
+        // Same shape the registry hands the orchestrator.
+        let raw = format!("Tool error: {err}");
+        assert!(
+            transient_tool_error(&raw).is_some(),
+            "a refused connection must qualify for the one automatic retry; got: {raw}"
+        );
+    }
+
+    #[test]
+    fn fetch_http_errors_stay_persistent() {
+        // Unchanged behaviour: a 404 or a rejected scheme is not worth a retry.
+        assert!(
+            transient_tool_error("Tool error: Fetch failed: HTTP 404 Not Found for http://x/")
+                .is_none()
+        );
+        assert!(
+            transient_tool_error("Tool error: URL scheme not allowed (http/https only)").is_none()
+        );
+    }
+}

@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start when a newer release exists. Opt out with `updates.check = false` or
   `TAKKA_NO_UPDATE_CHECK=1`. Nothing is installed automatically.
 
+### Fixed
+- Core/tools: `fetch` and `web_search` now keep the full `reqwest` error chain
+  (e.g. "...: client error (Connect): tcp connect error: Connection refused").
+  Previously only the top-level "error sending request for url" survived, so
+  the orchestrator's transient-error classifier never matched network failures
+  and the one automatic retry (P-02) never fired for them.
+
 ## [0.7.0] — 2026-11-25
 
 ### Added
