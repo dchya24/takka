@@ -214,3 +214,83 @@ fn disable_switch_turns_off_the_feature_a_task_expects() {
     let (code, _, stderr) = run(&tasks, &["--filter", "loop-nudge", "--disable", "nonsense"]);
     assert_eq!(code, 2, "unknown feature is a usage error: {stderr}");
 }
+
+/// A live-only task has no cassette; the replay lane must skip it rather
+/// than fail on the missing file.
+#[test]
+fn replay_lane_skips_live_only_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("hard");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "hard", "prompt": "p", "lanes": ["live"],
+            "verify": {"command": "true"}})
+        .to_string(),
+    )
+    .unwrap();
+    make_task(
+        tmp.path(),
+        "easy",
+        &[],
+        &[
+            call(
+                0,
+                "write_file",
+                json!({"path": "value.txt", "content": "good\n"}),
+            ),
+            text(1, "done"),
+        ],
+    );
+    let (code, stdout, stderr) = run(tmp.path(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("easy"), "{stdout}");
+    assert!(!stdout.contains("hard"), "{stdout}");
+    assert!(stderr.contains("skipping 1 task"), "{stderr}");
+}
+
+/// A task with `setup` gets a live service: the verify command sees its port
+/// in `EVAL_PORT` and can reach it. (`{port}` substitution in the prompt is
+/// covered by a unit test; a static cassette cannot observe it.)
+#[test]
+fn setup_service_is_reachable_from_verify() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("svc");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "svc", "prompt": "do nothing at {port}",
+            "setup": {"command": "python3 -m http.server $EVAL_PORT --bind 127.0.0.1"},
+            "verify": {"command": "python3 -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/' % os.environ['EVAL_PORT'])\""}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("cassette.jsonl"), text(0, "ok")).unwrap();
+    let (code, stdout, stderr) = run(tmp.path(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("1/1 passed"), "{stdout}");
+}
+
+/// A service that never comes up fails the task with a clear reason and
+/// never runs the agent.
+#[test]
+fn setup_service_that_never_starts_fails_the_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("svc");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "svc", "prompt": "p",
+            "setup": {"command": "sleep 30", "ready_timeout_secs": 1},
+            "verify": {"command": "true"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("cassette.jsonl"), text(0, "done")).unwrap();
+    let (code, stdout, _) = run(tmp.path(), &[]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("not ready"), "{stdout}");
+}

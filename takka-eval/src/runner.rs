@@ -3,6 +3,7 @@
 
 use crate::child::{ChildOutcome, ProviderSource};
 use crate::metrics::{self, Metrics};
+use crate::service;
 use crate::task::{ExpectSpec, Task};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,8 @@ use takka_core::runtime::pipe_id::fnv1a64;
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Lane {
     Replay,
     Live,
@@ -90,10 +92,34 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
 
     let before = snapshot(&work)?;
 
+    // Optional background service; killed when `_service` drops at the end
+    // of this function, after verification.
+    let task_dir = std::fs::canonicalize(&task.dir)?;
+    let mut port: Option<u16> = None;
+    let mut _service = None;
+    if let Some(setup) = &task.spec.setup {
+        let p = service::free_port()?;
+        match service::start(setup, &task_dir, &work, p) {
+            Ok(s) => {
+                port = Some(p);
+                _service = Some(s);
+            }
+            Err(e) => return Ok(failed_result(task, &opts.model, format!("setup: {e:#}"))),
+        }
+    }
+    // The child reads a resolved copy of the spec so `{port}` in the prompt
+    // points at this run's service.
+    let mut spec = task.spec.clone();
+    if let Some(p) = port {
+        spec.prompt = service::resolve_prompt(&spec.prompt, p);
+    }
+    let spec_file = tmp.path().join("task.json");
+    std::fs::write(&spec_file, serde_json::to_vec_pretty(&spec)?)?;
+
     let mut cmd = Command::new(&opts.exe);
     cmd.arg("child")
         .arg("--spec")
-        .arg(std::fs::canonicalize(task.dir.join("task.json"))?)
+        .arg(&spec_file)
         .arg("--out")
         .arg(&out_file);
     match &source {
@@ -147,7 +173,7 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     let forbidden = forbidden_edits(&changed, &task.spec.verify.forbid_paths);
 
     let (verify_exit, verify_ok) = if failure.is_none() {
-        let code = run_verify(&task.spec.verify.command, &work)?;
+        let code = run_verify(&task.spec.verify.command, &work, port)?;
         (code, code == Some(0))
     } else {
         (None, false)
@@ -179,7 +205,7 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         .unwrap_or_default();
 
     if failure.is_none() {
-        failure = check_expectations(&metrics, &task.spec.expect);
+        failure = expectation_failure(opts.lane, &metrics, &task.spec.expect);
     }
 
     let failure_is_none = failure.is_none();
@@ -198,6 +224,18 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         runs: 1,
         pass_count: u32::from(failure_is_none),
     })
+}
+
+/// Lane-aware wrapper: `expect` only constrains the replay lane. Its checks
+/// (a loop nudge, an auto-retry, a limit hit) describe behaviour a scripted
+/// cassette forces, which a real model may legitimately never exhibit, so in
+/// the live lane they would fail correct runs. Live runs still report the
+/// same metrics; only the pass/fail verdict ignores `expect`.
+pub fn expectation_failure(lane: Lane, m: &Metrics, e: &ExpectSpec) -> Option<String> {
+    match lane {
+        Lane::Replay => check_expectations(m, e),
+        Lane::Live => None,
+    }
 }
 
 /// `Some(reason)` when the run did not exhibit the behaviour a task expects.
@@ -289,11 +327,13 @@ pub fn aggregate(mut runs: Vec<TaskResult>) -> TaskResult {
     rep
 }
 
-fn run_verify(command: &str, work: &Path) -> Result<Option<i32>> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(work)
+fn run_verify(command: &str, work: &Path, port: Option<u16>) -> Result<Option<i32>> {
+    let mut verify = Command::new("sh");
+    verify.arg("-c").arg(command).current_dir(work);
+    if let Some(p) = port {
+        verify.env("EVAL_PORT", p.to_string());
+    }
+    let mut child = verify
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -486,6 +526,20 @@ mod tests {
             ..Default::default()
         };
         assert!(check_expectations(&m, &limit).unwrap().contains("limit"));
+    }
+
+    #[test]
+    fn expectations_apply_to_replay_only() {
+        // A real model that never thrashes must not "fail" a task whose
+        // expectations only make sense for a scripted cassette.
+        let m = Metrics::default();
+        let e = ExpectSpec {
+            min_loop_nudges: 1,
+            min_auto_retries: 1,
+            ..Default::default()
+        };
+        assert!(expectation_failure(Lane::Replay, &m, &e).is_some());
+        assert_eq!(expectation_failure(Lane::Live, &m, &e), None);
     }
 
     fn res(passed: bool, iters: u32) -> TaskResult {

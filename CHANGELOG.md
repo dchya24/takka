@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. The exact-match loop abort and the forced finalization turn are
   safety backstops and stay on. `takka-eval run --disable
   loop-nudge,auto-retry,budget-shaping` switches them off for a suite run.
+- Eval: tasks can set `lanes` (a live-only task needs no cassette and is
+  skipped by the replay lane) and `setup` (a background service started on a
+  free port, exposed as `{port}` in the prompt and `EVAL_PORT` to verify, and
+  killed afterwards).
 - Core: price table entry for `glm-5.3-flash` ($0.15 in / $0.50 out / $0.03
   cache-read per 1M tokens), so the eval live lane can enforce cost ceilings.
 - CLI: **update hint in the interactive banner** — the REPL checks GitHub
@@ -24,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TAKKA_NO_UPDATE_CHECK=1`. Nothing is installed automatically.
 
 ### Fixed
+- Eval: `expect` checks (loop nudge, auto-retry, iteration/limit assertions) now
+  apply to the replay lane only. In the live lane they failed correct runs of a
+  real model that simply never thrashed; the metrics are still reported.
 - Core/tools: `fetch` and `web_search` now keep the full `reqwest` error chain
   (e.g. "...: client error (Connect): tcp connect error: Connection refused").
   Previously only the top-level "error sending request for url" survived, so

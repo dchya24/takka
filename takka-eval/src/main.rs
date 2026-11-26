@@ -7,6 +7,7 @@ mod live;
 mod metrics;
 mod report;
 mod runner;
+mod service;
 mod task;
 
 use anyhow::{bail, Context, Result};
@@ -113,7 +114,21 @@ fn real_main() -> Result<()> {
     match Cli::parse().command {
         Command::List { tasks, filter } => {
             for t in task::load_tasks(&tasks, filter.as_deref())? {
-                println!("{}\t{}", t.spec.id, t.spec.tags.join(","));
+                let lanes: Vec<_> = t
+                    .spec
+                    .lanes
+                    .iter()
+                    .map(|l| match l {
+                        runner::Lane::Replay => "replay",
+                        runner::Lane::Live => "live",
+                    })
+                    .collect();
+                println!(
+                    "{}\t{}\t{}",
+                    t.spec.id,
+                    t.spec.tags.join(","),
+                    lanes.join(",")
+                );
             }
             Ok(())
         }
@@ -156,11 +171,27 @@ fn real_main() -> Result<()> {
             max_regress_pct,
             disable,
         } => {
-            let loaded = task::load_tasks(&tasks, filter.as_deref())?;
+            let mut loaded = task::load_tasks(&tasks, filter.as_deref())?;
             if loaded.is_empty() {
                 bail!("no tasks found under {}", tasks.display());
             }
             let live = matches!(lane, LaneArg::Live);
+            let this_lane = if live {
+                runner::Lane::Live
+            } else {
+                runner::Lane::Replay
+            };
+            let before_lane_filter = loaded.len();
+            loaded.retain(|t| t.runs_in(this_lane));
+            if loaded.len() < before_lane_filter {
+                eprintln!(
+                    "skipping {} task(s) not enabled for this lane",
+                    before_lane_filter - loaded.len()
+                );
+            }
+            if loaded.is_empty() {
+                bail!("no tasks enabled for this lane under {}", tasks.display());
+            }
             let opts = runner::RunOptions {
                 lane: if live {
                     runner::Lane::Live

@@ -4,11 +4,36 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::runner::Lane;
+
 fn default_max_iterations() -> u32 {
     20
 }
 fn default_timeout_secs() -> u64 {
     300
+}
+fn default_lanes() -> Vec<Lane> {
+    vec![Lane::Replay, Lane::Live]
+}
+fn default_ready_timeout_secs() -> u64 {
+    10
+}
+
+/// A background service the task needs (for example a local HTTP server that
+/// fails on purpose). Started before the agent runs, killed afterwards.
+///
+/// `command` runs as `sh -c "exec <command>"` with the task directory as cwd,
+/// so it must be one simple command (it is `exec`ed so the harness can kill
+/// it cleanly). The harness picks a free TCP port and passes it as
+/// `EVAL_PORT`; `{port}` in the task prompt is replaced with it, and the
+/// verify command sees `EVAL_PORT` too. The service lives next to
+/// `task.json`, not in the fixture, so it is not copied into the agent's
+/// workdir. The run only starts once the port accepts connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetupSpec {
+    pub command: String,
+    #[serde(default = "default_ready_timeout_secs")]
+    pub ready_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,7 +49,9 @@ pub struct VerifySpec {
 
 /// Behaviour the run must exhibit besides passing verification. Used by tasks
 /// that exist to exercise one orchestrator feature (loop nudge, auto-retry,
-/// budget wind-down); unmet expectations fail the task.
+/// budget wind-down); unmet expectations fail the task in the replay lane only
+/// (a real model may never exhibit scripted behaviour; see
+/// `runner::expectation_failure`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExpectSpec {
     #[serde(default)]
@@ -59,6 +86,13 @@ pub struct TaskSpec {
     pub verify: VerifySpec,
     #[serde(default)]
     pub expect: ExpectSpec,
+    /// Lanes this task runs in. A live-only task (`["live"]`) needs no
+    /// cassette; the replay lane skips it. Default: both.
+    #[serde(default = "default_lanes")]
+    pub lanes: Vec<Lane>,
+    /// Optional background service (see [`SetupSpec`]).
+    #[serde(default)]
+    pub setup: Option<SetupSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +107,9 @@ impl Task {
     }
     pub fn cassette_path(&self) -> PathBuf {
         self.dir.join("cassette.jsonl")
+    }
+    pub fn runs_in(&self, lane: Lane) -> bool {
+        self.spec.lanes.contains(&lane)
     }
 }
 
@@ -137,6 +174,51 @@ mod tests {
         assert_eq!(tasks[0].spec.max_iterations, 20);
         assert_eq!(tasks[0].spec.timeout_secs, 300);
         assert!(tasks[0].spec.verify.forbid_paths.is_empty());
+    }
+
+    #[test]
+    fn lanes_default_to_both_and_can_be_live_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_task(
+            tmp.path(),
+            "both",
+            r#"{"id":"both","prompt":"p","verify":{"command":"true"}}"#,
+        );
+        write_task(
+            tmp.path(),
+            "hard",
+            r#"{"id":"hard","prompt":"p","lanes":["live"],"verify":{"command":"true"}}"#,
+        );
+        let tasks = load_tasks(tmp.path(), None).unwrap();
+        let both = tasks.iter().find(|t| t.spec.id == "both").unwrap();
+        let hard = tasks.iter().find(|t| t.spec.id == "hard").unwrap();
+        assert!(both.runs_in(Lane::Replay) && both.runs_in(Lane::Live));
+        assert!(!hard.runs_in(Lane::Replay) && hard.runs_in(Lane::Live));
+    }
+
+    #[test]
+    fn unknown_lane_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_task(
+            tmp.path(),
+            "bad",
+            r#"{"id":"bad","prompt":"p","lanes":["nightly"],"verify":{"command":"true"}}"#,
+        );
+        assert!(load_tasks(tmp.path(), None).is_err());
+    }
+
+    #[test]
+    fn setup_defaults_ready_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_task(
+            tmp.path(),
+            "svc",
+            r#"{"id":"svc","prompt":"p","setup":{"command":"python3 server.py"},"verify":{"command":"true"}}"#,
+        );
+        let t = &load_tasks(tmp.path(), None).unwrap()[0];
+        let setup = t.spec.setup.as_ref().unwrap();
+        assert_eq!(setup.command, "python3 server.py");
+        assert_eq!(setup.ready_timeout_secs, 10);
     }
 
     #[test]
