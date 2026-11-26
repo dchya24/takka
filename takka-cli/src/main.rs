@@ -16,6 +16,7 @@ mod keyboard;
 mod session;
 mod tui;
 mod update;
+mod update_notice;
 mod widgets;
 
 use anyhow::Result;

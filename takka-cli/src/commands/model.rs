@@ -349,6 +349,7 @@ mod switch_model_tests {
             system_prompt: None,
             agent: Default::default(),
             skills: Default::default(),
+            updates: Default::default(),
         }
     }
 

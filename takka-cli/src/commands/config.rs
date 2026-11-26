@@ -319,6 +319,7 @@ impl Commands {
             system_prompt: None,
             agent: takka_core::AgentLoopConfig::default(),
             skills: takka_core::SkillsConfig::default(),
+            updates: takka_core::UpdatesConfig::default(),
         };
 
         // Summary
@@ -405,6 +406,7 @@ impl Commands {
             system_prompt: None,
             agent: takka_core::AgentLoopConfig::default(),
             skills: takka_core::SkillsConfig::default(),
+            updates: takka_core::UpdatesConfig::default(),
         };
 
         Ok(config)

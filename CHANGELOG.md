@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- CLI: **update hint in the interactive banner** — the REPL checks GitHub
+  Releases in the background (at most every 24 h, cached in
+  `~/.config/takka/update-check.json`) and shows a one-line hint on the next
+  start when a newer release exists. Opt out with `updates.check = false` or
+  `TAKKA_NO_UPDATE_CHECK=1`. Nothing is installed automatically.
+
 ## [0.7.0] — 2026-11-25
 
 ### Added

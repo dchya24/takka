@@ -23,6 +23,25 @@ pub struct Config {
     /// Skill system configuration.
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Release-notification settings (CLI banner hint).
+    #[serde(default)]
+    pub updates: UpdatesConfig,
+}
+
+/// `updates` section: whether the interactive CLI may check GitHub for a
+/// newer release in the background and hint at it in the banner. Installing
+/// is never automatic; the hint points at `takka update`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatesConfig {
+    /// `false` disables the background check and the banner hint.
+    #[serde(default = "default_true")]
+    pub check: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
 }
 
 /// Cache configuration for prompt caching support.
@@ -437,6 +456,7 @@ impl Config {
             system_prompt: None,
             agent: AgentLoopConfig::default(),
             skills: SkillsConfig::default(),
+            updates: UpdatesConfig::default(),
         })
     }
 
@@ -464,6 +484,7 @@ impl Config {
             system_prompt: None,
             agent: AgentLoopConfig::default(),
             skills: SkillsConfig::default(),
+            updates: UpdatesConfig::default(),
         })
     }
 
@@ -539,6 +560,7 @@ impl Config {
             system_prompt: None,
             agent: AgentLoopConfig::default(),
             skills: SkillsConfig::default(),
+            updates: UpdatesConfig::default(),
         }
     }
 
@@ -1170,5 +1192,16 @@ mod tests {
             legacy_env_warning("TAKKA_RUNTIME_BIN", "AGENTIC_RUNTIME_BIN"),
             "takka: warning: using legacy AGENTIC_RUNTIME_BIN; set TAKKA_RUNTIME_BIN instead"
         );
+    }
+
+    #[test]
+    fn updates_check_defaults_on_and_round_trips() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.updates.check, "check must default to on");
+        let off: Config = serde_json::from_str(r#"{"updates":{"check":false}}"#).unwrap();
+        assert!(!off.updates.check);
+        // An empty `updates` object also keeps the default.
+        let empty: Config = serde_json::from_str(r#"{"updates":{}}"#).unwrap();
+        assert!(empty.updates.check);
     }
 }

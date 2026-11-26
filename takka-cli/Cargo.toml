@@ -73,4 +73,5 @@ assets = [
 
 [dev-dependencies]
 futures = "0.3"
+tempfile = "3"
 tui-textarea = "0.7"
