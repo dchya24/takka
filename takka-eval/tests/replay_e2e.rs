@@ -160,3 +160,34 @@ fn baseline_compare_passes_against_itself_and_fails_on_regression() {
         "{stdout}"
     );
 }
+
+#[test]
+fn repeated_runs_report_pass_fraction() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_task(tmp.path(), "t-rep", &[], &edit_steps());
+    let out = tmp.path().join("r.jsonl");
+    let (code, stdout, stderr) = run(tmp.path(), &["--n", "3", "--out", out.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("3/3"), "{stdout}");
+    let v: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(out)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (v["runs"].as_u64(), v["pass_count"].as_u64()),
+        (Some(3), Some(3))
+    );
+}
+
+#[test]
+fn live_lane_requires_config_and_never_touches_the_network_without_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_task(tmp.path(), "t-live", &[], &edit_steps());
+    let (code, _, stderr) = run(tmp.path(), &["--lane", "live"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("--config"), "{stderr}");
+}

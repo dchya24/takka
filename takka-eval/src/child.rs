@@ -111,9 +111,13 @@ pub fn run_child(
     spec_path: &Path,
     source: &ProviderSource,
     model_override: Option<&str>,
+    default_max_cost_usd: Option<f64>,
     out: &Path,
 ) -> Result<()> {
-    let spec: TaskSpec = serde_json::from_str(&std::fs::read_to_string(spec_path)?)?;
+    let mut spec: TaskSpec = serde_json::from_str(&std::fs::read_to_string(spec_path)?)?;
+    if spec.max_cost_usd.is_none() {
+        spec.max_cost_usd = default_max_cost_usd;
+    }
     let model_override = model_override.or(spec.model.as_deref());
     let (provider, model) = build_provider(source, model_override)?;
     let outcome = run_in_cwd(&spec, provider, &model);

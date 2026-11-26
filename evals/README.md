@@ -14,6 +14,21 @@ cargo run -p takka-eval -- list
 
 Exit status is non-zero when a task fails or `--baseline` finds a regression.
 
+## Live lane (spends money)
+
+```bash
+cargo run -p takka-eval -- run --lane live --config ~/.config/takka/config.json \
+    --model <id> --n 3 --budget-usd 2 --out /tmp/live.jsonl
+```
+
+The live lane runs the real provider from the config file you pass explicitly
+(it never reads ambient config). Guards: a per-run cap (`--max-cost-usd`, used
+when a task sets none), a total budget (`--budget-usd`; the run stops and exits
+non-zero when it is spent), and a refusal for models missing from the price
+table (`--allow-unpriced` overrides, with no cost enforcement). `--n` repeats
+each task; `passed` is the majority outcome and the table shows `pass/runs`.
+The task fixtures and prompts are sent to the provider.
+
 ## Task layout
 
 ```

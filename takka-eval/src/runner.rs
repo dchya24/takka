@@ -28,6 +28,8 @@ pub struct RunOptions {
     pub model: Option<String>,
     /// Config file for the live lane.
     pub config: Option<PathBuf>,
+    /// Per-run USD ceiling for tasks that do not set `max_cost_usd`.
+    pub default_max_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +47,16 @@ pub struct TaskResult {
     pub wall_ms: u64,
     pub model: String,
     pub metrics: Metrics,
+    /// How many times the task ran (`--n`). Older result files omit it.
+    #[serde(default = "one")]
+    pub runs: u32,
+    /// How many of those runs passed. `passed` is the majority outcome.
+    #[serde(default)]
+    pub pass_count: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
@@ -93,6 +105,9 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     }
     if let Some(m) = &opts.model {
         cmd.arg("--model").arg(m);
+    }
+    if let Some(c) = opts.default_max_cost_usd {
+        cmd.arg("--default-max-cost-usd").arg(c.to_string());
     }
     cmd.current_dir(&work)
         .stdin(Stdio::null())
@@ -162,10 +177,11 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         failure = check_expectations(&metrics, &task.spec.expect);
     }
 
+    let failure_is_none = failure.is_none();
     Ok(TaskResult {
         id: task.spec.id.clone(),
         tags: task.spec.tags.clone(),
-        passed: failure.is_none(),
+        passed: failure_is_none,
         failure,
         verify_exit,
         agent_error: outcome.as_ref().and_then(|o| o.error.clone()),
@@ -174,6 +190,8 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         wall_ms,
         model,
         metrics,
+        runs: 1,
+        pass_count: u32::from(failure_is_none),
     })
 }
 
@@ -223,7 +241,47 @@ fn failed_result(task: &Task, model: &Option<String>, reason: String) -> TaskRes
             .or_else(|| task.spec.model.clone())
             .unwrap_or_else(|| crate::child::DEFAULT_REPLAY_MODEL.to_string()),
         metrics: Metrics::default(),
+        runs: 1,
+        pass_count: 0,
     }
+}
+
+/// Run a task `n` times and fold the runs into one result. Stops repeating
+/// once `remaining_budget` (USD) is spent. Returns the result and the USD
+/// spent across the runs that were priced.
+pub fn run_task_n(
+    task: &Task,
+    opts: &RunOptions,
+    n: u32,
+    remaining_budget: Option<f64>,
+) -> Result<(TaskResult, f64)> {
+    let mut runs = Vec::new();
+    let mut spent = 0.0;
+    for i in 0..n.max(1) {
+        if i > 0 && remaining_budget.is_some_and(|b| spent >= b) {
+            break;
+        }
+        let r = run_task(task, opts)?;
+        spent += r.metrics.cost_usd.unwrap_or(0.0);
+        runs.push(r);
+    }
+    Ok((aggregate(runs), spent))
+}
+
+/// Fold several runs of one task: `passed` is the majority outcome and the
+/// metrics come from the run with the median iteration count.
+pub fn aggregate(mut runs: Vec<TaskResult>) -> TaskResult {
+    assert!(!runs.is_empty(), "aggregate needs at least one run");
+    let total = runs.len() as u32;
+    let pass_count = runs.iter().filter(|r| r.passed).count() as u32;
+    let failure = runs.iter().find_map(|r| r.failure.clone());
+    runs.sort_by_key(|r| r.metrics.iterations);
+    let mut rep = runs.swap_remove(runs.len() / 2);
+    rep.runs = total;
+    rep.pass_count = pass_count;
+    rep.passed = pass_count * 2 > total;
+    rep.failure = if rep.passed { None } else { failure };
+    rep
 }
 
 fn run_verify(command: &str, work: &Path) -> Result<Option<i32>> {
@@ -422,6 +480,47 @@ mod tests {
             ..Default::default()
         };
         assert!(check_expectations(&m, &limit).unwrap().contains("limit"));
+    }
+
+    fn res(passed: bool, iters: u32) -> TaskResult {
+        TaskResult {
+            id: "t".into(),
+            tags: vec![],
+            passed,
+            failure: (!passed).then(|| "boom".to_string()),
+            verify_exit: None,
+            agent_error: None,
+            forbidden_edits: vec![],
+            files_changed: 0,
+            wall_ms: 0,
+            model: "m".into(),
+            metrics: Metrics {
+                iterations: iters,
+                ..Default::default()
+            },
+            runs: 1,
+            pass_count: u32::from(passed),
+        }
+    }
+
+    #[test]
+    fn aggregate_is_majority_with_median_metrics() {
+        let agg = aggregate(vec![res(true, 9), res(true, 3), res(false, 5)]);
+        assert!(agg.passed);
+        assert_eq!((agg.runs, agg.pass_count), (3, 2));
+        assert_eq!(agg.metrics.iterations, 5);
+        assert_eq!(agg.failure, None);
+
+        let agg = aggregate(vec![res(true, 3), res(false, 4), res(false, 5)]);
+        assert!(!agg.passed);
+        assert_eq!(agg.pass_count, 1);
+        assert_eq!(agg.failure.as_deref(), Some("boom"));
+
+        // An even split is not a pass.
+        assert!(!aggregate(vec![res(true, 1), res(false, 1)]).passed);
+        // Single run passes through unchanged.
+        let one = aggregate(vec![res(true, 7)]);
+        assert_eq!((one.runs, one.pass_count, one.passed), (1, 1, true));
     }
 
     #[test]

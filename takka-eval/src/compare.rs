@@ -197,6 +197,8 @@ mod tests {
                 cost_usd: cost,
                 ..Default::default()
             },
+            runs: 1,
+            pass_count: u32::from(passed),
         }
     }
 

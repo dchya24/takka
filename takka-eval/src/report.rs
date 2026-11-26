@@ -24,7 +24,7 @@ pub fn read_jsonl(path: &Path) -> Result<Vec<TaskResult>> {
 pub fn summary_table(results: &[TaskResult]) -> String {
     let id_w = results.iter().map(|r| r.id.len()).max().unwrap_or(2).max(4);
     let mut out = format!(
-        "{:<id_w$}  {:<4}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {}\n",
+        "{:<id_w$}  {:<5}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {}\n",
         "task", "pass", "iter", "tools", "cost_usd", "cache", "nudge", "retry", "note"
     );
     for r in results {
@@ -38,10 +38,17 @@ pub fn summary_table(results: &[TaskResult]) -> String {
             .clone()
             .or_else(|| r.metrics.limit_hit.as_ref().map(|l| format!("limit:{l}")))
             .unwrap_or_default();
+        let verdict = if r.runs > 1 {
+            format!("{}/{}", r.pass_count, r.runs)
+        } else if r.passed {
+            "ok".to_string()
+        } else {
+            "FAIL".to_string()
+        };
         out.push_str(&format!(
-            "{:<id_w$}  {:<4}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {}\n",
+            "{:<id_w$}  {:<5}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {}\n",
             r.id,
-            if r.passed { "ok" } else { "FAIL" },
+            verdict,
             r.metrics.iterations,
             r.metrics.total_tool_calls(),
             cost,
@@ -78,6 +85,8 @@ mod tests {
             wall_ms: 5,
             model: "m".into(),
             metrics: Metrics::default(),
+            runs: 1,
+            pass_count: u32::from(passed),
         }
     }
 
@@ -89,6 +98,14 @@ mod tests {
         let back = read_jsonl(&p).unwrap();
         assert_eq!(back.len(), 2);
         assert!(!back[1].passed);
+    }
+
+    #[test]
+    fn table_shows_pass_fraction_for_repeated_runs() {
+        let mut r = result("flaky", true);
+        r.runs = 3;
+        r.pass_count = 2;
+        assert!(summary_table(&[r]).contains("2/3"));
     }
 
     #[test]

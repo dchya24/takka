@@ -3,6 +3,7 @@
 
 mod child;
 mod compare;
+mod live;
 mod metrics;
 mod report;
 mod runner;
@@ -45,6 +46,20 @@ enum Command {
         /// Write per-task results as JSONL.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Run each task this many times; `passed` is the majority outcome and
+        /// the table shows pass/runs, so flaky tasks are visible.
+        #[arg(long, default_value_t = 1)]
+        n: u32,
+        /// Live lane: per-run USD ceiling for tasks without `max_cost_usd`.
+        #[arg(long, default_value_t = 0.50)]
+        max_cost_usd: f64,
+        /// Live lane: stop after this much total USD (the run then exits non-zero).
+        #[arg(long, default_value_t = 5.0)]
+        budget_usd: f64,
+        /// Live lane: run a model that is missing from the price table (its
+        /// cost ceilings cannot be enforced).
+        #[arg(long)]
+        allow_unpriced: bool,
         /// Compare against a JSONL results file from an earlier run and exit
         /// non-zero on regression.
         #[arg(long)]
@@ -76,6 +91,8 @@ enum Command {
         live_config: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        default_max_cost_usd: Option<f64>,
     },
 }
 
@@ -100,13 +117,14 @@ fn real_main() -> Result<()> {
             cassette,
             live_config,
             model,
+            default_max_cost_usd,
         } => {
             let source = match (cassette, live_config) {
                 (Some(c), None) => child::ProviderSource::Cassette(c),
                 (None, Some(config_path)) => child::ProviderSource::Live { config_path },
                 _ => bail!("child needs exactly one of --cassette or --live-config"),
             };
-            child::run_child(&spec, &source, model.as_deref(), &out)
+            child::run_child(&spec, &source, model.as_deref(), default_max_cost_usd, &out)
         }
         Command::Run {
             tasks,
@@ -115,6 +133,10 @@ fn real_main() -> Result<()> {
             model,
             config,
             out,
+            n,
+            max_cost_usd,
+            budget_usd,
+            allow_unpriced,
             baseline,
             max_pass_drop,
             max_regress_pct,
@@ -123,19 +145,54 @@ fn real_main() -> Result<()> {
             if loaded.is_empty() {
                 bail!("no tasks found under {}", tasks.display());
             }
+            let live = matches!(lane, LaneArg::Live);
             let opts = runner::RunOptions {
-                lane: match lane {
-                    LaneArg::Replay => runner::Lane::Replay,
-                    LaneArg::Live => runner::Lane::Live,
+                lane: if live {
+                    runner::Lane::Live
+                } else {
+                    runner::Lane::Replay
                 },
                 exe: std::env::current_exe().context("locating own executable")?,
                 model,
+                default_max_cost_usd: live.then_some(max_cost_usd),
                 config,
             };
+            if live {
+                // Resolve the model now: validates the config before any
+                // spend, and lets us refuse models we cannot price.
+                let config_path = opts
+                    .config
+                    .clone()
+                    .context("the live lane needs --config <path>")?;
+                let (_, model_name) = child::build_provider(
+                    &child::ProviderSource::Live { config_path },
+                    opts.model.as_deref(),
+                )?;
+                live::check_priced(&model_name, allow_unpriced)?;
+                eprintln!(
+                    "live lane: model {model_name}, <= ${max_cost_usd:.2}/run, <= ${budget_usd:.2} total"
+                );
+            }
+            let mut budget = live::Budget::new(budget_usd);
             let mut results = Vec::new();
+            let mut skipped = Vec::new();
             for t in &loaded {
+                if live && budget.exhausted() {
+                    skipped.push(t.spec.id.clone());
+                    continue;
+                }
                 eprintln!("running {} ...", t.spec.id);
-                results.push(runner::run_task(t, &opts)?);
+                let remaining = live.then(|| budget.remaining());
+                let (result, spent) = runner::run_task_n(t, &opts, n, remaining)?;
+                budget.record(spent);
+                results.push(result);
+            }
+            if !skipped.is_empty() {
+                eprintln!(
+                    "budget of ${budget_usd:.2} exhausted (spent ${:.4}); not run: {}",
+                    budget.spent(),
+                    skipped.join(", ")
+                );
             }
             print!("{}", report::summary_table(&results));
             if let Some(path) = out {
@@ -156,7 +213,7 @@ fn real_main() -> Result<()> {
                 print!("\n{}", cmp.render());
                 regression = cmp.is_regression();
             }
-            if regression || results.iter().any(|r| !r.passed) {
+            if regression || !skipped.is_empty() || results.iter().any(|r| !r.passed) {
                 std::process::exit(1);
             }
             Ok(())
