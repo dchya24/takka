@@ -1,12 +1,16 @@
 //! LLM Provider trait and implementations
 
 pub mod anthropic;
+pub mod cassette;
 pub mod openai;
 
 pub use anthropic::{
     AnthropicContentBlockResponse, AnthropicError, AnthropicErrorDetail, AnthropicProvider,
     AnthropicProviderConfig, AnthropicResponse, AnthropicStreamDelta, AnthropicStreamEvent,
     AnthropicStreamMessage, AnthropicUsage, RetryConfig,
+};
+pub use cassette::{
+    chunks_from_response, request_fingerprint, response_from_chunks, CassetteProvider, Exchange,
 };
 pub use openai::{OpenAIProvider, OpenAIProviderConfig};
 

@@ -2274,3 +2274,58 @@ fn run_cost_resets_between_runs() {
         orch.run_cost_usd()
     );
 }
+
+/// Same scenario as `run_loop_executes_tool_then_returns_final_answer`, but
+/// the model side is a checked-in cassette instead of an in-code script.
+/// Proves `CassetteProvider` can drive the real loop end to end.
+#[test]
+fn cassette_drives_tool_then_final_answer() {
+    use takka_core::providers::CassetteProvider;
+
+    let cassette = Arc::new(
+        CassetteProvider::from_path("tests/fixtures/cassettes/read_file_then_answer.jsonl")
+            .expect("load cassette"),
+    );
+    let provider: Arc<dyn LLMProvider> = cassette.clone();
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_model("gpt-4o-mini");
+
+    let answer = orch.run("what is the answer?").expect("run should succeed");
+    assert_eq!(answer, "42 is the answer");
+    assert_eq!(cassette.remaining(), 0, "every recorded exchange is used");
+}
+
+/// Streaming twin of `cassette_drives_tool_then_final_answer`: the same
+/// cassette must drive `run_stream` (the path `ScriptedProvider` cannot).
+#[tokio::test]
+async fn cassette_drives_stream_path() {
+    use takka_core::providers::CassetteProvider;
+
+    let cassette = Arc::new(
+        CassetteProvider::from_path("tests/fixtures/cassettes/read_file_then_answer.jsonl")
+            .expect("load cassette"),
+    );
+    let provider: Arc<dyn LLMProvider> = cassette.clone();
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+
+    let orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+
+    let out = orch
+        .run_stream("what is the answer?", |_| {})
+        .await
+        .expect("stream run should succeed");
+    assert_eq!(out, "42 is the answer");
+    assert_eq!(cassette.remaining(), 0);
+}
