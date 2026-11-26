@@ -1,0 +1,15 @@
+{
+  "id": "add-upper-flag",
+  "prompt": "shout.sh prints its first argument. Add an `--upper` flag so `sh shout.sh --upper hi` prints HI while `sh shout.sh hi` still prints hi. Do not edit test.sh.",
+  "tags": [
+    "feature",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  }
+}

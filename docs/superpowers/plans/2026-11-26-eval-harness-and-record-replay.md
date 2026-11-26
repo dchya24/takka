@@ -66,16 +66,19 @@ Two deliverables, in dependency order:
 ### Design
 - New workspace crate `takka-eval` (binary + library). Not part of the shipped
   `takka` binary; keeps `takka-core` free of eval-only dependencies.
-- **Task spec** (`evals/tasks/<id>/task.toml` + `repo/` fixture):
-  ```toml
-  id = "fix-off-by-one"
-  prompt = "The test in tests/pagination.rs fails. Fix the bug."
-  tags = ["bugfix", "rust"]
-  max_iterations = 20
-  max_cost_usd = 0.50
-  [verify]
-  command = "cargo test --quiet"      # exit 0 = success
-  forbid_paths = ["tests/"]           # agent must not edit tests
+- **Task spec** (`evals/tasks/<id>/task.json` + `repo/` fixture):
+  ```json
+  {
+    "id": "fix-off-by-one",
+    "prompt": "The test in tests/pagination.rs fails. Fix the bug.",
+    "tags": ["bugfix", "rust"],
+    "max_iterations": 20,
+    "max_cost_usd": 0.50,
+    "verify": {
+      "command": "cargo test --quiet",
+      "forbid_paths": ["tests/"]
+    }
+  }
   ```
 - **Runner**: copy fixture to a temp dir, build a hermetic engine config
   (cwd = temp dir, `permission_mode = yolo`, safety sandbox paths = temp dir),
@@ -96,7 +99,7 @@ Two deliverables, in dependency order:
     actually compare model/prompt/orchestrator changes. Never in default CI.
 
 ### Steps
-- **B0** Spike (½ day): confirm the cleanest headless entry point —
+- **B0 (done)** Spike (½ day): confirm the cleanest headless entry point —
   `Engine::with_provider` over an in-memory `Transport` vs `Orchestrator::run`
   directly. Write findings to this doc. *Done when:* a 20-line example runs one
   scripted task in a temp dir and prints its events.
@@ -105,7 +108,7 @@ Two deliverables, in dependency order:
   when:* `cargo run -p takka-eval -- --lane replay` passes on that task.
 - **B2** Metrics extraction from the event stream + summary table + unit tests
   over canned event sequences.
-- **B3** Seed suite of 8–12 tasks covering: bugfix, small feature, refactor,
+- **B3 (done, with caveats below)** Seed suite of 8–12 tasks covering: bugfix, small feature, refactor,
   multi-file edit, "needs exploration", a task that tempts loops (should trigger
   P-01 nudge), a transient-failure task (P-02), and a budget-tight task (P-06).
   Record cassettes with one real model.
@@ -115,6 +118,44 @@ Two deliverables, in dependency order:
   `max_cost_usd`, repeat count `--n` for variance.
 - **B6** CI wiring for the replay lane — **touches `.github/`; ask first.**
   Until approved, document the command in `CONTRIBUTING.md`.
+
+## B0 findings (spike result)
+
+- `Engine::initialize` hard-wires `OpenAIProvider` from the ambient config and
+  reads project instructions, skills and persistent memory from the developer's
+  machine. It is the wrong entry point for a hermetic eval.
+- Drive `Orchestrator` directly: inject any `Arc<dyn LLMProvider>`, register
+  `builtin_tools_with_deps(ToolDeps::new())`, `PermissionMode::Yolo`, a prompt
+  from `assemble_system_prompt(None, None, None, None)`, and collect `Event`s
+  via `on_event` (events are `Serialize`).
+- Builtin tools resolve relative paths against the **process cwd**, which is not
+  safe to change in a shared process. Each task therefore runs in a **child
+  process** (`takka-eval child`, re-exec of the same binary) with the temp
+  workdir as cwd. The parent verifies independently and derives metrics from the
+  child's serialized events.
+- Task specs are `task.json`, not TOML: no new dependency, and `serde_json` is
+  already in the workspace.
+- Seed tasks use POSIX `sh` fixtures so verification is fast and needs no
+  per-task toolchain build.
+
+## B3 outcome and caveats
+
+- Nine `sh`-fixture tasks ship in `evals/tasks/`: bugfix, new-file feature,
+  flag feature, multi-file edit, rename refactor, exploration, error recovery,
+  a loop-thrash task (`expect.min_loop_nudges`), and a tight-budget task
+  (`expect.max_iterations_used`).
+- **Cassettes are hand-authored, not recorded.** Recording needs a real provider
+  and credentials, which must not be used from an unattended session. They
+  exercise the harness and orchestrator wiring; they say nothing about model
+  quality. Run the live lane (B5) to get real numbers, and re-record with
+  `CassetteProvider::record` when a cassette should reflect a real model.
+- **No seed task for transient auto-retry (P-02).** It cannot be triggered
+  deterministically offline: `run_command` timeouts come back as an `Ok` JSON
+  result (not `Tool error:`), and `fetch` connection failures surface reqwest's
+  top-level message only ("error sending request for url ..."), which the
+  transient classifier's markers do not match. P-02 stays covered by the core
+  stub-tool test. The `fetch` wording gap is a likely real bug worth its own
+  fix (`providers::reqwest_chain` already shows the pattern).
 
 ## Order and size
 

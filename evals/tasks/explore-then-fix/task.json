@@ -1,0 +1,16 @@
+{
+  "id": "explore-then-fix",
+  "prompt": "`sh test.sh` fails but you do not know where the bug is. Find it in the code under src/ and fix it. Do not edit test.sh.",
+  "tags": [
+    "bugfix",
+    "exploration",
+    "shell"
+  ],
+  "max_iterations": 12,
+  "verify": {
+    "command": "sh test.sh",
+    "forbid_paths": [
+      "test.sh"
+    ]
+  }
+}

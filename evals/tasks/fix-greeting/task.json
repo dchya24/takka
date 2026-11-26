@@ -1,0 +1,7 @@
+{
+  "id": "fix-greeting",
+  "prompt": "greet.sh prints a misspelled greeting and test.sh fails. Fix greet.sh so that `sh test.sh` passes. Do not edit test.sh.",
+  "tags": ["bugfix", "shell"],
+  "max_iterations": 10,
+  "verify": { "command": "sh test.sh", "forbid_paths": ["test.sh"] }
+}
