@@ -2,6 +2,7 @@
 //! loop did. See docs/superpowers/plans/2026-11-26-eval-harness-and-record-replay.md.
 
 mod child;
+mod compare;
 mod metrics;
 mod report;
 mod runner;
@@ -44,6 +45,16 @@ enum Command {
         /// Write per-task results as JSONL.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Compare against a JSONL results file from an earlier run and exit
+        /// non-zero on regression.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Largest tolerated drop in pass rate, as a fraction (0.1 = 10 points).
+        #[arg(long, default_value_t = 0.0)]
+        max_pass_drop: f64,
+        /// Largest tolerated rise (percent) of median iterations or median cost.
+        #[arg(long, default_value_t = 25.0)]
+        max_regress_pct: f64,
     },
     /// List the tasks that would run.
     List {
@@ -104,6 +115,9 @@ fn real_main() -> Result<()> {
             model,
             config,
             out,
+            baseline,
+            max_pass_drop,
+            max_regress_pct,
         } => {
             let loaded = task::load_tasks(&tasks, filter.as_deref())?;
             if loaded.is_empty() {
@@ -127,7 +141,22 @@ fn real_main() -> Result<()> {
             if let Some(path) = out {
                 report::write_jsonl(&path, &results)?;
             }
-            if results.iter().any(|r| !r.passed) {
+            let mut regression = false;
+            if let Some(path) = baseline {
+                let base = report::read_jsonl(&path)
+                    .with_context(|| format!("reading baseline {}", path.display()))?;
+                let cmp = compare::compare(
+                    &base,
+                    &results,
+                    compare::Thresholds {
+                        max_pass_drop,
+                        max_regress_pct,
+                    },
+                );
+                print!("\n{}", cmp.render());
+                regression = cmp.is_regression();
+            }
+            if regression || results.iter().any(|r| !r.passed) {
                 std::process::exit(1);
             }
             Ok(())

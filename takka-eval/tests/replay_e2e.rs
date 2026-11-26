@@ -136,3 +136,27 @@ fn shipped_seed_tasks_pass_in_replay() {
     let (code, stdout, stderr) = run(&seed, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 }
+
+#[test]
+fn baseline_compare_passes_against_itself_and_fails_on_regression() {
+    let tmp = tempfile::tempdir().unwrap();
+    make_task(tmp.path(), "t-base", &[], &edit_steps());
+    let base = tmp.path().join("base.jsonl");
+    let (code, _, _) = run(tmp.path(), &["--out", base.to_str().unwrap()]);
+    assert_eq!(code, 0);
+
+    // Same run against its own baseline: no regression.
+    let (code, stdout, _) = run(tmp.path(), &["--baseline", base.to_str().unwrap()]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("no regressions"), "{stdout}");
+
+    // Break the cassette: the task now fails, which the baseline flags.
+    std::fs::write(tmp.path().join("t-base/cassette.jsonl"), text(0, "nothing")).unwrap();
+    let (code, stdout, _) = run(tmp.path(), &["--baseline", base.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("REGRESSION"), "{stdout}");
+    assert!(
+        stdout.contains("passed in the baseline but fails now"),
+        "{stdout}"
+    );
+}
