@@ -30,6 +30,8 @@ pub struct RunOptions {
     pub config: Option<PathBuf>,
     /// Per-run USD ceiling for tasks that do not set `max_cost_usd`.
     pub default_max_cost_usd: Option<f64>,
+    /// Features switched off for this run (ablation).
+    pub disabled: Vec<crate::child::Feature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +110,9 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     }
     if let Some(c) = opts.default_max_cost_usd {
         cmd.arg("--default-max-cost-usd").arg(c.to_string());
+    }
+    for f in &opts.disabled {
+        cmd.arg("--disable").arg(f.name());
     }
     cmd.current_dir(&work)
         .stdin(Stdio::null())

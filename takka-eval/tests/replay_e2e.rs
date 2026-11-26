@@ -194,3 +194,23 @@ fn live_lane_requires_config_and_never_touches_the_network_without_it() {
     assert_eq!(code, 2);
     assert!(stderr.contains("--config"), "{stderr}");
 }
+
+/// Ablation: switching a feature off must change the outcome of the task
+/// that depends on it, and an unknown feature name must be rejected.
+#[test]
+fn disable_switch_turns_off_the_feature_a_task_expects() {
+    let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../evals/tasks");
+
+    let (code, stdout, _) = run(&tasks, &["--filter", "loop-nudge"]);
+    assert_eq!(code, 0, "baseline run must pass: {stdout}");
+
+    let (code, stdout, _) = run(
+        &tasks,
+        &["--filter", "loop-nudge", "--disable", "loop-nudge"],
+    );
+    assert_ne!(code, 0, "task must fail without the nudge: {stdout}");
+    assert!(stdout.contains("saw 0"), "{stdout}");
+
+    let (code, _, stderr) = run(&tasks, &["--filter", "loop-nudge", "--disable", "nonsense"]);
+    assert_eq!(code, 2, "unknown feature is a usage error: {stderr}");
+}

@@ -1051,6 +1051,9 @@ impl Orchestrator {
         if finalizing {
             return (Vec::new(), None, 0);
         }
+        if !self.tool_budget_shaping {
+            return (all.to_vec(), None, 0);
+        }
         use crate::tool::Mutability;
         let pct = (iteration * 100 / self.max_iterations.max(1)) as u16;
         if pct >= 90 {

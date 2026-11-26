@@ -29,6 +29,23 @@ table (`--allow-unpriced` overrides, with no cost enforcement). `--n` repeats
 each task; `passed` is the majority outcome and the table shows `pass/runs`.
 The task fixtures and prompts are sent to the provider.
 
+## Ablation
+
+`--disable` switches orchestrator features off so a run measures what each
+one buys. Values (comma-separated or repeated): `loop-nudge` (P-01 semantic
+nudge; the exact-match abort stays on), `auto-retry` (P-02), `budget-shaping`
+(P-06 tool shrinking at 80%/90%; forced finalization stays on).
+
+```bash
+cargo run -p takka-eval -- run --lane live --config <cfg> --n 3 --out on.jsonl
+cargo run -p takka-eval -- run --lane live --config <cfg> --n 3 \
+    --disable loop-nudge --out off.jsonl --baseline on.jsonl
+```
+
+In the replay lane a task whose `expect` depends on the feature fails when it
+is disabled (that is the check that the switch works), so do not compare a
+replay ablation against the committed replay baseline.
+
 ## Task layout
 
 ```

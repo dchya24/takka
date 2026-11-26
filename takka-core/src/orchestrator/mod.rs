@@ -358,6 +358,14 @@ pub struct Orchestrator {
     /// `reset_session` (a new session), restored from the checkpoint on
     /// resume.
     session_cost_usd: Mutex<f64>,
+    /// P-01 semantic loop nudge. The exact-match abort is a safety
+    /// backstop and is NOT governed by this flag.
+    semantic_loop_nudge: bool,
+    /// P-02 single in-loop retry of transient tool errors.
+    auto_retry: bool,
+    /// P-06/O-02 graduated tool-set shrinking at 80%/90% of the
+    /// iteration cap. The forced finalization turn is unaffected.
+    tool_budget_shaping: bool,
 }
 
 impl Orchestrator {
@@ -394,6 +402,9 @@ impl Orchestrator {
             plan_steps: Mutex::new(Vec::new()),
             max_cost_usd_per_session: None,
             session_cost_usd: Mutex::new(0.0),
+            semantic_loop_nudge: true,
+            auto_retry: true,
+            tool_budget_shaping: true,
         }
     }
 
@@ -513,6 +524,10 @@ impl Orchestrator {
             }
         }
         drop(recent);
+
+        if !self.semantic_loop_nudge {
+            return LoopDetectionOutcome::None;
+        }
 
         // Semantic detector: accumulate similar calls, count the ones
         // matching a newly-seen signature, nudge when it crosses.
@@ -689,6 +704,26 @@ impl Orchestrator {
     /// in the `plan` checkpoint slot and prepended to every request.
     pub fn set_plan_then_execute(&mut self, enabled: bool) {
         self.plan_then_execute = enabled;
+    }
+
+    /// Enable or disable the semantic loop nudge (P-01). Default on. The
+    /// exact-match loop abort stays active either way. Exists so the eval
+    /// harness can ablate the feature.
+    pub fn set_semantic_loop_nudge(&mut self, enabled: bool) {
+        self.semantic_loop_nudge = enabled;
+    }
+
+    /// Enable or disable the automatic single retry of transient tool
+    /// errors (P-02). Default on. Exists so the eval harness can ablate it.
+    pub fn set_auto_retry(&mut self, enabled: bool) {
+        self.auto_retry = enabled;
+    }
+
+    /// Enable or disable graduated tool-budget shaping (P-06). Default on.
+    /// When off, the full tool set is offered until the forced
+    /// finalization turn. Exists so the eval harness can ablate it.
+    pub fn set_tool_budget_shaping(&mut self, enabled: bool) {
+        self.tool_budget_shaping = enabled;
     }
 
     /// Current plan steps (O-05), in stored order.

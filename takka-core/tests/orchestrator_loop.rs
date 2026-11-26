@@ -2329,3 +2329,210 @@ async fn cassette_drives_stream_path() {
     assert_eq!(out, "42 is the answer");
     assert_eq!(cassette.remaining(), 0);
 }
+
+// ── Ablation switches (eval harness) ───────────────────────────────
+//
+// The loop-behaviour features default to ON. `takka-eval --disable …`
+// turns each off so a suite run can measure what the feature buys.
+
+/// With the semantic nudge disabled, the same alternating-read thrash that
+/// normally produces a "re-reading" nudge runs through silently.
+#[test]
+fn semantic_loop_nudge_can_be_disabled() {
+    let dir = support::tempdir();
+    let path = dir.join("thrash.txt");
+    std::fs::write(&path, "body").unwrap();
+    let read = |offset: i32| {
+        support::tool_call_response(
+            "c",
+            "read_file",
+            &serde_json::json!({ "path": path.to_string_lossy(), "offset": offset }),
+        )
+    };
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        read(1),
+        read(50),
+        read(1),
+        read(50),
+        read(1),
+        read(50),
+        support::text_response("decided: file is fine"),
+    ]));
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(20);
+    orch.set_semantic_loop_nudge(false);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            sink.lock().unwrap().push(message);
+        }
+    });
+
+    let answer = orch.run("check this file").expect("run completes");
+    assert_eq!(answer, "decided: file is fine");
+    let captured = events.lock().unwrap();
+    assert!(
+        !captured.iter().any(|m| m.contains("re-reading")),
+        "nudge must be silent when disabled, got {:?}",
+        *captured
+    );
+}
+
+/// The exact-match abort is a safety backstop, not an ablation target: it
+/// still fires with the semantic nudge disabled.
+#[test]
+fn exact_loop_abort_survives_disabled_semantic_nudge() {
+    let dir = support::tempdir();
+    let path = dir.join("same.txt");
+    std::fs::write(&path, "body").unwrap();
+    let same = || {
+        support::tool_call_response(
+            "c",
+            "read_file",
+            &serde_json::json!({ "path": path.to_string_lossy() }),
+        )
+    };
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        same(),
+        same(),
+        same(),
+        support::text_response("never reached"),
+    ]));
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(20);
+    orch.set_semantic_loop_nudge(false);
+
+    let err = orch
+        .run("read it")
+        .expect_err("identical repeats must abort");
+    assert!(err.to_string().contains("Loop detected"), "{err}");
+}
+
+/// With budget shaping disabled the tool set stays full until the forced
+/// finalization turn (which is the hard cap and always strips tools).
+#[test]
+fn tool_budget_shaping_can_be_disabled() {
+    let mut script = Vec::new();
+    for i in 0..9 {
+        let (tool, path) = if i % 2 == 0 {
+            ("stub_read_a", format!("a{i}.txt"))
+        } else {
+            ("stub_read_b", format!("b{i}.txt"))
+        };
+        script.push(support::tool_call_response(
+            &format!("call-{i}"),
+            tool,
+            &serde_json::json!({"path": path}),
+        ));
+    }
+    script.push(support::text_response(""));
+    let recording = Arc::new(RecordingProvider::new(script));
+    let provider: Arc<dyn LLMProvider> = recording.clone();
+
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(StubReadTool::new("stub_read_a")));
+    tools.register(Box::new(StubReadTool::new("stub_read_b")));
+    tools.register(Box::new(StubWriteTool));
+
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(10);
+    orch.set_tool_budget_shaping(false);
+
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            sink.lock().unwrap().push(message);
+        }
+    });
+
+    orch.run("shape the budget").expect("run completes");
+
+    let counts = recording.tool_counts.lock().unwrap();
+    assert_eq!(
+        counts[7], 3,
+        "80% stage must not shrink tools: {:?}",
+        *counts
+    );
+    assert_eq!(
+        counts[8], 3,
+        "90% stage must not shrink tools: {:?}",
+        *counts
+    );
+    assert_eq!(
+        counts[9], 0,
+        "finalization still strips tools: {:?}",
+        *counts
+    );
+    let captured = events.lock().unwrap();
+    assert!(
+        !captured.iter().any(|m| m.contains("Tool budget")),
+        "no stage announcements when disabled: {:?}",
+        *captured
+    );
+}
+
+/// Fails with a transient-looking error on the first call, succeeds after.
+struct FlakyTool {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl takka_core::tool::Tool for FlakyTool {
+    fn name(&self) -> &str {
+        "flaky"
+    }
+    fn description(&self) -> &str {
+        "fails once with a transient error"
+    }
+    fn schema(&self) -> takka_core::tool::ToolSchema {
+        takka_core::tool::ToolSchema::new("flaky".to_string(), "fails once")
+    }
+    fn execute(&self, _args: serde_json::Value) -> takka_core::tool::ToolResult<serde_json::Value> {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            Err(takka_core::tool::ToolError(
+                "connection reset by peer".into(),
+            ))
+        } else {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+    fn metadata(&self) -> takka_core::tool::ToolMetadata {
+        takka_core::tool::ToolMetadata::read_only()
+    }
+}
+
+fn run_flaky(auto_retry: bool) -> usize {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(vec![
+        support::tool_call_response("c1", "flaky", &serde_json::json!({})),
+        support::text_response("done"),
+    ]));
+    let tools = ToolRegistry::new();
+    tools.register(Box::new(FlakyTool {
+        calls: calls.clone(),
+    }));
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_auto_retry(auto_retry);
+    orch.run("call the flaky tool").expect("run completes");
+    calls.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn auto_retry_defaults_on_and_can_be_disabled() {
+    assert_eq!(run_flaky(true), 2, "transient error is retried once");
+    assert_eq!(run_flaky(false), 1, "no retry when disabled");
+}

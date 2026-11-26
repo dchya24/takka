@@ -115,6 +115,17 @@ fn price_table() -> &'static [(&'static str, ModelPrice)] {
         // ── DeepSeek / GLM ─────────────────────────────────────
         ("deepseek-chat", ModelPrice::new(0.27, 1.10)),
         ("deepseek-coder", ModelPrice::new(0.27, 1.10)),
+        // glm-5.3-flash: no published cache-write price, so writes fall back
+        // to the input price. No shorter `glm-5` entry exists, so nothing shadows it.
+        (
+            "glm-5.3-flash",
+            ModelPrice {
+                input_per_mtok: 0.15,
+                output_per_mtok: 0.50,
+                cache_read_per_mtok: Some(0.03),
+                cache_write_per_mtok: None,
+            },
+        ),
         ("glm-4.7", ModelPrice::new(0.60, 2.20)),
         ("glm-4", ModelPrice::new(0.60, 2.20)),
     ];
@@ -166,6 +177,16 @@ mod tests {
         assert_eq!(sonnet.input_per_mtok, 3.00);
         let gpt4 = lookup("gpt-4o-2024-08-06").expect("known family");
         assert_eq!(gpt4.output_per_mtok, 10.00);
+    }
+
+    #[test]
+    fn glm_5_3_flash_is_priced() {
+        let price = lookup("glm-5.3-flash").expect("priced");
+        // 1M input + 1M output + 1M cache reads = $0.15 + $0.50 + $0.03.
+        let cost = price.cost_usd(1_000_000, 1_000_000, 1_000_000, 0);
+        assert!((cost - 0.68).abs() < 1e-9, "cost = {cost}");
+        // Vendor-prefixed names resolve to the same entry, not `glm-4`.
+        assert_eq!(lookup("zai/glm-5.3-flash"), Some(price));
     }
 
     #[test]

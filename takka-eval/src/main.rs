@@ -70,6 +70,10 @@ enum Command {
         /// Largest tolerated rise (percent) of median iterations or median cost.
         #[arg(long, default_value_t = 25.0)]
         max_regress_pct: f64,
+        /// Switch orchestrator features off for this run (ablation), e.g.
+        /// `--disable loop-nudge,auto-retry`. Repeatable.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        disable: Vec<child::Feature>,
     },
     /// List the tasks that would run.
     List {
@@ -93,6 +97,8 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         default_max_cost_usd: Option<f64>,
+        #[arg(long, value_enum)]
+        disable: Vec<child::Feature>,
     },
 }
 
@@ -118,13 +124,21 @@ fn real_main() -> Result<()> {
             live_config,
             model,
             default_max_cost_usd,
+            disable,
         } => {
             let source = match (cassette, live_config) {
                 (Some(c), None) => child::ProviderSource::Cassette(c),
                 (None, Some(config_path)) => child::ProviderSource::Live { config_path },
                 _ => bail!("child needs exactly one of --cassette or --live-config"),
             };
-            child::run_child(&spec, &source, model.as_deref(), default_max_cost_usd, &out)
+            child::run_child(
+                &spec,
+                &source,
+                model.as_deref(),
+                default_max_cost_usd,
+                &disable,
+                &out,
+            )
         }
         Command::Run {
             tasks,
@@ -140,6 +154,7 @@ fn real_main() -> Result<()> {
             baseline,
             max_pass_drop,
             max_regress_pct,
+            disable,
         } => {
             let loaded = task::load_tasks(&tasks, filter.as_deref())?;
             if loaded.is_empty() {
@@ -156,7 +171,12 @@ fn real_main() -> Result<()> {
                 model,
                 default_max_cost_usd: live.then_some(max_cost_usd),
                 config,
+                disabled: disable.clone(),
             };
+            if !disable.is_empty() {
+                let names: Vec<_> = disable.iter().map(|f| f.name()).collect();
+                eprintln!("ablation: disabled {}", names.join(", "));
+            }
             if live {
                 // Resolve the model now: validates the config before any
                 // spend, and lets us refuse models we cannot price.

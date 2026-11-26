@@ -2321,6 +2321,7 @@ dependencies = [
  "serde_json",
  "takka-core",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

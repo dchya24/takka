@@ -138,6 +138,9 @@ impl Orchestrator {
         args: &serde_json::Value,
         raw: String,
     ) -> (String, Option<String>) {
+        if !self.auto_retry {
+            return (raw, None);
+        }
         let Some(first_error) = transient_tool_error(&raw) else {
             return (raw, None);
         };

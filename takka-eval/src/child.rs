@@ -16,6 +16,32 @@ use takka_core::{Event, LLMProvider, Orchestrator, ToolRegistry};
 /// Model name used for replay when neither the task nor `--model` sets one.
 pub const DEFAULT_REPLAY_MODEL: &str = "eval-model";
 
+/// An orchestrator feature the eval can switch off to measure what it buys.
+/// Default behaviour (all on) is what ships; these exist for ablation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Feature {
+    /// P-01 semantic loop nudge (the exact-match abort stays on).
+    #[value(name = "loop-nudge")]
+    LoopNudge,
+    /// P-02 single in-loop retry of transient tool errors.
+    #[value(name = "auto-retry")]
+    AutoRetry,
+    /// P-06 graduated tool-set shrinking at 80%/90% of the iteration cap.
+    #[value(name = "budget-shaping")]
+    BudgetShaping,
+}
+
+impl Feature {
+    /// The CLI spelling, used when passing the switch on to the child.
+    pub fn name(self) -> &'static str {
+        match self {
+            Feature::LoopNudge => "loop-nudge",
+            Feature::AutoRetry => "auto-retry",
+            Feature::BudgetShaping => "budget-shaping",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProviderSource {
     /// Replay a cassette. Hermetic: no config, no network.
@@ -64,7 +90,12 @@ pub fn build_provider(
 }
 
 /// Run the task prompt against `provider` in the current directory.
-pub fn run_in_cwd(spec: &TaskSpec, provider: Arc<dyn LLMProvider>, model: &str) -> ChildOutcome {
+pub fn run_in_cwd(
+    spec: &TaskSpec,
+    provider: Arc<dyn LLMProvider>,
+    model: &str,
+    disabled: &[Feature],
+) -> ChildOutcome {
     let tools = ToolRegistry::new();
     for t in builtin_tools_with_deps(ToolDeps::new()) {
         tools.register(t);
@@ -80,6 +111,13 @@ pub fn run_in_cwd(spec: &TaskSpec, provider: Arc<dyn LLMProvider>, model: &str) 
     orch.set_system_prompt(system_prompt);
     orch.set_max_iterations(spec.max_iterations);
     orch.set_max_cost_usd(spec.max_cost_usd);
+    for feature in disabled {
+        match feature {
+            Feature::LoopNudge => orch.set_semantic_loop_nudge(false),
+            Feature::AutoRetry => orch.set_auto_retry(false),
+            Feature::BudgetShaping => orch.set_tool_budget_shaping(false),
+        }
+    }
 
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();
@@ -112,6 +150,7 @@ pub fn run_child(
     source: &ProviderSource,
     model_override: Option<&str>,
     default_max_cost_usd: Option<f64>,
+    disabled: &[Feature],
     out: &Path,
 ) -> Result<()> {
     let mut spec: TaskSpec = serde_json::from_str(&std::fs::read_to_string(spec_path)?)?;
@@ -119,8 +158,14 @@ pub fn run_child(
         spec.max_cost_usd = default_max_cost_usd;
     }
     let model_override = model_override.or(spec.model.as_deref());
+    // Real providers drive reqwest through `futures::executor::block_on`,
+    // which needs a Tokio reactor in context (the CLI gets it from
+    // `#[tokio::main]`). A multi-thread runtime keeps the IO driver running
+    // on its own workers while this thread blocks.
+    let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
+    let _entered = runtime.enter();
     let (provider, model) = build_provider(source, model_override)?;
-    let outcome = run_in_cwd(&spec, provider, &model);
+    let outcome = run_in_cwd(&spec, provider, &model, disabled);
     std::fs::write(out, serde_json::to_vec(&outcome)?)?;
     Ok(())
 }

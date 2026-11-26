@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Core/eval: **ablation switches** for the loop-behaviour features, so their
+  effect can be measured instead of assumed. `Orchestrator` gains
+  `set_semantic_loop_nudge` (P-01), `set_auto_retry` (P-02) and
+  `set_tool_budget_shaping` (P-06); all default to on and shipped behaviour is
+  unchanged. The exact-match loop abort and the forced finalization turn are
+  safety backstops and stay on. `takka-eval run --disable
+  loop-nudge,auto-retry,budget-shaping` switches them off for a suite run.
+- Core: price table entry for `glm-5.3-flash` ($0.15 in / $0.50 out / $0.03
+  cache-read per 1M tokens), so the eval live lane can enforce cost ceilings.
 - CLI: **update hint in the interactive banner** — the REPL checks GitHub
   Releases in the background (at most every 24 h, cached in
   `~/.config/takka/update-check.json`) and shows a one-line hint on the next
