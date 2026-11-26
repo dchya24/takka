@@ -386,7 +386,11 @@ mod tests {
         let msg = err.to_string().to_lowercase();
         // reqwest's Display alone says only "error sending request for url";
         // the cause ("Connection refused") is what retry logic needs.
-        assert!(msg.contains("connection refused"), "got: {msg}");
+        // Windows words the same failure "actively refused it".
+        assert!(
+            msg.contains("connection refused") || msg.contains("actively refused"),
+            "got: {msg}"
+        );
     }
 
     #[test]

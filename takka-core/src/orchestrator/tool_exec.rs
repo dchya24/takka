@@ -37,12 +37,15 @@ struct SlotOutcome {
 /// flaky transport failures. Anything else (file not found, schema
 /// validation, permission denied) is persistent — retrying it just
 /// wastes a turn and teaches the model to repeat itself.
-const TRANSIENT_ERROR_MARKERS: [&str; 8] = [
+const TRANSIENT_ERROR_MARKERS: [&str; 10] = [
     "timed out",
     "timeout",
     "temporarily unavailable",
     "connection reset",
     "connection refused",
+    // Windows wording for the same failures (WSAECONNREFUSED / WSAECONNRESET).
+    "actively refused",
+    "forcibly closed",
     "broken pipe",
     "rate limit",
     "503",
@@ -1133,6 +1136,16 @@ mod transient_classification_tests {
             transient_tool_error(&raw).is_some(),
             "a refused connection must qualify for the one automatic retry; got: {raw}"
         );
+    }
+
+    #[test]
+    fn windows_connection_failures_are_transient() {
+        for msg in [
+            "Tool error: Fetch failed: tcp connect error: No connection could be made because the target machine actively refused it. (os error 10061)",
+            "Tool error: Fetch failed: An existing connection was forcibly closed by the remote host. (os error 10054)",
+        ] {
+            assert!(transient_tool_error(msg).is_some(), "{msg}");
+        }
     }
 
     #[test]
