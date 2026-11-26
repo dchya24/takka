@@ -1,0 +1,2 @@
+{"seq":0,"response":{"id":"resp-call-1","model":"gpt-4o-mini","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"tests/fixtures/data/hello.txt\"}"}}]},"finish_reason":"tool_calls","usage":null}}
+{"seq":1,"response":{"id":"resp-text","model":"gpt-4o-mini","message":{"role":"assistant","content":"42 is the answer","tool_calls":[]},"finish_reason":"stop","usage":null}}

@@ -1,6 +1,7 @@
 //! LLM Provider trait and implementations
 
 pub mod anthropic;
+pub mod cassette;
 pub mod openai;
 
 pub use anthropic::{
@@ -8,6 +9,7 @@ pub use anthropic::{
     AnthropicProviderConfig, AnthropicResponse, AnthropicStreamDelta, AnthropicStreamEvent,
     AnthropicStreamMessage, AnthropicUsage, RetryConfig,
 };
+pub use cassette::{request_fingerprint, CassetteProvider, Exchange};
 pub use openai::{OpenAIProvider, OpenAIProviderConfig};
 
 use serde::{Deserialize, Serialize};
