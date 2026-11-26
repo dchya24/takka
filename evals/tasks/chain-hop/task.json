@@ -1,0 +1,20 @@
+{
+  "id": "chain-hop",
+  "prompt": "chain.txt has 2000 numbered lines. Start at line 0001 and follow its `goto NNNN` pointer to that numbered line, then follow that line's pointer, and so on, until you reach a line that says `ANSWER <word>`. Write that word to answer.txt. The pointers are physical line numbers; do not guess or skip hops. This machine has no shell: use only the file tools (read_file, grep, write_file).",
+  "tags": [
+    "loop-detection",
+    "paging",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 40,
+  "verify": {
+    "command": "test \"$(cat answer.txt | tr -d '[:space:]')\" = 'quartz-619'",
+    "forbid_paths": [
+      "chain.txt"
+    ]
+  }
+}
