@@ -49,6 +49,8 @@ pub fn resolve_prompt(prompt: &str, port: u16) -> String {
 
 /// Start the service and wait until `port` accepts connections.
 pub fn start(spec: &SetupSpec, task_dir: &Path, workdir: &Path, port: u16) -> Result<Service> {
+    // The service's stderr goes to a temp file so a failed start can say why.
+    let stderr_file = tempfile::tempfile().context("creating service stderr file")?;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(format!("exec {}", spec.command))
@@ -58,7 +60,9 @@ pub fn start(spec: &SetupSpec, task_dir: &Path, workdir: &Path, port: u16) -> Re
         .env("EVAL_WORKDIR", workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            stderr_file.try_clone().context("cloning stderr file")?,
+        ))
         .spawn()
         .with_context(|| format!("starting service `{}`", spec.command))?;
 
@@ -69,19 +73,43 @@ pub fn start(spec: &SetupSpec, task_dir: &Path, workdir: &Path, port: u16) -> Re
             return Ok(Service { child });
         }
         if let Some(status) = child.try_wait()? {
-            bail!("service `{}` exited early with {status}", spec.command);
+            bail!(
+                "service `{}` exited early with {status}{}",
+                spec.command,
+                stderr_tail(&stderr_file)
+            );
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "service `{}` not ready on port {port} after {}s",
+                "service `{}` not ready on port {port} after {}s{}",
                 spec.command,
-                spec.ready_timeout_secs
+                spec.ready_timeout_secs,
+                stderr_tail(&stderr_file)
             );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The last part of the service's stderr as ` (stderr: ...)`, or empty.
+fn stderr_tail(file: &std::fs::File) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file;
+    let mut text = String::new();
+    if f.seek(SeekFrom::Start(0)).is_err() || f.read_to_string(&mut text).is_err() {
+        return String::new();
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let keep = text.len().saturating_sub(500);
+    let start = (keep..text.len())
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    format!(" (stderr: {})", &text[start..])
 }
 
 #[cfg(all(test, unix))]
@@ -138,6 +166,22 @@ mod tests {
             .expect("must fail")
             .to_string();
         assert!(err.contains("not ready"), "{err}");
+    }
+
+    #[test]
+    fn startup_errors_include_the_service_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().unwrap();
+        let err = start(
+            &spec("sh -c 'echo boom-from-$((1+1)) >&2; exit 3'", 5),
+            dir.path(),
+            dir.path(),
+            port,
+        )
+        .err()
+        .expect("must fail")
+        .to_string();
+        assert!(err.contains("boom-from-2"), "{err}");
     }
 
     #[test]

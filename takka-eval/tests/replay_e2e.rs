@@ -263,7 +263,8 @@ fn setup_service_is_reachable_from_verify() {
     std::fs::write(
         dir.join("task.json"),
         json!({"id": "svc", "prompt": "do nothing at {port}",
-            "setup": {"command": "python3 -m http.server $EVAL_PORT --bind 127.0.0.1"},
+            "setup": {"command": "python3 -m http.server $EVAL_PORT --bind 127.0.0.1",
+                "ready_timeout_secs": 30},
             "verify": {"command": "python3 -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/' % os.environ['EVAL_PORT'])\""}})
         .to_string(),
     )
