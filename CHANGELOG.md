@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skipped by the replay lane) and `setup` (a background service started on a
   free port, exposed as `{port}` in the prompt and `EVAL_PORT` to verify, and
   killed afterwards).
+- Eval: a run killed by its wall-clock timeout (or a crashed child) now keeps
+  the metrics it produced so far (iterations, tool calls, nudges, cost); the
+  child streams its events to a `<outcome>.events` log as it runs.
+- Eval: results keep one record per run (`run_details`: pass/fail and reason,
+  iterations, nudges, retries, budget stage, cost) and the table gains a
+  `fired (runs)` column, so a failure or a feature trigger can be traced when
+  `--n > 1`. New metrics `budget_stage` (0-2, from the tool-budget stage
+  announcements) and `finalized` (forced finalization at the iteration cap).
+  Older result files still load.
 - Core: price table entry for `glm-5.3-flash` ($0.15 in / $0.50 out / $0.03
   cache-read per 1M tokens), so the eval live lane can enforce cost ceilings.
 - CLI: **update hint in the interactive banner** — the REPL checks GitHub

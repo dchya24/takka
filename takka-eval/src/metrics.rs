@@ -27,6 +27,13 @@ pub struct Metrics {
     pub denied_tools: u32,
     /// `"max_tokens"`, `"max_turn_requests"` or `"cost"` when a limit ended the run.
     pub limit_hit: Option<String>,
+    /// Highest graduated tool-budget stage reached: 0 none, 1 read-only tools
+    /// stripped (80%), 2 only mutating tools left (90%).
+    #[serde(default)]
+    pub budget_stage: u8,
+    /// The run hit the iteration cap and was forced to finalize.
+    #[serde(default)]
+    pub finalized: bool,
 }
 
 impl Metrics {
@@ -79,6 +86,14 @@ pub fn from_events(events: &[Event], model: &str) -> Metrics {
                 // integration tests in takka-core assert the same strings.
                 if message.contains("re-reading") {
                     m.loop_nudges += 1;
+                }
+                if message.contains("Tool budget 90%") {
+                    m.budget_stage = m.budget_stage.max(2);
+                } else if message.contains("Tool budget 80%") {
+                    m.budget_stage = m.budget_stage.max(1);
+                }
+                if message.contains("finalizing answer") {
+                    m.finalized = true;
                 }
                 if message.contains("denied") || message.contains("confirmation denied") {
                     m.denied_tools += 1;
@@ -191,6 +206,32 @@ mod tests {
         assert_eq!(from_events(&[], "gpt-4o-mini").cost_usd, None);
         let m = from_events(&[usage(1_000_000, 0, None)], "gpt-4o-mini");
         assert!(m.cost_usd.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn tracks_highest_budget_stage_and_forced_finalization() {
+        let sys = |s: &str| Event::System { message: s.into() };
+        assert_eq!(from_events(&[], "m").budget_stage, 0);
+        assert!(!from_events(&[], "m").finalized);
+        let m = from_events(
+            &[
+                sys("\u{26a0}\u{fe0f} Approaching iteration limit (6/7)"),
+                sys("\u{26a0}\u{fe0f} Tool budget 80% (iteration 6/7) \u{2014} read-only tools disabled"),
+            ],
+            "m",
+        );
+        assert_eq!(m.budget_stage, 1, "approaching alone is not a stage");
+        assert!(!m.finalized);
+        let m = from_events(
+            &[
+                sys("Tool budget 80% (iteration 8/10) - read-only tools disabled"),
+                sys("Tool budget 90% (iteration 9/10) - only write/edit tools remain"),
+                sys("\u{1f6d1} Iteration limit reached (10) \u{2014} finalizing answer"),
+            ],
+            "m",
+        );
+        assert_eq!(m.budget_stage, 2);
+        assert!(m.finalized);
     }
 
     #[test]

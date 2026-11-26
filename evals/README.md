@@ -64,6 +64,15 @@ model may never thrash or hit a transient error. The live lane ignores
 `expect` for the verdict and still reports the same metrics (nudges, retries,
 iterations, limit hit).
 
+## Reading results
+
+`--out` writes one JSON object per task. With `--n > 1` the headline metrics come
+from the median run, so use `run_details` (one record per run, in run order) to
+see every run's verdict, failure reason, iterations, nudges, retries, budget
+stage and cost. The table's `fired (runs)` column says in how many runs each
+feature fired (`nudge`, `retry`, `shape`); a task whose feature never fires
+carries no information for an ablation.
+
 ## Lanes and live-only tasks
 
 `task.json` may set `"lanes": ["live"]` (default: both). A live-only task needs

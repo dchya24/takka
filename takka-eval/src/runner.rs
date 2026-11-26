@@ -57,6 +57,41 @@ pub struct TaskResult {
     /// How many of those runs passed. `passed` is the majority outcome.
     #[serde(default)]
     pub pass_count: u32,
+    /// One record per run, in run order, so a failure or a feature trigger
+    /// can be traced even when the representative metrics come from the
+    /// median run. Older result files omit it.
+    #[serde(default)]
+    pub run_details: Vec<RunDetail>,
+}
+
+/// What happened in one run of a task (see `TaskResult::run_details`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunDetail {
+    pub passed: bool,
+    pub failure: Option<String>,
+    pub iterations: u32,
+    pub loop_nudges: u32,
+    pub auto_retries: u32,
+    pub budget_stage: u8,
+    pub finalized: bool,
+    pub cost_usd: Option<f64>,
+    pub wall_ms: u64,
+}
+
+impl From<&TaskResult> for RunDetail {
+    fn from(r: &TaskResult) -> Self {
+        RunDetail {
+            passed: r.passed,
+            failure: r.failure.clone(),
+            iterations: r.metrics.iterations,
+            loop_nudges: r.metrics.loop_nudges,
+            auto_retries: r.metrics.auto_retries,
+            budget_stage: r.metrics.budget_stage,
+            finalized: r.metrics.finalized,
+            cost_usd: r.metrics.cost_usd,
+            wall_ms: r.wall_ms,
+        }
+    }
 }
 
 fn one() -> u32 {
@@ -153,6 +188,12 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
 
     let mut outcome: Option<ChildOutcome> = None;
     let mut failure: Option<String> = None;
+    // Events streamed before a timeout or crash; used when there is no outcome.
+    let partial_events = if matches!(&status, Some(s) if s.success()) {
+        Vec::new()
+    } else {
+        crate::child::read_events_log(&crate::child::events_log_path(&out_file))
+    };
     match status {
         None => failure = Some(format!("agent timed out after {}s", timeout.as_secs())),
         Some(s) if !s.success() => {
@@ -202,7 +243,7 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     let metrics = outcome
         .as_ref()
         .map(|o| metrics::from_events(&o.events, &model))
-        .unwrap_or_default();
+        .unwrap_or_else(|| metrics::from_events(&partial_events, &model));
 
     if failure.is_none() {
         failure = expectation_failure(opts.lane, &metrics, &task.spec.expect);
@@ -223,6 +264,7 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         metrics,
         runs: 1,
         pass_count: u32::from(failure_is_none),
+        run_details: Vec::new(),
     })
 }
 
@@ -286,6 +328,7 @@ fn failed_result(task: &Task, model: &Option<String>, reason: String) -> TaskRes
         metrics: Metrics::default(),
         runs: 1,
         pass_count: 0,
+        run_details: Vec::new(),
     }
 }
 
@@ -316,12 +359,14 @@ pub fn run_task_n(
 pub fn aggregate(mut runs: Vec<TaskResult>) -> TaskResult {
     assert!(!runs.is_empty(), "aggregate needs at least one run");
     let total = runs.len() as u32;
+    let details: Vec<RunDetail> = runs.iter().map(RunDetail::from).collect();
     let pass_count = runs.iter().filter(|r| r.passed).count() as u32;
     let failure = runs.iter().find_map(|r| r.failure.clone());
     runs.sort_by_key(|r| r.metrics.iterations);
     let mut rep = runs.swap_remove(runs.len() / 2);
     rep.runs = total;
     rep.pass_count = pass_count;
+    rep.run_details = details;
     rep.passed = pass_count * 2 > total;
     rep.failure = if rep.passed { None } else { failure };
     rep
@@ -560,7 +605,33 @@ mod tests {
             },
             runs: 1,
             pass_count: u32::from(passed),
+            run_details: Vec::new(),
         }
+    }
+
+    #[test]
+    fn aggregate_keeps_one_detail_per_run_in_order() {
+        let mut a = res(false, 9);
+        a.failure = Some("verify command exited with 1".into());
+        a.metrics.budget_stage = 2;
+        a.metrics.finalized = true;
+        let mut b = res(true, 4);
+        b.metrics.loop_nudges = 1;
+        let c = res(true, 6);
+        let agg = aggregate(vec![a, b, c]);
+        let d = &agg.run_details;
+        assert_eq!(d.len(), 3);
+        // Run order is preserved, not the median ordering used for metrics.
+        assert_eq!(d[0].iterations, 9);
+        assert!(!d[0].passed);
+        assert_eq!(
+            d[0].failure.as_deref(),
+            Some("verify command exited with 1")
+        );
+        assert_eq!((d[0].budget_stage, d[0].finalized), (2, true));
+        assert_eq!(d[1].loop_nudges, 1);
+        assert_eq!(d[2].iterations, 6);
+        assert_eq!(agg.runs, 3);
     }
 
     #[test]

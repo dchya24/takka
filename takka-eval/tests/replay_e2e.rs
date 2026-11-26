@@ -294,3 +294,37 @@ fn setup_service_that_never_starts_fails_the_task() {
     assert_eq!(code, 1, "{stdout}");
     assert!(stdout.contains("not ready"), "{stdout}");
 }
+
+/// A run killed by the wall-clock timeout still reports what it did before
+/// being killed (iterations, tool calls), so a slow run can be diagnosed.
+#[test]
+fn timed_out_run_keeps_partial_metrics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("slow");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "slow", "prompt": "p", "timeout_secs": 2,
+            "verify": {"command": "true"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("cassette.jsonl"),
+        [
+            call(0, "run_command", json!({"command": "sleep 30"})),
+            text(1, "done"),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let out = tmp.path().join("results.jsonl");
+    let (code, stdout, _) = run(tmp.path(), &["--out", out.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stdout}");
+    let line = std::fs::read_to_string(out).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert!(v["failure"].as_str().unwrap().contains("timed out"), "{v}");
+    assert_eq!(v["metrics"]["iterations"], 1, "{v}");
+    assert_eq!(v["metrics"]["tool_calls"]["run_command"], 1, "{v}");
+    assert_eq!(v["run_details"][0]["iterations"], 1, "{v}");
+}

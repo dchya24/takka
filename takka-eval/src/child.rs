@@ -89,12 +89,32 @@ pub fn build_provider(
     }
 }
 
-/// Run the task prompt against `provider` in the current directory.
+/// Where the child streams events while it runs, next to its outcome file.
+/// The outcome file is only written when the run ends; this log survives a
+/// kill, so the runner can still report what a timed-out run did.
+pub fn events_log_path(out: &Path) -> PathBuf {
+    let mut s = out.as_os_str().to_owned();
+    s.push(".events");
+    PathBuf::from(s)
+}
+
+/// Read a streamed event log, skipping a line cut off by a kill.
+pub fn read_events_log(path: &Path) -> Vec<Event> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Run the task prompt against `provider` in the current directory. When
+/// `events_log` is set, every event is also appended there as one JSON line.
 pub fn run_in_cwd(
     spec: &TaskSpec,
     provider: Arc<dyn LLMProvider>,
     model: &str,
     disabled: &[Feature],
+    events_log: Option<&Path>,
 ) -> ChildOutcome {
     let tools = ToolRegistry::new();
     for t in builtin_tools_with_deps(ToolDeps::new()) {
@@ -121,7 +141,15 @@ pub fn run_in_cwd(
 
     let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();
+    let log = events_log.and_then(|p| std::fs::File::create(p).ok());
     orch.on_event(move |e| {
+        if let Some(mut f) = log.as_ref() {
+            use std::io::Write;
+            if let Ok(mut line) = serde_json::to_vec(&e) {
+                line.push(b'\n');
+                let _ = f.write_all(&line);
+            }
+        }
         if let Ok(mut v) = sink.lock() {
             v.push(e);
         }
@@ -165,7 +193,13 @@ pub fn run_child(
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     let _entered = runtime.enter();
     let (provider, model) = build_provider(source, model_override)?;
-    let outcome = run_in_cwd(&spec, provider, &model, disabled);
+    let outcome = run_in_cwd(
+        &spec,
+        provider,
+        &model,
+        disabled,
+        Some(&events_log_path(out)),
+    );
     std::fs::write(out, serde_json::to_vec(&outcome)?)?;
     Ok(())
 }

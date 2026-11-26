@@ -24,8 +24,17 @@ pub fn read_jsonl(path: &Path) -> Result<Vec<TaskResult>> {
 pub fn summary_table(results: &[TaskResult]) -> String {
     let id_w = results.iter().map(|r| r.id.len()).max().unwrap_or(2).max(4);
     let mut out = format!(
-        "{:<id_w$}  {:<5}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {}\n",
-        "task", "pass", "iter", "tools", "cost_usd", "cache", "nudge", "retry", "note"
+        "{:<id_w$}  {:<5}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {:<30}  {}\n",
+        "task",
+        "pass",
+        "iter",
+        "tools",
+        "cost_usd",
+        "cache",
+        "nudge",
+        "retry",
+        "fired (runs)",
+        "note"
     );
     for r in results {
         let cost = r
@@ -46,7 +55,7 @@ pub fn summary_table(results: &[TaskResult]) -> String {
             "FAIL".to_string()
         };
         out.push_str(&format!(
-            "{:<id_w$}  {:<5}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {}\n",
+            "{:<id_w$}  {:<5}  {:>5}  {:>5}  {:>9}  {:>6}  {:>6}  {:>6}  {:<30}  {}\n",
             r.id,
             verdict,
             r.metrics.iterations,
@@ -55,12 +64,27 @@ pub fn summary_table(results: &[TaskResult]) -> String {
             format!("{:.0}%", r.metrics.cache_hit_ratio() * 100.0),
             r.metrics.loop_nudges,
             r.metrics.auto_retries,
+            fired_summary(r),
             note
         ));
     }
     let passed = results.iter().filter(|r| r.passed).count();
     out.push_str(&format!("\n{passed}/{} passed\n", results.len()));
     out
+}
+
+/// In how many runs each feature fired, e.g. `nudge 3/5 retry 0/5 shape 2/5`.
+/// Empty for results without per-run records (older files).
+fn fired_summary(r: &TaskResult) -> String {
+    let d = &r.run_details;
+    if d.is_empty() {
+        return String::new();
+    }
+    let n = d.len();
+    let nudge = d.iter().filter(|x| x.loop_nudges > 0).count();
+    let retry = d.iter().filter(|x| x.auto_retries > 0).count();
+    let shape = d.iter().filter(|x| x.budget_stage > 0).count();
+    format!("nudge {nudge}/{n} retry {retry}/{n} shape {shape}/{n}")
 }
 
 #[cfg(test)]
@@ -87,6 +111,7 @@ mod tests {
             metrics: Metrics::default(),
             runs: 1,
             pass_count: u32::from(passed),
+            run_details: Vec::new(),
         }
     }
 
@@ -98,6 +123,46 @@ mod tests {
         let back = read_jsonl(&p).unwrap();
         assert_eq!(back.len(), 2);
         assert!(!back[1].passed);
+    }
+
+    #[test]
+    fn table_shows_how_often_each_feature_fired() {
+        let mut r = result("t", true);
+        r.runs = 2;
+        r.run_details = vec![
+            crate::runner::RunDetail {
+                passed: true,
+                failure: None,
+                iterations: 5,
+                loop_nudges: 1,
+                auto_retries: 0,
+                budget_stage: 2,
+                finalized: false,
+                cost_usd: None,
+                wall_ms: 1,
+            },
+            crate::runner::RunDetail {
+                passed: true,
+                failure: None,
+                iterations: 4,
+                loop_nudges: 0,
+                auto_retries: 0,
+                budget_stage: 0,
+                finalized: false,
+                cost_usd: None,
+                wall_ms: 1,
+            },
+        ];
+        let t = summary_table(&[r]);
+        assert!(t.contains("nudge 1/2 retry 0/2 shape 1/2"), "{t}");
+    }
+
+    #[test]
+    fn old_result_files_without_run_details_still_load() {
+        let old = r#"{"id":"a","tags":[],"passed":true,"failure":null,"verify_exit":0,"agent_error":null,"forbidden_edits":[],"files_changed":1,"wall_ms":5,"model":"m","metrics":{"iterations":3,"tool_calls":{},"tool_failures":0,"prompt_tokens":0,"completion_tokens":0,"cache_read_tokens":0,"cache_creation_tokens":0,"cost_usd":null,"loop_nudges":0,"auto_retries":0,"denied_tools":0,"limit_hit":null},"runs":1,"pass_count":1}"#;
+        let r: TaskResult = serde_json::from_str(old).unwrap();
+        assert!(r.run_details.is_empty());
+        assert_eq!(r.metrics.budget_stage, 0);
     }
 
     #[test]
