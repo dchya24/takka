@@ -1,0 +1,20 @@
+{
+  "id": "flaky-api-token",
+  "prompt": "Fetch http://127.0.0.1:{port}/token and save the `token` field of the JSON response to token.txt (just the token, nothing else).",
+  "tags": [
+    "auto-retry",
+    "network",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 15,
+  "setup": {
+    "command": "python3 service/server.py"
+  },
+  "verify": {
+    "command": "test \"$(cat token.txt | tr -d '[:space:]')\" = 'tok-7f3a91'"
+  }
+}

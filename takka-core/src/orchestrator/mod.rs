@@ -49,7 +49,9 @@ const LOOP_DETECTION_WINDOW: usize = 8;
 
 /// How many *semantically similar* calls (same tool, same target — args
 /// differing only in view-shift keys like `offset`) inside the semantic
-/// window trigger a steering nudge. Higher than the exact-match threshold:
+/// window trigger a steering nudge. Calls that look at disjoint line ranges
+/// of the target (paging, single-line hops) do not count: only repeated or
+/// overlapping views, or calls with no range, are thrash. Higher than the exact-match threshold:
 /// scattered same-file reads are common in real exploration, so only a
 /// sustained thrash run should fire.
 const SEMANTIC_LOOP_THRESHOLD: usize = 6;
@@ -147,6 +149,44 @@ fn normalize_args_for_semantic(args: &str) -> String {
         }
         _ => args.trim().to_string(),
     }
+}
+
+/// One entry in the semantic window: the target signature plus the line
+/// range the call looked at (when the args carry one).
+#[derive(Clone, Debug)]
+pub(super) struct SemanticEntry {
+    sig: ToolCallSignature,
+    /// Inclusive 1-based line range requested, `None` when the call has no
+    /// view arguments (a whole-target call).
+    view: Option<(u64, u64)>,
+    /// Whether this call counts toward the nudge: a whole-target call, the
+    /// first visit to a target, or a visit whose range overlaps one already
+    /// in the window. Disjoint ranges of one file are paging, not thrash.
+    counts: bool,
+}
+
+/// The inclusive line range a call asks for, from `offset`/`start_line`/
+/// `line`/`line_offset` (start) and `limit`/`end_line` (extent). A missing
+/// end is open-ended. `None` when the args have no view keys at all.
+fn view_range(args: &str) -> Option<(u64, u64)> {
+    let serde_json::Value::Object(map) = serde_json::from_str::<serde_json::Value>(args).ok()?
+    else {
+        return None;
+    };
+    let num = |k: &str| map.get(k).and_then(serde_json::Value::as_u64);
+    let start = ["offset", "start_line", "line", "line_offset"]
+        .iter()
+        .find_map(|k| num(k));
+    let end = num("end_line")
+        .or_else(|| num("limit").map(|l| start.unwrap_or(1).saturating_add(l.max(1)) - 1));
+    if start.is_none() && end.is_none() {
+        return None;
+    }
+    Some((start.unwrap_or(1), end.unwrap_or(u64::MAX)))
+}
+
+fn ranges_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
 }
 
 /// Truncate `s` to `max` bytes on a UTF-8 boundary, appending an ellipsis
@@ -288,7 +328,7 @@ pub struct Orchestrator {
     /// Recent *semantic* signatures for the second detector: same tool +
     /// same target (args differing only in offset-ish keys). Cleared when
     /// a state-changing tool executes or a run begins.
-    recent_semantic_calls: Mutex<Vec<ToolCallSignature>>,
+    recent_semantic_calls: Mutex<Vec<SemanticEntry>>,
     /// Cap individual tool result strings (Layer 1 of context compression).
     tool_result_max_chars: usize,
     /// Auto-compact memory when token usage exceeds the configured threshold.
@@ -358,6 +398,14 @@ pub struct Orchestrator {
     /// `reset_session` (a new session), restored from the checkpoint on
     /// resume.
     session_cost_usd: Mutex<f64>,
+    /// P-01 semantic loop nudge. The exact-match abort is a safety
+    /// backstop and is NOT governed by this flag.
+    semantic_loop_nudge: bool,
+    /// P-02 single in-loop retry of transient tool errors.
+    auto_retry: bool,
+    /// P-06/O-02 graduated tool-set shrinking at 80%/90% of the
+    /// iteration cap. The forced finalization turn is unaffected.
+    tool_budget_shaping: bool,
 }
 
 impl Orchestrator {
@@ -394,6 +442,9 @@ impl Orchestrator {
             plan_steps: Mutex::new(Vec::new()),
             max_cost_usd_per_session: None,
             session_cost_usd: Mutex::new(0.0),
+            semantic_loop_nudge: true,
+            auto_retry: true,
+            tool_budget_shaping: true,
         }
     }
 
@@ -481,13 +532,14 @@ impl Orchestrator {
         // De-dup within this turn (rule 2). N is tiny, so a linear
         // `contains` is cheaper than a HashSet and keeps first-seen order.
         let mut new_sigs: Vec<ToolCallSignature> = Vec::with_capacity(calls.len());
-        let mut new_semantic: Vec<ToolCallSignature> = Vec::with_capacity(calls.len());
+        let mut new_semantic: Vec<(ToolCallSignature, Option<(u64, u64)>)> =
+            Vec::with_capacity(calls.len());
         for (name, args) in calls {
             let sig = ToolCallSignature::new(name, args);
             if !new_sigs.contains(&sig) {
                 new_sigs.push(sig);
             }
-            let semantic = ToolCallSignature::semantic(name, args);
+            let semantic = (ToolCallSignature::semantic(name, args), view_range(args));
             if !new_semantic.contains(&semantic) {
                 new_semantic.push(semantic);
             }
@@ -514,16 +566,37 @@ impl Orchestrator {
         }
         drop(recent);
 
+        if !self.semantic_loop_nudge {
+            return LoopDetectionOutcome::None;
+        }
+
         // Semantic detector: accumulate similar calls, count the ones
         // matching a newly-seen signature, nudge when it crosses.
         let mut semantic = sync::lock(&self.recent_semantic_calls);
-        semantic.extend(new_semantic.iter().cloned());
+        for (sig, view) in &new_semantic {
+            let counts = match view {
+                None => true,
+                Some(v) => {
+                    let mut seen = semantic.iter().filter(|e| &e.sig == sig).peekable();
+                    seen.peek().is_none()
+                        || seen.any(|e| e.view.is_none_or(|w| ranges_overlap(*v, w)))
+                }
+            };
+            semantic.push(SemanticEntry {
+                sig: sig.clone(),
+                view: *view,
+                counts,
+            });
+        }
         if semantic.len() > SEMANTIC_LOOP_WINDOW {
             let split = semantic.len() - SEMANTIC_LOOP_WINDOW;
             semantic.drain(0..split);
         }
-        for sig in &new_semantic {
-            let count = semantic.iter().filter(|s| s == &sig).count();
+        for (sig, _) in &new_semantic {
+            let count = semantic
+                .iter()
+                .filter(|e| &e.sig == sig && e.counts)
+                .count();
             if count >= SEMANTIC_LOOP_THRESHOLD {
                 // Reset so the nudge doesn't re-fire every turn while the
                 // (possibly continuing) thrash accumulates again.
@@ -689,6 +762,26 @@ impl Orchestrator {
     /// in the `plan` checkpoint slot and prepended to every request.
     pub fn set_plan_then_execute(&mut self, enabled: bool) {
         self.plan_then_execute = enabled;
+    }
+
+    /// Enable or disable the semantic loop nudge (P-01). Default on. The
+    /// exact-match loop abort stays active either way. Exists so the eval
+    /// harness can ablate the feature.
+    pub fn set_semantic_loop_nudge(&mut self, enabled: bool) {
+        self.semantic_loop_nudge = enabled;
+    }
+
+    /// Enable or disable the automatic single retry of transient tool
+    /// errors (P-02). Default on. Exists so the eval harness can ablate it.
+    pub fn set_auto_retry(&mut self, enabled: bool) {
+        self.auto_retry = enabled;
+    }
+
+    /// Enable or disable graduated tool-budget shaping (P-06). Default on.
+    /// When off, the full tool set is offered until the forced
+    /// finalization turn. Exists so the eval harness can ablate it.
+    pub fn set_tool_budget_shaping(&mut self, enabled: bool) {
+        self.tool_budget_shaping = enabled;
     }
 
     /// Current plan steps (O-05), in stored order.

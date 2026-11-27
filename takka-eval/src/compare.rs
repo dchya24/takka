@@ -199,6 +199,7 @@ mod tests {
             },
             runs: 1,
             pass_count: u32::from(passed),
+            run_details: Vec::new(),
         }
     }
 

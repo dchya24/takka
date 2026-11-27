@@ -7,6 +7,14 @@ use serde_json::json;
 use std::path::Path;
 use std::process::Command;
 
+const LISTEN_PY: &str = r#"import os, socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(os.environ["EVAL_PORT"])))
+s.listen()
+time.sleep(60)
+"#;
+
 fn call(i: usize, name: &str, args: serde_json::Value) -> String {
     json!({"seq": i, "response": {"id": format!("r{i}"), "model": "eval-model",
         "message": {"role": "assistant", "content": null,
@@ -193,4 +201,141 @@ fn live_lane_requires_config_and_never_touches_the_network_without_it() {
     let (code, _, stderr) = run(tmp.path(), &["--lane", "live"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("--config"), "{stderr}");
+}
+
+/// Ablation: switching a feature off must change the outcome of the task
+/// that depends on it, and an unknown feature name must be rejected.
+#[test]
+fn disable_switch_turns_off_the_feature_a_task_expects() {
+    let tasks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../evals/tasks");
+
+    let (code, stdout, _) = run(&tasks, &["--filter", "loop-nudge"]);
+    assert_eq!(code, 0, "baseline run must pass: {stdout}");
+
+    let (code, stdout, _) = run(
+        &tasks,
+        &["--filter", "loop-nudge", "--disable", "loop-nudge"],
+    );
+    assert_ne!(code, 0, "task must fail without the nudge: {stdout}");
+    assert!(stdout.contains("saw 0"), "{stdout}");
+
+    let (code, _, stderr) = run(&tasks, &["--filter", "loop-nudge", "--disable", "nonsense"]);
+    assert_eq!(code, 2, "unknown feature is a usage error: {stderr}");
+}
+
+/// A live-only task has no cassette; the replay lane must skip it rather
+/// than fail on the missing file.
+#[test]
+fn replay_lane_skips_live_only_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("hard");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "hard", "prompt": "p", "lanes": ["live"],
+            "verify": {"command": "true"}})
+        .to_string(),
+    )
+    .unwrap();
+    make_task(
+        tmp.path(),
+        "easy",
+        &[],
+        &[
+            call(
+                0,
+                "write_file",
+                json!({"path": "value.txt", "content": "good\n"}),
+            ),
+            text(1, "done"),
+        ],
+    );
+    let (code, stdout, stderr) = run(tmp.path(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("easy"), "{stdout}");
+    assert!(!stdout.contains("hard"), "{stdout}");
+    assert!(stderr.contains("skipping 1 task"), "{stderr}");
+}
+
+/// A task with `setup` gets a live service: the verify command sees its port
+/// in `EVAL_PORT` and can reach it. (`{port}` substitution in the prompt is
+/// covered by a unit test; a static cassette cannot observe it.)
+#[test]
+fn setup_service_is_reachable_from_verify() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("svc");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "svc", "prompt": "do nothing at {port}",
+            "setup": {"command": "python3 listen.py", "ready_timeout_secs": 30},
+            "verify": {"command": "python3 -c \"import os,socket; socket.create_connection(('127.0.0.1', int(os.environ['EVAL_PORT'])), 5)\""}})
+        .to_string(),
+    )
+    .unwrap();
+    // A bare socket, not `http.server`: that calls `socket.getfqdn()` while
+    // binding, which can hang on CI hosts without working reverse DNS.
+    std::fs::write(dir.join("listen.py"), LISTEN_PY).unwrap();
+    std::fs::write(dir.join("cassette.jsonl"), text(0, "ok")).unwrap();
+    let (code, stdout, stderr) = run(tmp.path(), &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("1/1 passed"), "{stdout}");
+}
+
+/// A service that never comes up fails the task with a clear reason and
+/// never runs the agent.
+#[test]
+fn setup_service_that_never_starts_fails_the_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("svc");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "svc", "prompt": "p",
+            "setup": {"command": "sleep 30", "ready_timeout_secs": 1},
+            "verify": {"command": "true"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("cassette.jsonl"), text(0, "done")).unwrap();
+    let (code, stdout, _) = run(tmp.path(), &[]);
+    assert_eq!(code, 1, "{stdout}");
+    assert!(stdout.contains("not ready"), "{stdout}");
+}
+
+/// A run killed by the wall-clock timeout still reports what it did before
+/// being killed (iterations, tool calls), so a slow run can be diagnosed.
+#[test]
+fn timed_out_run_keeps_partial_metrics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("slow");
+    std::fs::create_dir_all(dir.join("repo")).unwrap();
+    std::fs::write(
+        dir.join("task.json"),
+        json!({"id": "slow", "prompt": "p", "timeout_secs": 2,
+            "verify": {"command": "true"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("cassette.jsonl"),
+        [
+            call(0, "run_command", json!({"command": "sleep 30"})),
+            text(1, "done"),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    let out = tmp.path().join("results.jsonl");
+    let (code, stdout, _) = run(tmp.path(), &["--out", out.to_str().unwrap()]);
+    assert_eq!(code, 1, "{stdout}");
+    let line = std::fs::read_to_string(out).unwrap();
+    let v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    assert!(v["failure"].as_str().unwrap().contains("timed out"), "{v}");
+    assert_eq!(v["metrics"]["iterations"], 1, "{v}");
+    assert_eq!(v["metrics"]["tool_calls"]["run_command"], 1, "{v}");
+    assert_eq!(v["run_details"][0]["iterations"], 1, "{v}");
 }

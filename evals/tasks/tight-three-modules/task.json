@@ -1,0 +1,22 @@
+{
+  "id": "tight-three-modules",
+  "prompt": "The unit tests in this directory fail (run `python3 -m unittest -q`). Fix the bugs in calc.py, text.py and dates.py so every test passes. Do not edit the test files.",
+  "tags": [
+    "budget",
+    "bugfix",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 7,
+  "verify": {
+    "command": "python3 -m unittest -q",
+    "forbid_paths": [
+      "test_calc.py",
+      "test_text.py",
+      "test_dates.py"
+    ]
+  }
+}

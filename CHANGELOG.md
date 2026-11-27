@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Loop detection (P-01): the semantic "you keep re-reading" nudge no longer
+  counts calls that look at disjoint line ranges of the same file (paging,
+  single-line hops). Repeated or overlapping ranges, and calls without a range,
+  still count. The live `chain-hop` eval showed the old rule nudging legitimate
+  hopping, after which the model abandoned efficient one-line reads and dumped
+  the file (about 2x prompt tokens per step).
+
 ### Added
+- Core/eval: **ablation switches** for the loop-behaviour features, so their
+  effect can be measured instead of assumed. `Orchestrator` gains
+  `set_semantic_loop_nudge` (P-01), `set_auto_retry` (P-02) and
+  `set_tool_budget_shaping` (P-06); all default to on and shipped behaviour is
+  unchanged. The exact-match loop abort and the forced finalization turn are
+  safety backstops and stay on. `takka-eval run --disable
+  loop-nudge,auto-retry,budget-shaping` switches them off for a suite run.
+- Eval: tasks can set `lanes` (a live-only task needs no cassette and is
+  skipped by the replay lane) and `setup` (a background service started on a
+  free port, exposed as `{port}` in the prompt and `EVAL_PORT` to verify, and
+  killed afterwards).
+- Eval: a run killed by its wall-clock timeout (or a crashed child) now keeps
+  the metrics it produced so far (iterations, tool calls, nudges, cost); the
+  child streams its events to a `<outcome>.events` log as it runs.
+- Eval: results keep one record per run (`run_details`: pass/fail and reason,
+  iterations, nudges, retries, budget stage, cost) and the table gains a
+  `fired (runs)` column, so a failure or a feature trigger can be traced when
+  `--n > 1`. New metrics `budget_stage` (0-2, from the tool-budget stage
+  announcements) and `finalized` (forced finalization at the iteration cap).
+  Older result files still load.
+- Core: price table entry for `glm-5.3-flash` ($0.15 in / $0.50 out / $0.03
+  cache-read per 1M tokens), so the eval live lane can enforce cost ceilings.
 - CLI: **update hint in the interactive banner** — the REPL checks GitHub
   Releases in the background (at most every 24 h, cached in
   `~/.config/takka/update-check.json`) and shows a one-line hint on the next
@@ -15,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TAKKA_NO_UPDATE_CHECK=1`. Nothing is installed automatically.
 
 ### Fixed
+- Eval: `expect` checks (loop nudge, auto-retry, iteration/limit assertions) now
+  apply to the replay lane only. In the live lane they failed correct runs of a
+  real model that simply never thrashed; the metrics are still reported.
 - Core/tools: `fetch` and `web_search` now keep the full `reqwest` error chain
   (e.g. "...: client error (Connect): tcp connect error: Connection refused").
   Previously only the top-level "error sending request for url" survived, so

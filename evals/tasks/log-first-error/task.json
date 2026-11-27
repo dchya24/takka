@@ -1,0 +1,20 @@
+{
+  "id": "log-first-error",
+  "prompt": "app.log is a large service log (about 3000 lines) whose lines are NOT in time order. Find the ERROR line with the earliest timestamp and write its error code (the value after `code=`, e.g. E1234) to answer.txt. This machine has no shell: use only the file tools (read_file, grep, write_file).",
+  "tags": [
+    "loop-detection",
+    "paging",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 30,
+  "verify": {
+    "command": "test \"$(cat answer.txt | tr -d '[:space:]')\" = 'E5875'",
+    "forbid_paths": [
+      "app.log"
+    ]
+  }
+}

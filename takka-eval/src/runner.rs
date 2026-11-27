@@ -3,6 +3,7 @@
 
 use crate::child::{ChildOutcome, ProviderSource};
 use crate::metrics::{self, Metrics};
+use crate::service;
 use crate::task::{ExpectSpec, Task};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,8 @@ use takka_core::runtime::pipe_id::fnv1a64;
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Lane {
     Replay,
     Live,
@@ -30,6 +32,8 @@ pub struct RunOptions {
     pub config: Option<PathBuf>,
     /// Per-run USD ceiling for tasks that do not set `max_cost_usd`.
     pub default_max_cost_usd: Option<f64>,
+    /// Features switched off for this run (ablation).
+    pub disabled: Vec<crate::child::Feature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +57,41 @@ pub struct TaskResult {
     /// How many of those runs passed. `passed` is the majority outcome.
     #[serde(default)]
     pub pass_count: u32,
+    /// One record per run, in run order, so a failure or a feature trigger
+    /// can be traced even when the representative metrics come from the
+    /// median run. Older result files omit it.
+    #[serde(default)]
+    pub run_details: Vec<RunDetail>,
+}
+
+/// What happened in one run of a task (see `TaskResult::run_details`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunDetail {
+    pub passed: bool,
+    pub failure: Option<String>,
+    pub iterations: u32,
+    pub loop_nudges: u32,
+    pub auto_retries: u32,
+    pub budget_stage: u8,
+    pub finalized: bool,
+    pub cost_usd: Option<f64>,
+    pub wall_ms: u64,
+}
+
+impl From<&TaskResult> for RunDetail {
+    fn from(r: &TaskResult) -> Self {
+        RunDetail {
+            passed: r.passed,
+            failure: r.failure.clone(),
+            iterations: r.metrics.iterations,
+            loop_nudges: r.metrics.loop_nudges,
+            auto_retries: r.metrics.auto_retries,
+            budget_stage: r.metrics.budget_stage,
+            finalized: r.metrics.finalized,
+            cost_usd: r.metrics.cost_usd,
+            wall_ms: r.wall_ms,
+        }
+    }
 }
 
 fn one() -> u32 {
@@ -88,10 +127,34 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
 
     let before = snapshot(&work)?;
 
+    // Optional background service; killed when `_service` drops at the end
+    // of this function, after verification.
+    let task_dir = std::fs::canonicalize(&task.dir)?;
+    let mut port: Option<u16> = None;
+    let mut _service = None;
+    if let Some(setup) = &task.spec.setup {
+        let p = service::free_port()?;
+        match service::start(setup, &task_dir, &work, p) {
+            Ok(s) => {
+                port = Some(p);
+                _service = Some(s);
+            }
+            Err(e) => return Ok(failed_result(task, &opts.model, format!("setup: {e:#}"))),
+        }
+    }
+    // The child reads a resolved copy of the spec so `{port}` in the prompt
+    // points at this run's service.
+    let mut spec = task.spec.clone();
+    if let Some(p) = port {
+        spec.prompt = service::resolve_prompt(&spec.prompt, p);
+    }
+    let spec_file = tmp.path().join("task.json");
+    std::fs::write(&spec_file, serde_json::to_vec_pretty(&spec)?)?;
+
     let mut cmd = Command::new(&opts.exe);
     cmd.arg("child")
         .arg("--spec")
-        .arg(std::fs::canonicalize(task.dir.join("task.json"))?)
+        .arg(&spec_file)
         .arg("--out")
         .arg(&out_file);
     match &source {
@@ -109,6 +172,9 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     if let Some(c) = opts.default_max_cost_usd {
         cmd.arg("--default-max-cost-usd").arg(c.to_string());
     }
+    for f in &opts.disabled {
+        cmd.arg("--disable").arg(f.name());
+    }
     cmd.current_dir(&work)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -122,6 +188,12 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
 
     let mut outcome: Option<ChildOutcome> = None;
     let mut failure: Option<String> = None;
+    // Events streamed before a timeout or crash; used when there is no outcome.
+    let partial_events = if matches!(&status, Some(s) if s.success()) {
+        Vec::new()
+    } else {
+        crate::child::read_events_log(&crate::child::events_log_path(&out_file))
+    };
     match status {
         None => failure = Some(format!("agent timed out after {}s", timeout.as_secs())),
         Some(s) if !s.success() => {
@@ -142,7 +214,7 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     let forbidden = forbidden_edits(&changed, &task.spec.verify.forbid_paths);
 
     let (verify_exit, verify_ok) = if failure.is_none() {
-        let code = run_verify(&task.spec.verify.command, &work)?;
+        let code = run_verify(&task.spec.verify.command, &work, port)?;
         (code, code == Some(0))
     } else {
         (None, false)
@@ -171,10 +243,10 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
     let metrics = outcome
         .as_ref()
         .map(|o| metrics::from_events(&o.events, &model))
-        .unwrap_or_default();
+        .unwrap_or_else(|| metrics::from_events(&partial_events, &model));
 
     if failure.is_none() {
-        failure = check_expectations(&metrics, &task.spec.expect);
+        failure = expectation_failure(opts.lane, &metrics, &task.spec.expect);
     }
 
     let failure_is_none = failure.is_none();
@@ -192,7 +264,20 @@ pub fn run_task(task: &Task, opts: &RunOptions) -> Result<TaskResult> {
         metrics,
         runs: 1,
         pass_count: u32::from(failure_is_none),
+        run_details: Vec::new(),
     })
+}
+
+/// Lane-aware wrapper: `expect` only constrains the replay lane. Its checks
+/// (a loop nudge, an auto-retry, a limit hit) describe behaviour a scripted
+/// cassette forces, which a real model may legitimately never exhibit, so in
+/// the live lane they would fail correct runs. Live runs still report the
+/// same metrics; only the pass/fail verdict ignores `expect`.
+pub fn expectation_failure(lane: Lane, m: &Metrics, e: &ExpectSpec) -> Option<String> {
+    match lane {
+        Lane::Replay => check_expectations(m, e),
+        Lane::Live => None,
+    }
 }
 
 /// `Some(reason)` when the run did not exhibit the behaviour a task expects.
@@ -243,6 +328,7 @@ fn failed_result(task: &Task, model: &Option<String>, reason: String) -> TaskRes
         metrics: Metrics::default(),
         runs: 1,
         pass_count: 0,
+        run_details: Vec::new(),
     }
 }
 
@@ -273,22 +359,26 @@ pub fn run_task_n(
 pub fn aggregate(mut runs: Vec<TaskResult>) -> TaskResult {
     assert!(!runs.is_empty(), "aggregate needs at least one run");
     let total = runs.len() as u32;
+    let details: Vec<RunDetail> = runs.iter().map(RunDetail::from).collect();
     let pass_count = runs.iter().filter(|r| r.passed).count() as u32;
     let failure = runs.iter().find_map(|r| r.failure.clone());
     runs.sort_by_key(|r| r.metrics.iterations);
     let mut rep = runs.swap_remove(runs.len() / 2);
     rep.runs = total;
     rep.pass_count = pass_count;
+    rep.run_details = details;
     rep.passed = pass_count * 2 > total;
     rep.failure = if rep.passed { None } else { failure };
     rep
 }
 
-fn run_verify(command: &str, work: &Path) -> Result<Option<i32>> {
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(work)
+fn run_verify(command: &str, work: &Path, port: Option<u16>) -> Result<Option<i32>> {
+    let mut verify = Command::new("sh");
+    verify.arg("-c").arg(command).current_dir(work);
+    if let Some(p) = port {
+        verify.env("EVAL_PORT", p.to_string());
+    }
+    let mut child = verify
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -483,6 +573,20 @@ mod tests {
         assert!(check_expectations(&m, &limit).unwrap().contains("limit"));
     }
 
+    #[test]
+    fn expectations_apply_to_replay_only() {
+        // A real model that never thrashes must not "fail" a task whose
+        // expectations only make sense for a scripted cassette.
+        let m = Metrics::default();
+        let e = ExpectSpec {
+            min_loop_nudges: 1,
+            min_auto_retries: 1,
+            ..Default::default()
+        };
+        assert!(expectation_failure(Lane::Replay, &m, &e).is_some());
+        assert_eq!(expectation_failure(Lane::Live, &m, &e), None);
+    }
+
     fn res(passed: bool, iters: u32) -> TaskResult {
         TaskResult {
             id: "t".into(),
@@ -501,7 +605,33 @@ mod tests {
             },
             runs: 1,
             pass_count: u32::from(passed),
+            run_details: Vec::new(),
         }
+    }
+
+    #[test]
+    fn aggregate_keeps_one_detail_per_run_in_order() {
+        let mut a = res(false, 9);
+        a.failure = Some("verify command exited with 1".into());
+        a.metrics.budget_stage = 2;
+        a.metrics.finalized = true;
+        let mut b = res(true, 4);
+        b.metrics.loop_nudges = 1;
+        let c = res(true, 6);
+        let agg = aggregate(vec![a, b, c]);
+        let d = &agg.run_details;
+        assert_eq!(d.len(), 3);
+        // Run order is preserved, not the median ordering used for metrics.
+        assert_eq!(d[0].iterations, 9);
+        assert!(!d[0].passed);
+        assert_eq!(
+            d[0].failure.as_deref(),
+            Some("verify command exited with 1")
+        );
+        assert_eq!((d[0].budget_stage, d[0].finalized), (2, true));
+        assert_eq!(d[1].loop_nudges, 1);
+        assert_eq!(d[2].iterations, 6);
+        assert_eq!(agg.runs, 3);
     }
 
     #[test]
