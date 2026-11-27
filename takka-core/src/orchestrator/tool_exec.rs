@@ -67,14 +67,51 @@ const PERSISTENT_ERROR_MARKERS: [&str; 6] = [
 /// when it succeeded or failed persistently.
 fn transient_tool_error(result: &str) -> Option<String> {
     let msg = result.strip_prefix("Tool error: ")?;
-    let lower = msg.to_lowercase();
+    // Markers are matched outside URLs: a port (`:5031`) or path
+    // (`/timeout`) says nothing about why the call failed.
+    let lower = strip_urls(&msg.to_lowercase());
     if PERSISTENT_ERROR_MARKERS.iter().any(|m| lower.contains(m)) {
         return None;
     }
     TRANSIENT_ERROR_MARKERS
         .iter()
-        .any(|m| lower.contains(m))
+        .any(|m| contains_marker(&lower, m))
         .then(|| msg.to_string())
+}
+
+/// Replace every `http://` / `https://` URL with a space. A URL ends at
+/// whitespace, a quote or a closing parenthesis.
+fn strip_urls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = ["http://", "https://"]
+        .iter()
+        .filter_map(|p| rest.find(p))
+        .min()
+    {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '"' | '\''))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `marker` occurs in `haystack`; a purely numeric marker (an HTTP status)
+/// must not be part of a longer number such as a port or an id.
+fn contains_marker(haystack: &str, marker: &str) -> bool {
+    if !marker.bytes().all(|b| b.is_ascii_digit()) {
+        return haystack.contains(marker);
+    }
+    haystack.match_indices(marker).any(|(i, m)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + m.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 /// Budget live output per tool (chars).
@@ -1146,6 +1183,30 @@ mod transient_classification_tests {
         for msg in [
             "Tool error: Fetch failed: tcp connect error: No connection could be made because the target machine actively refused it. (os error 10061)",
             "Tool error: Fetch failed: An existing connection was forcibly closed by the remote host. (os error 10054)",
+        ] {
+            assert!(transient_tool_error(msg).is_some(), "{msg}");
+        }
+    }
+
+    #[test]
+    fn markers_inside_the_url_do_not_make_an_error_transient() {
+        // A persistent HTTP error whose URL happens to contain a marker
+        // (port 5031, a `/timeout` path) must not be retried.
+        for msg in [
+            "Tool error: Fetch failed: HTTP 403 Forbidden for http://127.0.0.1:5031/x",
+            "Tool error: Fetch failed: HTTP 401 Unauthorized for https://api.example.com/v1/timeout",
+            "Tool error: Fetch failed: HTTP 400 Bad Request for http://h:8503/rate-limit",
+        ] {
+            assert!(transient_tool_error(msg).is_none(), "{msg}");
+        }
+    }
+
+    #[test]
+    fn real_503_and_url_wrapped_transport_errors_stay_transient() {
+        for msg in [
+            "Tool error: Fetch failed: HTTP 503 Service Unavailable for http://127.0.0.1:5031/x",
+            "Tool error: Fetch failed: error sending request for url (http://127.0.0.1:9/chat/completions): tcp connect error: Connection refused (os error 111)",
+            "Tool error: command exited: operation timed out",
         ] {
             assert!(transient_tool_error(msg).is_some(), "{msg}");
         }
