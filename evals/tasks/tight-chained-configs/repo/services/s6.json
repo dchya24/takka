@@ -1,0 +1,7 @@
+{
+  "name": "s6",
+  "port": 8060,
+  "upstream": null,
+  "owner": "team-0",
+  "retries": 3
+}

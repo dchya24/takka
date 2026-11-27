@@ -1,0 +1,7 @@
+{
+  "name": "s4",
+  "port": 8040,
+  "upstream": null,
+  "owner": "team-1",
+  "retries": 3
+}

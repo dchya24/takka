@@ -1,0 +1,21 @@
+{
+  "id": "persistent-404-control",
+  "prompt": "Get the `token` field from http://127.0.0.1:{port}/v1/token and save just the token to token.txt. If that endpoint does not work, NOTES.md explains what changed.",
+  "tags": [
+    "auto-retry",
+    "network",
+    "control",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 15,
+  "setup": {
+    "command": "python3 service/server.py"
+  },
+  "verify": {
+    "command": "test \"$(cat token.txt | tr -d '[:space:]')\" = 'tok-c0ffee'"
+  }
+}

@@ -72,13 +72,48 @@ above is not measured; the unit tests cover both the distinct-range (quiet) and
 overlapping-range (nudge) cases. Still unverified: that the nudge helps on a
 genuine thrash, for which there is no live task yet.
 
+## Second round: more P-02 and P-06 tasks
+
+Six more live-only tasks (all Python, local fixtures), each first checked with
+the feature on to confirm it actually fires, then run ON/OFF interleaved, 5
+runs per side, same model. Iteration caps of the three P-06 tasks were lowered
+after a first trigger check (cap 8 never made shaping fire on
+`tight-rename-across`; it now uses 6, the other two use 7).
+
+| Task | Feature | ON | OFF |
+|---|---|---|---|
+| `flaky-two-endpoints` | P-02 | 5/5 pass, 3 iterations in every run, retry fired 5/5 | 5/5 pass, 4-5 iterations |
+| `flaky-paginated` | P-02 | 5/5 pass, mean 5.2 iterations, retry fired 2/5 | 5/5 pass, mean 6.6 iterations |
+| `persistent-404-control` | P-02 (control) | 3/3 pass, retry fired 0/3 (n=3, ON only) | not run: nothing to switch off |
+| `tight-rename-across` (cap 6) | P-06 | 5/5 pass, shaping 5/5, forced finalization 1/5 | 5/5 pass, forced finalization 1/5 |
+| `tight-chained-configs` (cap 7) | P-06 | 5/5 pass, shaping 2/5, forced finalization 1/5 | 5/5 pass, forced finalization 2/5 |
+| `tight-four-functions` (cap 7) | P-06 | 5/5 pass, shaping 4/5, forced finalization 0/5 | 5/5 pass, forced finalization 1/5 |
+
+Reading, together with the first round:
+
+- **P-02 retry: keep.** Across both new tasks it saves iterations (roughly 1 to
+  1.5 per run) and about 30% of the cost, and the control task shows it does not
+  retry a persistent 404. It did not change pass rate: without it the model
+  retries the failed call itself one turn later. The benefit is efficiency, not
+  correctness, on this model and these tasks.
+- **P-06 shaping: no measurable benefit, no measured harm.** Over the four
+  P-06 tasks (20 runs per side) forced finalization happened in 3 ON runs and 6
+  OFF runs, but every one of those runs still passed, so cutting the number of
+  cap hits did not turn into a pass-rate difference. Iterations and cost were
+  the same. The value shaping is meant to deliver (finishing before the cap
+  instead of failing at it) was never tested, because none of these runs failed
+  at the cap. Keep it as low-risk, but do not claim it helps yet.
+- **Still open for P-01:** no task where the nudge helps on a genuine thrash.
+
 ## Next
 
 1. Inspect a `chain-hop` ON transcript after the first nudge to see what
    changes in the model's behaviour.
 2. Add P-01 tasks with a genuine thrash (nudge should help) next to
    legitimate-paging cases (nudge should stay quiet), then re-run interleaved.
-3. Grow the P-06 and P-02 task sets before drawing keep/remove conclusions.
+3. P-06: find tasks where a run really fails at the cap without shaping
+   (tighter caps or harder tasks), otherwise the feature has no demonstrated
+   effect. (P-02 now has three tasks; see the second round.)
 
 Raw result files are not committed; regenerate with `takka-eval run --lane
 live --config <config> --model glm-5.3-flash --n 5 [--disable <feature>]`.

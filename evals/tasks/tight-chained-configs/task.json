@@ -1,0 +1,20 @@
+{
+  "id": "tight-chained-configs",
+  "prompt": "The six service configs services/s1.json .. s6.json need re-numbering. Set the `port` of s1 to 9001, s2 to 9002, and so on up to s6 = 9006. Set each service's `upstream` to the new port of the previous service (s1 has no upstream: keep it null). Keep every other field exactly as it is. `python3 check.py` verifies the result; do not edit check.py.",
+  "tags": [
+    "budget",
+    "config",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 7,
+  "verify": {
+    "command": "python3 check.py",
+    "forbid_paths": [
+      "check.py"
+    ]
+  }
+}

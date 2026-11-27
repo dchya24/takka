@@ -1,0 +1,20 @@
+{
+  "id": "tight-rename-across",
+  "prompt": "Rename the function `fmt_price` to `format_price` everywhere in this directory (its definition in utils.py and all callers). Do not edit test_names.py. Run `python3 -m unittest -q` to confirm.",
+  "tags": [
+    "budget",
+    "refactor",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 6,
+  "verify": {
+    "command": "python3 -m unittest -q",
+    "forbid_paths": [
+      "test_names.py"
+    ]
+  }
+}

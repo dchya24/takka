@@ -1,0 +1,20 @@
+{
+  "id": "flaky-two-endpoints",
+  "prompt": "Fetch http://127.0.0.1:{port}/users and http://127.0.0.1:{port}/orders (both return JSON with a `count` field). Write one line to summary.txt in exactly this form: users=<count> orders=<count>",
+  "tags": [
+    "auto-retry",
+    "network",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 15,
+  "setup": {
+    "command": "python3 service/server.py"
+  },
+  "verify": {
+    "command": "test \"$(cat summary.txt | tr -d '[:space:]')\" = 'users=42orders=17' || test \"$(tr -s ' \\n' ' ' < summary.txt | sed 's/ *$//')\" = 'users=42 orders=17'"
+  }
+}
