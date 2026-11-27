@@ -105,15 +105,39 @@ Reading, together with the first round:
   at the cap. Keep it as low-risk, but do not claim it helps yet.
 - **Still open for P-01:** no task where the nudge helps on a genuine thrash.
 
+## Third round: tighter caps for P-06
+
+Goal: find a cap where runs fail at the cap without shaping, so that shaping
+has something to rescue. The caps of three P-06 tasks were lowered
+temporarily (not committed): `tight-four-functions` and `tight-chained-configs`
+to 5, `tight-rename-across` to 4. 3 runs per side, interleaved, same model.
+
+| Task (cap) | ON | OFF |
+|---|---|---|
+| `tight-four-functions` (5) | 3/3 pass, shaping 3/3, all finalized | 3/3 pass, all finalized |
+| `tight-chained-configs` (5) | 2/3 pass, shaping 3/3, all finalized | 2/3 pass, all finalized |
+| `tight-rename-across` (4) | 1/3 pass, shaping 0/3, all finalized | 2/3 pass, all finalized |
+
+Reading: failures at the cap do appear now (chained-configs and
+rename-across), but shaping did not turn any of them into a pass. ON passed
+6/9 and OFF 7/9, which is noise at n=3. At a cap of 4 or 5 the 80% and 90%
+thresholds fall on the last one or two iterations (shaping did not fire at all
+on `tight-rename-across`), so there is little room for shaping to change the
+run. Every run, ON or OFF, ended in forced finalization, so these caps are
+too tight to say anything about shaping beyond "it does not rescue a run that
+needs more iterations than the cap allows". The P-06 verdict stays: no
+measured benefit, no measured harm.
+
 ## Next
 
 1. Inspect a `chain-hop` ON transcript after the first nudge to see what
    changes in the model's behaviour.
 2. Add P-01 tasks with a genuine thrash (nudge should help) next to
    legitimate-paging cases (nudge should stay quiet), then re-run interleaved.
-3. P-06: find tasks where a run really fails at the cap without shaping
-   (tighter caps or harder tasks), otherwise the feature has no demonstrated
-   effect. (P-02 now has three tasks; see the second round.)
+3. P-06: tighter caps (third round) did not show a rescue effect. A better
+   test needs a larger cap (10+) with a task where the model dithers over
+   read-only calls; until then the feature has no demonstrated effect.
+   (P-02 now has three tasks; see the second round.)
 
 Raw result files are not committed; regenerate with `takka-eval run --lane
 live --config <config> --model glm-5.3-flash --n 5 [--disable <feature>]`.
