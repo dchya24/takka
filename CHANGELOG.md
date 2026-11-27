@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TAKKA_NO_UPDATE_CHECK=1`. Nothing is installed automatically.
 
 ### Fixed
+- Core/orchestrator: the transient-error classifier (auto-retry) no longer
+  matches markers inside URLs, and `503` must be a whole number. A persistent
+  failure such as `HTTP 403 Forbidden for http://host:5031/` was retried
+  because the port contains `503`; a path like `/timeout` had the same effect.
 - Eval: `expect` checks (loop nudge, auto-retry, iteration/limit assertions) now
   apply to the replay lane only. In the live lane they failed correct runs of a
   real model that simply never thrashed; the metrics are still reported.
