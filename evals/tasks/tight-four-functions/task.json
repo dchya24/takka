@@ -1,0 +1,20 @@
+{
+  "id": "tight-four-functions",
+  "prompt": "Implement the four functions described in SPEC.md (each stub raises NotImplementedError) so that `python3 -m unittest -q` passes. Do not edit test_all.py.",
+  "tags": [
+    "budget",
+    "feature",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 7,
+  "verify": {
+    "command": "python3 -m unittest -q",
+    "forbid_paths": [
+      "test_all.py"
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "s5",
+  "port": 8050,
+  "upstream": null,
+  "owner": "team-2",
+  "retries": 3
+}

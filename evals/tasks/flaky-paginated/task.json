@@ -1,0 +1,20 @@
+{
+  "id": "flaky-paginated",
+  "prompt": "The API at http://127.0.0.1:{port}/items?page=1 is paginated: each response has `items` (each with a numeric `value`) and `next` (the next page number, or null on the last page). Add up `value` over every item on every page and write just that number to total.txt.",
+  "tags": [
+    "auto-retry",
+    "network",
+    "python",
+    "live-only"
+  ],
+  "lanes": [
+    "live"
+  ],
+  "max_iterations": 20,
+  "setup": {
+    "command": "python3 service/server.py"
+  },
+  "verify": {
+    "command": "test \"$(cat total.txt | tr -d '[:space:]')\" = '82'"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "s3",
+  "port": 8030,
+  "upstream": null,
+  "owner": "team-0",
+  "retries": 3
+}
