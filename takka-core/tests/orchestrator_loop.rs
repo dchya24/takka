@@ -571,6 +571,84 @@ fn semantic_loop_detection_nudges_on_alternating_same_target_reads() {
     );
 }
 
+/// Run a scripted sequence of `read_file` calls (offset, limit) on one file
+/// and return the system messages the orchestrator emitted.
+fn run_scripted_reads(reads: &[(i64, Option<i64>)]) -> Vec<String> {
+    let dir = support::tempdir();
+    let path = dir.join("pages.txt");
+    let body: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, body).unwrap();
+
+    let mut script: Vec<_> = reads
+        .iter()
+        .map(|(offset, limit)| {
+            let mut args = serde_json::json!({ "path": path.to_string_lossy(), "offset": offset });
+            if let Some(l) = limit {
+                args["limit"] = serde_json::json!(l);
+            }
+            support::tool_call_response("c", "read_file", &args)
+        })
+        .collect();
+    script.push(support::text_response("done"));
+    let provider: Arc<dyn LLMProvider> = Arc::new(ScriptedProvider::new(script));
+
+    let tools = ToolRegistry::new();
+    for t in builtin_tools_with_tracker(Arc::new(FileTracker::new())) {
+        tools.register(t);
+    }
+    let mut orch = Orchestrator::new(provider, tools);
+    orch.set_permission_mode(PermissionMode::Yolo);
+    orch.set_max_iterations(40);
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    orch.on_event(move |event| {
+        if let Event::System { message } = event {
+            sink.lock().unwrap().push(message);
+        }
+    });
+    orch.run("read the pages").expect("run completes");
+    let out = events.lock().unwrap().clone();
+    out
+}
+
+/// Visiting many *different* line ranges of one file (single-line hops,
+/// paging) is progress, not thrash: no nudge.
+#[test]
+fn semantic_loop_nudge_ignores_distinct_non_overlapping_ranges() {
+    let hops = [
+        (1, 5),
+        (310, 1),
+        (21, 1),
+        (200, 1),
+        (88, 1),
+        (350, 1),
+        (140, 1),
+        (260, 1),
+        (60, 1),
+        (390, 1),
+    ];
+    let reads: Vec<_> = hops.iter().map(|(o, l)| (*o, Some(*l))).collect();
+    let msgs = run_scripted_reads(&reads);
+    assert!(
+        !msgs.iter().any(|m| m.contains("re-reading")),
+        "distinct ranges must not nudge, got {msgs:?}"
+    );
+}
+
+/// Re-reading the *same* lines over and over is still thrash and still nudges.
+#[test]
+fn semantic_loop_nudge_still_fires_on_overlapping_ranges() {
+    let reads: Vec<_> = [(1, 50), (20, 50), (1, 50), (30, 50), (10, 50), (25, 50)]
+        .iter()
+        .map(|(o, l)| (*o, Some(*l)))
+        .collect();
+    let msgs = run_scripted_reads(&reads);
+    assert!(
+        msgs.iter().any(|m| m.contains("re-reading")),
+        "overlapping re-reads must nudge, got {msgs:?}"
+    );
+}
+
 /// A legit read-after-edit sequence (read → edit → read the same file)
 /// must NOT trip the semantic detector: the edit resets the window.
 #[test]

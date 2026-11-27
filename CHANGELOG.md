@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Loop detection (P-01): the semantic "you keep re-reading" nudge no longer
+  counts calls that look at disjoint line ranges of the same file (paging,
+  single-line hops). Repeated or overlapping ranges, and calls without a range,
+  still count. The live `chain-hop` eval showed the old rule nudging legitimate
+  hopping, after which the model abandoned efficient one-line reads and dumped
+  the file (about 2x prompt tokens per step).
+
 ### Added
 - Core/eval: **ablation switches** for the loop-behaviour features, so their
   effect can be measured instead of assumed. `Orchestrator` gains

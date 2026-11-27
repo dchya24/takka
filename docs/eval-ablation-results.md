@@ -58,6 +58,20 @@ ON runs were again the slow ones (longest 212 s).
   child streams its events to a log), but no live run has exercised it yet.
 - Cache read is 0% for this provider, so cost comparisons here ignore caching.
 
+## Follow-up: tuned P-01 detector
+
+A traced `chain-hop` run showed the model making efficient single-line reads
+(`limit: 1`) at distinct offsets. The nudge fired anyway; the next steps were
+two 1000-line reads of the whole file, which explains the roughly 2x prompt
+tokens per iteration. The semantic detector now counts a call only if it
+re-visits lines already seen in the window (overlapping range), has no range,
+or is the first visit to the target. After the change `chain-hop` ran 10/10
+with the nudge firing in 0/10 runs (median 18 iterations). Cost and wall time
+for that batch were not recorded per run, so the saving versus the OFF numbers
+above is not measured; the unit tests cover both the distinct-range (quiet) and
+overlapping-range (nudge) cases. Still unverified: that the nudge helps on a
+genuine thrash, for which there is no live task yet.
+
 ## Next
 
 1. Inspect a `chain-hop` ON transcript after the first nudge to see what
